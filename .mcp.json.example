@@ -1,0 +1,20 @@
+{
+  "_comment": "Template. scripts/setup.sh substitutes __PROJECT_DIR__ with the clone path and writes .mcp.json (gitignored, per-machine).",
+  "mcpServers": {
+    "moomoo-mcp": {
+      "command": "__PROJECT_DIR__/.venv/bin/moomoo-mcp",
+      "args": [],
+      "env": {}
+    },
+    "edgar-mcp": {
+      "command": "__PROJECT_DIR__/.venv/bin/edgar-mcp",
+      "args": [],
+      "env": {}
+    },
+    "journal-mcp": {
+      "command": "__PROJECT_DIR__/.venv/bin/journal-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

@@ -1,0 +1,37 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Env & secrets
+.env
+*.pem
+*.key
+
+# Generated per-machine — ship the .example / .template siblings, not the
+# filled-in copies. `bash scripts/setup.sh` regenerates them after clone.
+.claude/settings.json
+.claude/settings.local.json
+.mcp.json
+deploy/launchd/*.plist
+!deploy/launchd/*.plist.template
+
+# Data — trader DB, filings cache, logs, hook audit. Keep sectors.csv
+# (static GICS lookup) and .gitkeep. Using data/* instead of data/ so the
+# !negations below can re-include specific files.
+data/*
+!data/.gitkeep
+!data/sectors.csv
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

@@ -1,0 +1,293 @@
+"""PostToolUse capture for paper order fills.
+
+Fires after moomoo-mcp order tools return. Persists a `trades` row (one
+per response row) and a `market_snapshots` payload, then exits 0.
+
+Why posttool rather than inside the MCP tool itself:
+  - Keeps moomoo/server.py a thin transport wrapper. Anything DB-ish
+    lives in trading_agent.db / trading_agent.mcp_servers.journal.
+  - The fill/thesis/snapshot bundle is exactly what the post-mortem
+    flow consumes; having the hook own the join keeps the schema-level
+    contract in one place.
+
+This hook is NOT a gate. Any failure here is a telemetry problem, not
+a trading problem — exit 0 in all cases and log to data/hook_audit.log.
+
+Submit-time reality: MoomooOpenD typically returns order_status
+SUBMITTING with dealt_qty=0 on the first response. Per plan decision
+(MVP pick (a)): record at submit-time with entry_price=limit_price so
+the journal row is never missing. If a subsequent FILLED_ALL event
+ever comes in with a different dealt_avg_price, the ledger drift is
+accepted for MVP (documented in data/hook_audit.log).
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from trading_agent.config import CONFIG, ensure_dirs
+from trading_agent.db import connection
+
+ORDER_TOOL_RE = re.compile(
+    r"^mcp__moomoo[_-]mcp__(place_paper_order|place_paper_option_order)$"
+)
+OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{4,8})$")
+AUDIT_PATH = CONFIG.data_dir / "hook_audit.log"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _audit(rec: dict) -> None:
+    try:
+        ensure_dirs()
+        with AUDIT_PATH.open("a") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _extract_dict(tool_response: Any) -> dict | None:
+    """MCP tool responses can arrive as the bare return dict OR wrapped in
+    `{"content": [{"type":"text","text":"<json>"}], "isError": False}`.
+    Handle both shapes; give up gracefully on anything else."""
+    if isinstance(tool_response, dict) and "content" not in tool_response:
+        return tool_response
+    if isinstance(tool_response, dict) and "content" in tool_response:
+        items = tool_response.get("content") or []
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "text":
+                try:
+                    return json.loads(item.get("text") or "")
+                except Exception:
+                    continue
+    return None
+
+
+def _side_from_trd_side(x: Any) -> str | None:
+    """moomoo SDK returns trd_side as 'BUY'/'SELL' or the int enum. Normalize."""
+    if x is None:
+        return None
+    s = str(x).upper()
+    if "BUY" in s:
+        return "BUY"
+    if "SELL" in s:
+        return "SELL"
+    return None
+
+
+def _ticker_from_symbol(symbol: str) -> str | None:
+    if not symbol:
+        return None
+    s = symbol.upper()
+    if s.startswith("US."):
+        s = s[3:]
+    m = OCC_RE.match(s)
+    if m:
+        return m.group(1)
+    return s
+
+
+def _insert_trade_row(
+    *,
+    thesis_id: int | None,
+    symbol: str,
+    asset_type: str,
+    strategy_label: str | None,
+    side: str | None,
+    qty: float,
+    entry_price: float,
+    stop: float | None,
+    target: float | None,
+    broker_order_id: str,
+    reasoning: str | None,
+) -> int:
+    opened_at = _now()
+    with connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO trades (thesis_id, symbol, asset_type, strategy_label,
+                side, qty, entry_price, stop, target, opened_at, reasoning,
+                outcome, broker_order_id, is_paper)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, 1)
+            """,
+            (thesis_id, symbol, asset_type, strategy_label, side, qty,
+             entry_price, stop, target, opened_at, reasoning, broker_order_id),
+        )
+        trade_id = cur.lastrowid
+        conn.commit()
+    return int(trade_id)
+
+
+def _insert_snapshot(trade_id: int, payload: dict) -> None:
+    with connection() as conn:
+        conn.execute(
+            "INSERT INTO market_snapshots (trade_id, taken_at, payload) "
+            "VALUES (?, ?, ?)",
+            (trade_id, _now(), json.dumps(payload, default=str)),
+        )
+        conn.commit()
+
+
+def _best_effort_snapshot(symbol: str) -> dict:
+    """Try to grab a quote (and for options a short-window chain context).
+    Best-effort — any failure returns a payload marked 'unavailable'. The
+    hook swallows exceptions so the trade row always lands.
+    """
+    try:
+        from moomoo import OpenQuoteContext
+        ctx = OpenQuoteContext(host=CONFIG.opend_host, port=CONFIG.opend_port)
+        try:
+            ret, df = ctx.get_market_snapshot([symbol])
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+        if ret != 0 or df is None or df.empty:
+            return {"symbol": symbol, "quote": None, "note": f"snapshot ret={ret}"}
+        row = df.iloc[0].to_dict()
+        # dataframe values may include numpy types; JSON-encode defensively upstream.
+        return {"symbol": symbol, "quote": row}
+    except Exception as e:
+        return {"symbol": symbol, "quote": None, "note": f"snapshot failed: {e!r}"}
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception as e:
+        sys.stderr.write(f"[posttool_fill_capture] bad payload: {e}\n")
+        return 0
+
+    tool_name = payload.get("tool_name", "")
+    if not ORDER_TOOL_RE.match(tool_name):
+        return 0
+
+    tool_input = payload.get("tool_input", {}) or {}
+    tool_response_raw = payload.get("tool_response", {}) or {}
+    resp = _extract_dict(tool_response_raw)
+    if resp is None:
+        _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
+                "decision": "noop", "reason": "unparseable tool_response",
+                "response_shape": type(tool_response_raw).__name__})
+        return 0
+
+    # Virtual-fill suggestion path: option tool returned without placing.
+    # Skill will invoke journal.record_virtual_fill next — we don't double-write.
+    if resp.get("virtual_fill_suggested"):
+        _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
+                "decision": "defer_virtual", "reason": resp.get("reason"),
+                "thesis_id": resp.get("thesis_id")})
+        return 0
+
+    is_option = tool_name.endswith("__place_paper_option_order")
+    asset_type = "OPT" if is_option else "STK"
+
+    thesis_id = resp.get("thesis_id") or tool_input.get("thesis_id")
+    strategy_label = resp.get("strategy_label") or tool_input.get("strategy_label")
+    stop = resp.get("stop") if not is_option else None
+    target = resp.get("target") if not is_option else None
+    # For options: tool_input carries delta + dte (echoed into resp too).
+    reasoning_bits: list[str] = []
+    if is_option:
+        if resp.get("delta") is not None:
+            reasoning_bits.append(f"delta={resp.get('delta')}")
+        if resp.get("dte") is not None:
+            reasoning_bits.append(f"dte={resp.get('dte')}")
+    reasoning = ", ".join(reasoning_bits) or None
+
+    rows = resp.get("rows") or []
+    if not rows:
+        _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
+                "decision": "noop", "reason": "no rows in response",
+                "resp_keys": list(resp.keys())})
+        return 0
+
+    inserted: list[dict] = []
+    for row in rows:
+        symbol = (
+            row.get("code")
+            or tool_input.get("symbol")
+            or tool_input.get("option_symbol")
+            or ""
+        )
+        side = _side_from_trd_side(row.get("trd_side") or tool_input.get("side"))
+
+        # Submit-time: dealt_qty often 0, order_status SUBMITTING. Per MVP
+        # decision, record at submit with entry=limit_price so the journal
+        # row never lags the broker. If dealt_avg_price is non-zero, prefer
+        # it (partial/immediate fills).
+        dealt_qty = float(row.get("dealt_qty", 0) or 0)
+        dealt_avg_price = float(row.get("dealt_avg_price", 0) or 0)
+        limit_price = float(tool_input.get("price", 0) or 0)
+        entry_price = dealt_avg_price if dealt_qty > 0 and dealt_avg_price > 0 else limit_price
+
+        qty = float(
+            row.get("qty")
+            or tool_input.get("qty")
+            or tool_input.get("contracts")
+            or 0
+        )
+        broker_order_id = str(row.get("order_id") or "")
+
+        try:
+            trade_id = _insert_trade_row(
+                thesis_id=(int(thesis_id) if thesis_id is not None else None),
+                symbol=symbol,
+                asset_type=asset_type,
+                strategy_label=strategy_label,
+                side=side,
+                qty=qty,
+                entry_price=entry_price,
+                stop=(float(stop) if stop is not None else None),
+                target=(float(target) if target is not None else None),
+                broker_order_id=broker_order_id,
+                reasoning=reasoning,
+            )
+        except Exception as e:
+            _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
+                    "decision": "error", "phase": "insert_trade",
+                    "error": repr(e), "row": row})
+            continue
+
+        # Best-effort snapshot — never raises.
+        snap_payload = {
+            "raw_order_row": row,
+            "quote": _best_effort_snapshot(symbol),
+            "order_status_at_submit": row.get("order_status"),
+        }
+        try:
+            _insert_snapshot(trade_id, snap_payload)
+        except Exception as e:
+            _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
+                    "decision": "warn", "phase": "insert_snapshot",
+                    "error": repr(e), "trade_id": trade_id})
+
+        inserted.append({"trade_id": trade_id, "broker_order_id": broker_order_id,
+                          "symbol": symbol, "qty": qty, "entry_price": entry_price})
+
+    _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
+            "decision": "captured", "thesis_id": thesis_id,
+            "inserted": inserted, "row_count": len(rows)})
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        sys.stderr.write(
+            f"[posttool_fill_capture] crashed (non-blocking):\n"
+            f"{traceback.format_exc()}\n"
+        )
+        # Posttool hooks must never block; exit 0 even on crash.
+        sys.exit(0)

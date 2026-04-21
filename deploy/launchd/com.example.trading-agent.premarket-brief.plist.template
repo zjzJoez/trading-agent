@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template — `bash scripts/setup.sh` substitutes __PROJECT_DIR__ and
+  __SEC_UA_EMAIL__. Rename + update Label if you want your own
+  reverse-DNS identifier.
+
+  The 20:00 local firing assumes Asia/Shanghai (= before US pre-market
+  at 14:00 UTC during DST). Adjust to your timezone so this runs in the
+  window 30–60 minutes before US regular open.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.trading-agent.premarket-brief</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>trading_agent.jobs.premarket_watchlist</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DB_PATH</key>
+        <string>__PROJECT_DIR__/data/trader.db</string>
+        <key>SEC_UA_EMAIL</key>
+        <string>__SEC_UA_EMAIL__</string>
+        <key>WATCHLIST_TICKERS</key>
+        <string>AAPL,MSFT,NVDA,GOOGL,META,TSLA,AMZN,SPY,QQQ,IWM</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/data/logs/premarket-brief.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/data/logs/premarket-brief.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -1,0 +1,55 @@
+{
+  "_comment": "Template. Run `bash scripts/setup.sh` after cloning to generate a real .claude/settings.json with your absolute paths substituted. Hook commands use ${CLAUDE_PROJECT_DIR} (Claude Code expands this at runtime). MCP server commands need real absolute paths, which the setup script fills in.",
+
+  "mcpServers": {
+    "moomoo-mcp": {
+      "command": "__PROJECT_DIR__/.venv/bin/moomoo-mcp",
+      "args": [],
+      "env": {}
+    },
+    "edgar-mcp": {
+      "command": "__PROJECT_DIR__/.venv/bin/edgar-mcp",
+      "args": [],
+      "env": {}
+    },
+    "journal-mcp": {
+      "command": "__PROJECT_DIR__/.venv/bin/journal-mcp",
+      "args": [],
+      "env": {}
+    }
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.venv/bin/python ${CLAUDE_PROJECT_DIR}/src/trading_agent/hooks/reject_real_env.py"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__moomoo[_-]mcp__place_paper_order|mcp__moomoo[_-]mcp__place_paper_option_order",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.venv/bin/python ${CLAUDE_PROJECT_DIR}/src/trading_agent/hooks/pretool_order_guard.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__moomoo[_-]mcp__place_paper_order|mcp__moomoo[_-]mcp__place_paper_option_order",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.venv/bin/python ${CLAUDE_PROJECT_DIR}/src/trading_agent/hooks/posttool_fill_capture.py"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template — `bash scripts/setup.sh` substitutes __PROJECT_DIR__.
+  Mac-only: backfills MiniLM embeddings for notes missing from
+  notes_vec. EC2 jobs insert notes without embeddings to keep the
+  EC2 box lean; this cron on the Mac re-hydrates them so the RAG
+  index stays current.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.trading-agent.backfill-embeddings</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>trading_agent.jobs.backfill_embeddings</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DB_PATH</key>
+        <string>__PROJECT_DIR__/data/trader.db</string>
+    </dict>
+
+    <!-- Every 30 minutes. No-op when caught up. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/data/logs/backfill-embeddings.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/data/logs/backfill-embeddings.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>

@@ -1,0 +1,45 @@
+[project]
+name = "trading-agent"
+version = "0.1.0"
+description = "Senior-trader Claude Code agent: paper trading, research, self-learning."
+readme = "README.md"
+authors = [
+    { name = "JoezZz" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mcp>=1.2.0",
+    "moomoo-api>=9.3.5308",
+    "httpx>=0.27.0",
+    "pydantic>=2.7.0",
+    "sqlite-vec>=0.1.6",
+    "sentence-transformers>=3.0.0",
+    "python-dotenv>=1.0.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "lxml>=5.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+moomoo-mcp = "trading_agent.mcp_servers.moomoo.server:main"
+edgar-mcp = "trading_agent.mcp_servers.edgar.server:main"
+journal-mcp = "trading_agent.mcp_servers.journal.server:main"
+ta-migrate = "trading_agent.db:migrate_cli"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]

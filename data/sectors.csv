@@ -1,0 +1,91 @@
+ticker,sector
+AAPL,Information Technology
+MSFT,Information Technology
+NVDA,Information Technology
+AVGO,Information Technology
+ORCL,Information Technology
+CSCO,Information Technology
+ADBE,Information Technology
+CRM,Information Technology
+AMD,Information Technology
+INTC,Information Technology
+QCOM,Information Technology
+TXN,Information Technology
+GOOGL,Communication Services
+GOOG,Communication Services
+META,Communication Services
+NFLX,Communication Services
+DIS,Communication Services
+TMUS,Communication Services
+AMZN,Consumer Discretionary
+TSLA,Consumer Discretionary
+HD,Consumer Discretionary
+NKE,Consumer Discretionary
+MCD,Consumer Discretionary
+LOW,Consumer Discretionary
+SBUX,Consumer Discretionary
+WMT,Consumer Staples
+PG,Consumer Staples
+KO,Consumer Staples
+PEP,Consumer Staples
+COST,Consumer Staples
+JPM,Financials
+BAC,Financials
+WFC,Financials
+GS,Financials
+MS,Financials
+C,Financials
+V,Financials
+MA,Financials
+AXP,Financials
+BRK.B,Financials
+XOM,Energy
+CVX,Energy
+COP,Energy
+SLB,Energy
+EOG,Energy
+UNH,Health Care
+JNJ,Health Care
+LLY,Health Care
+PFE,Health Care
+ABBV,Health Care
+MRK,Health Care
+TMO,Health Care
+ABT,Health Care
+BMY,Health Care
+CAT,Industrials
+BA,Industrials
+GE,Industrials
+HON,Industrials
+UPS,Industrials
+RTX,Industrials
+LMT,Industrials
+DE,Industrials
+UNP,Industrials
+LIN,Materials
+APD,Materials
+SHW,Materials
+FCX,Materials
+NEE,Utilities
+SO,Utilities
+DUK,Utilities
+PLD,Real Estate
+AMT,Real Estate
+SPG,Real Estate
+SPY,ETF-Broad
+QQQ,ETF-Broad
+IWM,ETF-Broad
+DIA,ETF-Broad
+VIX,Index
+VOO,ETF-Broad
+XLK,ETF-Sector
+XLF,ETF-Sector
+XLE,ETF-Sector
+XLV,ETF-Sector
+XLY,ETF-Sector
+XLP,ETF-Sector
+XLI,ETF-Sector
+XLRE,ETF-Sector
+XLU,ETF-Sector
+XLB,ETF-Sector
+XLC,ETF-Sector

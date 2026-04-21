@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template — `bash scripts/setup.sh` substitutes __PROJECT_DIR__ and
+  __SEC_UA_EMAIL__ and writes a real .plist next to this file. If you
+  want to use your own reverse-DNS Label, also rename the file + update
+  the <Label> below (e.g. com.yourname.trading-agent.overnight-scan).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.trading-agent.overnight-scan</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>trading_agent.jobs.overnight_edgar_scan</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DB_PATH</key>
+        <string>__PROJECT_DIR__/data/trader.db</string>
+        <key>SEC_UA_EMAIL</key>
+        <string>__SEC_UA_EMAIL__</string>
+        <key>WATCHLIST_TICKERS</key>
+        <string>AAPL,MSFT,NVDA,GOOGL,META,TSLA,AMZN,SPY,QQQ,IWM</string>
+    </dict>
+
+    <!-- Fires daily at 08:00 local time (after US regular close in all DST regimes). -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/data/logs/overnight-scan.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/data/logs/overnight-scan.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
