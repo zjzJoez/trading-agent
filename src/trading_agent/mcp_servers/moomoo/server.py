@@ -32,7 +32,44 @@ from mcp.server.fastmcp import FastMCP
 
 from trading_agent.config import CONFIG
 
+# ---------------------------------------------------------------------------
+# Silence moomoo-api SDK stdout pollution.
+#
+# moomoo/common/ft_logger.py:102 hard-codes `logging.StreamHandler(sys.stdout)`
+# for its FTConsoleLog singleton. The SDK writes a Python-logging record to
+# stdout on every OpenQuoteContext / OpenSecTradeContext connect/disconnect —
+# lines like:
+#   "2026-04-22 04:26:43,889 | 89449 | ... | [open_context_base.py:409]
+#    _init_connect_sync: New connect ready: conn=..."
+# That corrupts the MCP JSON-RPC stdio stream (the client's pydantic parser
+# raises "Invalid JSON: trailing characters"). The MCP client recovers, but
+# any contamination on stdout is a latent bug.
+#
+# Fix: re-point the SDK's console StreamHandler at stderr. File logging under
+# ~/futu_cache/py_YYYY_MM_DD.log is unaffected; interactive/harness stderr
+# still shows the line.
+# ---------------------------------------------------------------------------
+try:
+    from moomoo.common.ft_logger import FTLog as _FTLog  # type: ignore
+    _ftlog = _FTLog()  # singleton; __init__ is idempotent (hasattr guards)
+    _h = getattr(_ftlog, "consoleHandler", None)
+    if _h is not None and getattr(_h, "stream", None) is sys.stdout:
+        _h.setStream(sys.stderr)
+except Exception:
+    # Never block MCP startup on a logging tweak — worst case is the
+    # historical "tolerated" behavior.
+    pass
+
 PAPER_ENV: TrdEnv = TrdEnv.SIMULATE  # MVP: paper only, never real.
+
+# Read-only view of the real Moomoo account. Consumed *exclusively* by the
+# get_real_* query tools below and by get_watchlist* (watchlists live on the
+# real login even though the API is on the quote ctx, which is env-less).
+# INVARIANT (grep-able): REAL_READONLY_ENV must never appear as an argument to
+# place_order / modify_order — the write tools hard-code PAPER_ENV and assert
+# it with _assert_paper(). Real-account writes also require unlock_trade(),
+# which this server never calls; no password handling exists in this module.
+REAL_READONLY_ENV: TrdEnv = TrdEnv.REAL
 
 mcp = FastMCP("moomoo-mcp")
 
@@ -209,6 +246,43 @@ def get_option_chain_snapshot(
     return {"expiry": expiry, "spot": spot, "underlying": underlying, "rows": snapshots}
 
 
+# ------------------------ Watchlist (real-account, read-only) ------------------------
+#
+# Watchlists live on the user's Moomoo login and are exposed via the quote
+# context (env-less). These tools are pure reads — no modify_user_security
+# wrapper is exposed here.
+
+@mcp.tool()
+def get_watchlist_groups(group_type: Literal["ALL", "CUSTOM", "SYSTEM"] = "ALL") -> dict:
+    """List the user's watchlist groups (自选分组).
+
+    `group_type`: "ALL" (default), "CUSTOM" (user-created), or "SYSTEM"
+    (built-in groups like 全部/港股/美股).
+    Returns rows with `group_name` and `group_type`. Feed a `group_name`
+    into `get_watchlist` to read its tickers.
+    """
+    from moomoo import UserSecurityGroupType
+    gt_enum = {
+        "ALL": UserSecurityGroupType.ALL,
+        "CUSTOM": UserSecurityGroupType.CUSTOM,
+        "SYSTEM": UserSecurityGroupType.SYSTEM,
+    }[group_type]
+    df = _require_ok(*_quote().get_user_security_group(group_type=gt_enum), op="get_user_security_group")
+    return {"rows": _df_records(df)}
+
+
+@mcp.tool()
+def get_watchlist(group_name: str) -> dict:
+    """Return the symbols in a watchlist group (自选股列表).
+
+    `group_name` is a string from `get_watchlist_groups().rows[*].group_name`.
+    The rows include code (e.g. "US.AAPL"), stock_name, stock_type, and basic
+    last_price snapshot. For richer fields pass the codes to `get_quote`.
+    """
+    df = _require_ok(*_quote().get_user_security(group_name), op="get_user_security")
+    return {"rows": _df_records(df)}
+
+
 # ------------------------ Account / positions (paper) ------------------------
 
 @mcp.tool()
@@ -242,6 +316,122 @@ def get_orders(status_filter: list[str] | None = None) -> dict:
     df = _require_ok(
         *_trade().order_list_query(trd_env=PAPER_ENV, status_filter_list=status_filter or []),
         op="order_list_query",
+    )
+    return {"rows": _df_records(df)}
+
+
+# ------------------------ Real account (read-only) ------------------------
+#
+# Query-only tools that hit the user's live Moomoo account via REAL_READONLY_ENV.
+# No write tool in this module accepts trd_env or references REAL_READONLY_ENV.
+# Moomoo's real-account write operations additionally require unlock_trade()
+# with the trading password; this module never calls unlock_trade and never
+# accepts a password parameter — the real-env write path is physically
+# unreachable from MCP.
+
+@mcp.tool()
+def get_real_account_list() -> dict:
+    """List the real Moomoo trading accounts visible to OpenD (US market filter).
+
+    Call this first to discover the `acc_index` to pass into other `get_real_*`
+    tools. Rows include acc_id, acc_index, trd_env (REAL/SIMULATE), acc_type
+    (CASH / MARGIN), card_num, security_firm. A typical user has a REAL cash
+    or margin account plus a SIMULATE paper account.
+    """
+    df = _require_ok(*_trade().get_acc_list(), op="get_acc_list")
+    return {"rows": _df_records(df)}
+
+
+@mcp.tool()
+def get_real_account_info(acc_index: int = 0, currency: Literal["USD", "HKD", "CNH"] = "USD") -> dict:
+    """Real-account cash / asset summary (read-only).
+
+    `acc_index` 0-based position in `get_real_account_list().rows`. Defaults
+    to 0 which is usually the primary real account — call the list tool first
+    if the user has multiple. `currency` controls the display currency of
+    cash balances (Moomoo reports per-currency). Returns power/cash/total
+    assets, market value, and margin usage.
+
+    refresh_cache=True so we get a fresh snapshot — stale positions mislead
+    analysis more than a slow call hurts.
+    """
+    df = _require_ok(
+        *_trade().accinfo_query(
+            trd_env=REAL_READONLY_ENV,
+            acc_index=acc_index,
+            currency=currency,
+            refresh_cache=True,
+        ),
+        op="accinfo_query[real]",
+    )
+    return {"rows": _df_records(df)}
+
+
+@mcp.tool()
+def get_real_positions(acc_index: int = 0) -> dict:
+    """Real-account positions: stocks, ETFs, options (read-only).
+
+    Returns qty, cost, current price, market value, unrealized P&L. Option
+    positions show the full option code — pass into `get_quote` for live greeks.
+    """
+    df = _require_ok(
+        *_trade().position_list_query(
+            trd_env=REAL_READONLY_ENV,
+            acc_index=acc_index,
+            refresh_cache=True,
+        ),
+        op="position_list_query[real]",
+    )
+    return {"rows": _df_records(df)}
+
+
+@mcp.tool()
+def get_real_orders(
+    acc_index: int = 0,
+    status_filter: list[str] | None = None,
+) -> dict:
+    """Real-account open/recent orders (read-only).
+
+    `status_filter`: e.g. ["SUBMITTED", "FILLED_ALL"]. Empty list returns all
+    today's orders. For closed orders beyond today use `get_real_history_orders`.
+    """
+    df = _require_ok(
+        *_trade().order_list_query(
+            trd_env=REAL_READONLY_ENV,
+            acc_index=acc_index,
+            status_filter_list=status_filter or [],
+            refresh_cache=True,
+        ),
+        op="order_list_query[real]",
+    )
+    return {"rows": _df_records(df)}
+
+
+@mcp.tool()
+def get_real_history_orders(
+    acc_index: int = 0,
+    start: str | None = None,
+    end: str | None = None,
+    code: str = "",
+    status_filter: list[str] | None = None,
+) -> dict:
+    """Real-account historical orders (read-only).
+
+    `start` / `end` in YYYY-MM-DD; omit for the broker's default window
+    (usually last 30–90 days). `code` optionally filters to one symbol
+    (e.g. "US.AAPL"). Useful for reconstructing past trades when building a
+    thesis or reviewing realized P&L.
+    """
+    df = _require_ok(
+        *_trade().history_order_list_query(
+            trd_env=REAL_READONLY_ENV,
+            acc_index=acc_index,
+            start=start or "",
+            end=end or "",
+            code=code,
+            status_filter_list=status_filter or [],
+        ),
+        op="history_order_list_query[real]",
     )
     return {"rows": _df_records(df)}
 

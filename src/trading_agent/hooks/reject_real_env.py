@@ -41,6 +41,17 @@ FORBIDDEN_SUBSTRINGS = [
     re.compile(r"TrdEnv\.REAL\b"),
 ]
 
+# Allowlisted contexts — stripped from strings BEFORE FORBIDDEN_SUBSTRINGS
+# runs, so known-safe constructs don't trip the block. Each entry is a
+# narrow, grep-able audit target.
+ALLOWED_SUBSTRINGS = [
+    # Sole read-only real-account constant, defined once in
+    # mcp_servers/moomoo/server.py. Never passed to place_order / modify_order.
+    re.compile(r"REAL_READONLY_ENV\s*:\s*TrdEnv\s*=\s*TrdEnv\.REAL"),
+    # Usages of the constant on read-only query paths.
+    re.compile(r"trd_env\s*=\s*REAL_READONLY_ENV"),
+]
+
 AUDIT_PATH = Path.home() / "Desktop" / "trading-agent" / "data" / "hook_audit.log"
 
 
@@ -71,11 +82,16 @@ def _scan(obj, path: str = "$") -> list[str]:
         for i, v in enumerate(obj):
             reasons.extend(_scan(v, f"{path}[{i}]"))
     elif isinstance(obj, str):
-        upper = obj.strip().upper()
+        # Strip allowlisted constructs first so their internal TrdEnv.REAL
+        # mention (or similar) doesn't trip FORBIDDEN_SUBSTRINGS below.
+        scanned = obj
+        for allowed in ALLOWED_SUBSTRINGS:
+            scanned = allowed.sub("", scanned)
+        upper = scanned.strip().upper()
         if upper in FORBIDDEN_VALUES:
             reasons.append(f"forbidden literal at {path}: {obj!r}")
         for pat in FORBIDDEN_SUBSTRINGS:
-            if pat.search(obj):
+            if pat.search(scanned):
                 reasons.append(f"forbidden pattern at {path}: {pat.pattern}")
     return reasons
 
