@@ -14,6 +14,7 @@ units=(
   "trading-agent-intraday.timer"
   "trading-agent-eod.timer"
   "trading-agent-healthcheck.timer"
+  "trading-agent-learning.timer"
 )
 
 for u in "${units[@]}"; do
@@ -23,7 +24,7 @@ done
 $SUDO systemctl daemon-reload
 
 # Enable + start the timers (NOT the @-templates; they run on demand)
-for t in trading-agent-premarket trading-agent-intraday trading-agent-eod trading-agent-healthcheck; do
+for t in trading-agent-premarket trading-agent-intraday trading-agent-eod trading-agent-healthcheck trading-agent-learning; do
   $SUDO systemctl enable --now "$t.timer"
 done
 

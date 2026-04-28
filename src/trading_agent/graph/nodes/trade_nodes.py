@@ -57,9 +57,11 @@ def _moomoo_row_to_open_position(row: dict) -> dict:
     side = "BUY" if qty >= 0 else "SELL"
     entry = float(row.get("cost_price") or row.get("avg_price") or 0.0)
     mark = float(row.get("nominal_price") or row.get("current_price") or entry)
+    bare = _bare_ticker(code)
+    from trading_agent import sectors as sectors_lookup
     return {
         "symbol": code,
-        "underlying": "US." + _bare_ticker(code) if "." in code else _bare_ticker(code),
+        "underlying": "US." + bare if "." in code else bare,
         "asset_type": "OPT" if is_opt else "STK",
         "side": side,
         "qty": abs(qty),
@@ -75,7 +77,7 @@ def _moomoo_row_to_open_position(row: dict) -> dict:
         "notional": abs(qty) * (100.0 if is_opt else 1.0) * mark,
         "unrealized_pnl": float(row.get("pl_val") or 0.0),
         "thesis_id": None,
-        "sector": None,
+        "sector": sectors_lookup.lookup(bare),
         "strategy_label": None,
         "age_minutes": 0.0,
     }
@@ -1274,6 +1276,9 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
     positions = state.get("positions") or []
     equity = float(account.get("equity", 100_000.0))
 
+    from trading_agent import sectors as sectors_lookup
+    sectors_loaded = sectors_lookup.known_count() > 0
+
     open_positions = tuple(
         SizingOpenPosition(
             symbol=p.get("symbol", ""),
@@ -1282,12 +1287,12 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
             qty=float(p.get("qty", 0)),
             entry_price=float(p.get("entry_price", 0)),
             stop=p.get("stop"),
-            sector=p.get("sector"),
+            sector=p.get("sector") or sectors_lookup.lookup(_bare_ticker(p.get("symbol", ""))),
             strategy_label=p.get("strategy_label"),
         )
         for p in positions
     )
-    ctx = SizingContext(equity=equity, opens=open_positions, sector_lookup_available=True)
+    ctx = SizingContext(equity=equity, opens=open_positions, sector_lookup_available=sectors_loaded)
 
     requested_qty = float(proposal.get("qty", 0))
     final_qty = 0.0
@@ -1322,7 +1327,7 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
             entry_price=float(proposal.get("entry_price", 0)),
             stop=proposal.get("stop"),
             strategy_label=proposal.get("strategy_label"),
-            sector=proposal.get("sector"),
+            sector=proposal.get("sector") or sectors_lookup.lookup(proposal.get("ticker", "")),
             delta=proposal.get("option_delta"),
             dte=proposal.get("option_dte"),
         )
