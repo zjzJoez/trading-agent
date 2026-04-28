@@ -1,16 +1,24 @@
-"""Phase 2.6 — LangGraph nodes for the online-learning loop.
+"""LangGraph nodes for the online-learning loop.
 
-Two nodes are exposed:
+Three nodes are exposed:
 
-  * ``load_active_params``  — resolves the current ACTIVE param_versions row
-    once per graph run and snapshots it onto ``state["learning"]``.  Every
-    downstream consumer (sizing, regime gate, risk, trader) sees the same
-    values, so the decision has a single ``params_version_id`` for audit.
+  * ``load_active_params``  *(Phase 2.6)* — resolves the current ACTIVE
+    param_versions row once per graph run and snapshots it onto
+    ``state["learning"]``.  Every downstream consumer (sizing, regime gate,
+    risk, trader) sees the same values, so the decision has a single
+    ``params_version_id`` for audit.
 
-  * ``shadow_track``  — best-effort: replays every ``SHADOW``-status param
-    version against the just-sized proposal and writes the counterfactual
-    metrics to ``learning_events`` + ``learning_assignments``.  Never alters
-    the proposal; never raises.
+  * ``shadow_track``  *(Phase 2.6)* — best-effort: replays every
+    ``SHADOW``-status param version against the just-sized proposal and
+    writes the counterfactual metrics to ``learning_events`` +
+    ``learning_assignments``.  Never alters the proposal; never raises.
+
+  * ``assign_canary``  *(Phase 2.7)* — for each active CANARY family,
+    stable-hash on (ticker, date, family) → bucket; if bucket < traffic_pct
+    overlay the canary's keys onto the resolver in
+    ``state["learning"]["params"]``.  Records a ``learning_assignments``
+    row per family routed.  Runs after ``research_ticker`` so the ticker
+    is known.
 """
 from __future__ import annotations
 
@@ -19,7 +27,10 @@ from typing import Any
 
 from trading_agent.events import emit
 from trading_agent.graph.state import TradingGraphState
-from trading_agent.learning.params import load_active_params
+from trading_agent.learning.canary import (
+    list_active_canaries, record_assignment, route_canary,
+)
+from trading_agent.learning.params import ParamResolver, load_active_params
 from trading_agent.learning.shadow import ShadowInputs, run_shadows
 
 log = logging.getLogger(__name__)
@@ -127,4 +138,112 @@ def shadow_track_node(state: TradingGraphState) -> dict:
     return {"learning": learning_payload}
 
 
-__all__ = ["load_active_params_node", "shadow_track_node"]
+def _research_ticker(state: TradingGraphState) -> str | None:
+    research = state.get("research") or {}
+    target = research.get("target_ticker")
+    if target:
+        return str(target).upper().lstrip("US.").lstrip(".")
+    cands = state.get("candidates") or []
+    if cands:
+        first = cands[0]
+        if isinstance(first, dict):
+            t = first.get("ticker")
+            if t:
+                return str(t).upper().lstrip("US.").lstrip(".")
+    return None
+
+
+def assign_canary_node(state: TradingGraphState) -> dict:
+    """Stable-hash route any active CANARY families to control vs canary.
+
+    Runs AFTER ``research_ticker`` so the ticker is known.  No-op when:
+      * no active CANARY rows exist
+      * no ticker can be resolved (degenerate state)
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[learning/assign_canary] run_id=%s", run_id)
+
+    ticker = _research_ticker(state)
+    if not ticker:
+        log.info("[assign_canary] no ticker yet — skipping")
+        return {}
+
+    # Phase 2.8 soak gate — CANARY_DISABLED short-circuits to control
+    from trading_agent.learning.soak import (
+        canary_routing_enabled, current_phase,
+    )
+    soak = current_phase()
+    if not canary_routing_enabled(soak):
+        emit(
+            run_id=run_id, trigger=trigger, agent="assign_canary",
+            event_type="canary_disabled_by_soak",
+            payload={"soak_phase": soak.value},
+        )
+        return {}
+
+    canaries = list_active_canaries()
+    if not canaries:
+        return {}
+
+    learning_payload = state.get("learning") or {}
+    control_dict = learning_payload.get("params") or {}
+    control = ParamResolver(
+        version_id=control_dict.get("version_id"),
+        status=control_dict.get("status", "DEFAULTS"),
+        scope=control_dict.get("scope", "global"),
+        scope_key=control_dict.get("scope_key"),
+        values=dict(control_dict.get("values") or {}),
+    )
+
+    routed = route_canary(
+        control,
+        ticker=ticker,
+        ts=state.get("ts"),
+        canaries=canaries,
+    )
+
+    # Record one learning_assignments row per canary considered (whether
+    # we routed to it or not).  The bucket integer makes the routing
+    # decision auditable post-hoc.
+    proposal = state.get("proposal") or {}
+    proposal_id = str(proposal.get("proposal_id") or run_id)
+    strategy_label = str(proposal.get("strategy_label") or "n/a")
+    for d in routed.routed_to_canary + routed.routed_to_control:
+        record_assignment(
+            proposal_id=proposal_id,
+            ticker=ticker,
+            strategy_label=strategy_label,
+            baseline_param_version_id=control.version_id,
+            assigned_param_version_id=(
+                d.canary_version_id if d.routed_to_canary
+                else (control.version_id or 0)
+            ),
+            bucket=d.bucket,
+            reason=(
+                f"phase_2_7_canary_{d.family.value}"
+                if d.routed_to_canary
+                else f"phase_2_7_control_{d.family.value}"
+            ),
+        )
+
+    emit(
+        run_id=run_id, trigger=trigger, agent="assign_canary",
+        event_type="canary_routed",
+        payload=routed.to_audit_dict(),
+    )
+
+    new_learning = {
+        **learning_payload,
+        "params": routed.resolver.to_audit_dict(),
+        "params_version_id": routed.resolver.version_id,
+        "canary_routed": [d.family.value for d in routed.routed_to_canary],
+    }
+    return {"learning": new_learning}
+
+
+__all__ = [
+    "assign_canary_node",
+    "load_active_params_node",
+    "shadow_track_node",
+]

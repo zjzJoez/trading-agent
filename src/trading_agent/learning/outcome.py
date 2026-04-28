@@ -91,13 +91,26 @@ def compute_outcome(trade_row: dict[str, Any]) -> OutcomeMetrics:
 
     option_iv_change = _safe_float(fill_blob.get("iv_change"))
 
+    # Phase 2.7.5 — MAE / MFE read from journal_trades persisted by
+    # intraday update_excursions_node.  None when the trade closed before
+    # any intraday refresh fired (e.g. immediate same-tick close).
+    mae: float | None = None
+    mfe: float | None = None
+    tid = trade_row.get("id")
+    if tid is not None:
+        try:
+            from trading_agent.learning.excursion import read_extremes
+            mae, mfe = read_extremes(int(tid))
+        except Exception:
+            pass
+
     return OutcomeMetrics(
         realized_r=realized_r,
         holding_days=holding_days,
         slippage_bps=slippage_bps,
         option_iv_change=option_iv_change,
-        mae=None,  # Phase 2.6.5 — needs intraday quote path
-        mfe=None,
+        mae=mae,
+        mfe=mfe,
     )
 
 
@@ -199,10 +212,10 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
                        jt.opened_at, jt.closed_at, jt.broker_fill_json,
                        jt.entry_regime_state_id, jt.exit_regime_state_id,
                        jt.params_version_id, jt.risk_decision_id, jt.outcome,
-                       jth.strategy_label, rs.label AS entry_regime_label
+                       jt.broker_fill_json->>'strategy_label' AS strategy_label,
+                       rs.label AS entry_regime_label
                 FROM journal_trades jt
                 LEFT JOIN trade_outcome_features tof ON tof.trade_id = jt.id
-                LEFT JOIN journal_theses jth ON jth.id = jt.thesis_id
                 LEFT JOIN regime_states rs ON rs.id = jt.entry_regime_state_id
                 WHERE jt.outcome IN ('CLOSED', 'STOPPED', 'TARGET_HIT')
                   AND tof.id IS NULL

@@ -1,0 +1,13 @@
+[Unit]
+Description=trading-agent weekly learning Critic — Saturdays 02:00 UTC
+Requires=trading-agent-brain@weekly_learning.service
+
+[Timer]
+# Saturday post-close. US close is 21:00 UTC Friday (winter); we wait until
+# the EOD review has run + extra slack so trade_outcome_features is fresh.
+OnCalendar=Sat *-*-* 02:00:00 UTC
+Persistent=true
+Unit=trading-agent-brain@weekly_learning.service
+
+[Install]
+WantedBy=timers.target

@@ -595,7 +595,26 @@ def execute_paper_order(state: TradingGraphState) -> dict:
         log.info("[execute_paper_order] decision=%s — no order to place", risk.get("decision"))
         return {}
 
+    # Phase 2.8 soak gate — READ_ONLY blocks all new entries
+    from trading_agent.learning.soak import current_phase, is_new_entry_allowed, tiny_paper_qty_cap
+    phase = current_phase()
+    if not is_new_entry_allowed(phase):
+        log.info("[execute_paper_order] soak_phase=%s blocks new entries", phase.value)
+        emit(
+            run_id=run_id, trigger=trigger, agent="execute_paper_order",
+            event_type="soak_read_only_block",
+            payload={"soak_phase": phase.value, "proposal_id": proposal.get("proposal_id")},
+        )
+        return {}
+
     approved_qty = int(risk.get("approved_qty") or 0)
+    # TINY_PAPER soak phase clamps to 1 contract regardless of sizing decision
+    cap = tiny_paper_qty_cap(phase)
+    if cap is not None and approved_qty > cap:
+        log.info("[execute_paper_order] soak_phase=%s caps qty %d→%d",
+                 phase.value, approved_qty, cap)
+        approved_qty = cap
+
     if approved_qty <= 0:
         log.info("[execute_paper_order] approved_qty=0 — nothing to place")
         return {}

@@ -18,6 +18,7 @@ from trading_agent.graph.checkpointer import get_saver
 from trading_agent.graph.nodes import eod_learning as EL
 from trading_agent.graph.nodes import learning_nodes as L
 from trading_agent.graph.nodes import regime_nodes as R
+from trading_agent.graph.nodes import weekly_learning as WL
 from trading_agent.graph.nodes import risk_nodes as RK
 from trading_agent.graph.nodes import stubs as N
 from trading_agent.graph.nodes import trade_nodes as T
@@ -64,6 +65,7 @@ def build_candidate_entry_graph():
         ("load_latest_regime", T.load_latest_regime),
         ("load_open_positions", T.load_open_positions),
         ("research_ticker", T.research_ticker),
+        ("assign_canary", L.assign_canary_node),
         ("researcher_debate", T.researcher_debate),
         ("retrieve_past_lessons", T.retrieve_past_lessons),
         ("create_or_refresh_thesis", T.create_or_refresh_thesis),
@@ -90,7 +92,8 @@ def build_candidate_entry_graph():
     g.add_edge("load_active_params", "load_latest_regime")
     g.add_edge("load_latest_regime", "load_open_positions")
     g.add_edge("load_open_positions", "research_ticker")
-    g.add_edge("research_ticker", "researcher_debate")
+    g.add_edge("research_ticker", "assign_canary")
+    g.add_edge("assign_canary", "researcher_debate")
     g.add_edge("researcher_debate", "retrieve_past_lessons")
     # Build the proposal first, then bind a thesis row to it (so the thesis
     # row has the concrete strategy_label / direction / numeric levels).
@@ -138,6 +141,7 @@ def build_intraday_monitor_graph():
     g.add_node("opend_health", N.opend_health)
     g.add_node("load_open_positions", T.load_open_positions)
     g.add_node("refresh_quotes_and_greeks", N.refresh_quotes_and_greeks)
+    g.add_node("update_excursions", EL.update_excursions_node)
     g.add_node("load_latest_regime", T.load_latest_regime)
     g.add_node("active_risk_snapshot", RK.active_risk_snapshot)
     g.add_node("detect_exit_triggers", N.detect_exit_triggers)
@@ -147,7 +151,8 @@ def build_intraday_monitor_graph():
     g.add_edge("load_active_params", "opend_health")
     g.add_edge("opend_health", "load_open_positions")
     g.add_edge("load_open_positions", "refresh_quotes_and_greeks")
-    g.add_edge("refresh_quotes_and_greeks", "load_latest_regime")
+    g.add_edge("refresh_quotes_and_greeks", "update_excursions")
+    g.add_edge("update_excursions", "load_latest_regime")
     g.add_edge("load_latest_regime", "active_risk_snapshot")
     g.add_edge("active_risk_snapshot", "detect_exit_triggers")
     g.add_edge("detect_exit_triggers", "route_exit_or_hold")
@@ -166,6 +171,7 @@ def build_eod_review_graph():
     g.add_node("persist_daily_marks", N.persist_daily_marks)
     g.add_node("update_regime_accuracy_labels", N.update_regime_accuracy_labels)
     g.add_node("enrich_outcomes", EL.enrich_outcomes_node)
+    g.add_node("promote_or_rollback", EL.promote_or_rollback_node)
     g.add_node("generate_eod_digest", N.generate_eod_digest)
     g.add_node("ntfy_daily_summary", N.ntfy_daily_summary)
 
@@ -174,7 +180,8 @@ def build_eod_review_graph():
     g.add_edge("mark_to_market", "persist_daily_marks")
     g.add_edge("persist_daily_marks", "update_regime_accuracy_labels")
     g.add_edge("update_regime_accuracy_labels", "enrich_outcomes")
-    g.add_edge("enrich_outcomes", "generate_eod_digest")
+    g.add_edge("enrich_outcomes", "promote_or_rollback")
+    g.add_edge("promote_or_rollback", "generate_eod_digest")
     g.add_edge("generate_eod_digest", "ntfy_daily_summary")
     g.add_edge("ntfy_daily_summary", END)
 
@@ -199,6 +206,27 @@ def build_healthcheck_graph():
 
 
 # -----------------------------------------------------------------------------
+# weekly_learning_graph (Phase 2.7.5) — Saturday post-close LLM Critic loop
+# -----------------------------------------------------------------------------
+def build_weekly_learning_graph():
+    g = StateGraph(TradingGraphState)
+    g.add_node("collect_outcomes_weekly", WL.collect_outcomes_node)
+    g.add_node("critic_propose", WL.critic_propose_node)
+    g.add_node("replay_validate", WL.replay_validate_node)
+    g.add_node("promote_to_canary", WL.promote_to_canary_node)
+    g.add_node("ntfy_learning_digest", WL.ntfy_learning_digest_node)
+
+    g.add_edge(START, "collect_outcomes_weekly")
+    g.add_edge("collect_outcomes_weekly", "critic_propose")
+    g.add_edge("critic_propose", "replay_validate")
+    g.add_edge("replay_validate", "promote_to_canary")
+    g.add_edge("promote_to_canary", "ntfy_learning_digest")
+    g.add_edge("ntfy_learning_digest", END)
+
+    return g.compile(checkpointer=get_saver())
+
+
+# -----------------------------------------------------------------------------
 # Registry — used by orchestrator dispatcher
 # -----------------------------------------------------------------------------
 GRAPH_BUILDERS = {
@@ -206,6 +234,7 @@ GRAPH_BUILDERS = {
     "candidate_entry": build_candidate_entry_graph,
     "intraday_monitor": build_intraday_monitor_graph,
     "eod_review": build_eod_review_graph,
+    "weekly_learning": build_weekly_learning_graph,
     "healthcheck": build_healthcheck_graph,
 }
 
