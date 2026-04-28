@@ -124,6 +124,7 @@ def _stats_for_version(param_version_id: int) -> OutcomeStats:
 
 
 def _aggregate(rs: list[float]) -> OutcomeStats:
+    from trading_agent.learning._stats import series_max_drawdown
     n = len(rs)
     wins = sum(1 for r in rs if r > 0)
     losses = sum(1 for r in rs if r < 0)
@@ -137,13 +138,7 @@ def _aggregate(rs: list[float]) -> OutcomeStats:
         pf = float("inf")
     else:
         pf = 0.0
-    cum = 0.0
-    peak = 0.0
-    mdd = 0.0
-    for r in rs:
-        cum += r
-        peak = max(peak, cum)
-        mdd = max(mdd, peak - cum)
+    cum, mdd = series_max_drawdown(rs)
     return OutcomeStats(
         n=n, wins=wins, losses=losses,
         win_rate=win_rate, wilson_lb=wlb,

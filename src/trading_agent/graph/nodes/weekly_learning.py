@@ -100,7 +100,13 @@ def _last_n_days_outcomes(days: int = LOOKBACK_DAYS) -> dict[str, Any]:
 
 
 def _recent_param_changes(weeks: int = 4) -> list[dict[str, Any]]:
-    """Anti-thrashing: surface params that were already touched recently."""
+    """Anti-thrashing: surface params that were already touched recently.
+
+    Best-effort — DB read failures degrade to an empty list (the Critic
+    just sees no recent changes context, slightly more likely to thrash
+    a knob).  We log the failure so it's visible in agent_events / brain
+    log instead of silently disappearing.
+    """
     since = datetime.now(timezone.utc) - timedelta(weeks=weeks)
     try:
         with cursor() as cur:
@@ -114,7 +120,8 @@ def _recent_param_changes(weeks: int = 4) -> list[dict[str, Any]]:
                 (since,),
             )
             rows = cur.fetchall()
-    except Exception:
+    except Exception as e:
+        log.warning("_recent_param_changes: db read failed (%s)", e)
         return []
     out: list[dict[str, Any]] = []
     for rid, status, created_at, params, rationale in rows:

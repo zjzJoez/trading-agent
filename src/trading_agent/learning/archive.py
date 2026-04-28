@@ -166,12 +166,7 @@ def _composite_from_running(
     return float(sharpe - LAMBDA_MDD * mdd)
 
 
-def _next_drawdown(prev_peak: float, prev_mdd: float, new_cum: float) -> tuple[float, float]:
-    """Update peak and max-drawdown after appending a trade with new cum_R."""
-    peak = max(prev_peak, new_cum)
-    drop = peak - new_cum
-    mdd = max(prev_mdd, drop)
-    return peak, mdd
+from trading_agent.learning._stats import running_drawdown_step as _next_drawdown
 
 
 # ---------------------------------------------------------------------------

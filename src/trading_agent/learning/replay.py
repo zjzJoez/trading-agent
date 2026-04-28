@@ -284,13 +284,8 @@ def _aggregate(rs: list[float], baseline_rs: list[float] | None = None) -> Repla
     sd = math.sqrt(var)
     sharpe = _safe_div(mean, sd) * math.sqrt(252.0 / max(1, n))
 
-    cum = 0.0
-    peak = 0.0
-    mdd = 0.0
-    for r in rs:
-        cum += r
-        peak = max(peak, cum)
-        mdd = max(mdd, peak - cum)
+    from trading_agent.learning._stats import series_max_drawdown
+    cum, mdd = series_max_drawdown(rs)
 
     # Information ratio vs baseline (if provided)
     if baseline_rs and len(baseline_rs) == n:
