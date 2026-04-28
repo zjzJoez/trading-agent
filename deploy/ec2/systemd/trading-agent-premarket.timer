@@ -1,0 +1,12 @@
+[Unit]
+Description=trading-agent premarket scan @ 12:30 UTC weekdays
+Requires=trading-agent-brain@premarket_scan.service
+
+[Timer]
+# US premarket: 8:30 ET (winter) / 7:30 ET (summer DST). UTC 12:30.
+OnCalendar=Mon..Fri *-*-* 12:30:00 UTC
+Persistent=true
+Unit=trading-agent-brain@premarket_scan.service
+
+[Install]
+WantedBy=timers.target

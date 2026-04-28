@@ -1,0 +1,12 @@
+[Unit]
+Description=trading-agent end-of-day review @ 21:30 UTC weekdays
+Requires=trading-agent-brain@eod_review.service
+
+[Timer]
+# US close: 16:00 ET = 21:00 UTC (winter). Run reconcile at 21:30 UTC to catch all fills.
+OnCalendar=Mon..Fri *-*-* 21:30:00 UTC
+Persistent=true
+Unit=trading-agent-brain@eod_review.service
+
+[Install]
+WantedBy=timers.target

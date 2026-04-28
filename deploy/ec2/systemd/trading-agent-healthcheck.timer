@@ -1,0 +1,12 @@
+[Unit]
+Description=trading-agent hourly healthcheck
+Requires=trading-agent-brain@healthcheck.service
+
+[Timer]
+# Run hourly always (no business-day filter). The healthcheck graph is silent when OK.
+OnCalendar=*-*-* *:05:00 UTC
+Persistent=false
+Unit=trading-agent-brain@healthcheck.service
+
+[Install]
+WantedBy=timers.target

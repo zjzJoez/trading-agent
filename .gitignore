@@ -11,6 +11,9 @@ wheels/
 
 # Env & secrets
 .env
+.env.*
+!.env.example
+!.env.*.example
 *.pem
 *.key
 
@@ -28,6 +31,15 @@ deploy/launchd/*.plist
 data/*
 !data/.gitkeep
 !data/sectors.csv
+
+# Personal artifacts — not framework code, contain author's own trades / notes
+scripts/generate_postmortem.py
+HANDOFF*.md
+*.HANDOFF.md
+
+# Local-only Phase 2 audit fallback file (`agent_events.fallback.jsonl` lives
+# in $HOME, not the repo, but pin it just in case it ever gets dropped here)
+agent_events.fallback.jsonl
 
 # OS
 .DS_Store

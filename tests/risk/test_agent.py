@@ -1,0 +1,214 @@
+"""End-to-end tests for the Active Risk Agent's `decide()` orchestration.
+
+Verifies APPROVE / DOWNSIZE / VETO / DEFER paths combining deterministic
+guardrails + (stub) LLM council.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from trading_agent.risk.agent import RiskInput, decide
+from trading_agent.risk.portfolio import OpenPosition, PortfolioSnapshot, build_snapshot
+
+
+def _opt(symbol="US.SPY260530C00720000", **kw) -> OpenPosition:
+    base = dict(
+        symbol=symbol,
+        underlying="US.SPY",
+        asset_type="OPT",
+        side="BUY",
+        qty=10.0,
+        entry_price=1.5,
+        mark=1.5,
+        stop=None,
+        target=None,
+        delta=0.4,
+        gamma=0.02,
+        vega=0.10,
+        theta=-0.05,
+        iv=0.18,
+        notional=1500.0,
+        unrealized_pnl=0.0,
+        thesis_id=None,
+        sector="Information Technology",
+        strategy_label="long_call",
+        age_minutes=5.0,
+    )
+    base.update(kw)
+    return OpenPosition(**base)
+
+
+def _empty_snapshot(equity=100_000) -> PortfolioSnapshot:
+    return build_snapshot(equity=equity, cash=equity, open_positions=[])
+
+
+def _proposal(qty=10.0, **kw) -> dict:
+    base = dict(
+        proposal_id="prop_test_1",
+        ticker="SPY",
+        symbol="US.SPY260530C00720000",
+        asset_type="OPT",
+        direction="LONG_CALL",
+        side="BUY",
+        qty=qty,
+        entry_price=1.5,
+        strategy_label="long_call",
+        thesis_id=1,
+        params_version_id=1,
+    )
+    base.update(kw)
+    return base
+
+
+def test_clean_bull_approves():
+    """Empty portfolio + small new option in BULL → APPROVE."""
+    out = decide(
+        RiskInput(
+            proposal=_proposal(),
+            portfolio=_empty_snapshot(),
+            regime={"label": "BULL_TREND", "confidence": 0.85},
+        )
+    )
+    assert out.decision == "APPROVE"
+    assert out.approved_qty == 10.0
+    assert out.hard_violations == []
+
+
+def test_real_trading_marker_vetos_unconditionally():
+    out = decide(
+        RiskInput(
+            proposal=_proposal(),
+            portfolio=_empty_snapshot(),
+            regime={"label": "BULL_TREND", "confidence": 0.85},
+            real_trading_marker_detected=True,
+        )
+    )
+    assert out.decision == "VETO"
+    assert out.approved_qty == 0.0
+    assert "real_trading_marker_blocked" in out.reasons
+
+
+def test_crisis_regime_vetos_new_entry():
+    out = decide(
+        RiskInput(
+            proposal=_proposal(),
+            portfolio=_empty_snapshot(),
+            regime={"label": "CRISIS", "confidence": 0.7},
+        )
+    )
+    assert out.decision == "VETO"
+    assert out.approved_qty == 0.0
+
+
+def test_heat_breach_downsizes():
+    """Existing portfolio with high heat triggers DOWNSIZE in BULL."""
+    # 10 long contracts at $4 entry → 10×4×100 = $4000 at risk on $50k equity = 8%
+    # Use vega=0/delta=0 to isolate the heat breach (avoid greek-stress side breaches)
+    existing = _opt(qty=10, entry_price=4.0, delta=0.0, gamma=0.0, vega=0.0, theta=0.0)
+    snap = build_snapshot(equity=50_000, cash=50_000, open_positions=[existing])
+    out = decide(
+        RiskInput(
+            proposal=_proposal(qty=10, entry_price=0.01),  # tiny new proposal so it doesn't add heat
+            portfolio=snap,
+            regime={"label": "BULL_TREND", "confidence": 0.85},
+        )
+    )
+    # Heat 8% breaches BULL cap of 6% but is within 1.5× → DOWNSIZE
+    assert out.decision == "DOWNSIZE"
+    assert 0 <= out.approved_qty <= 10.0
+    # Heat-only DOWNSIZE: factor 6/8 = 0.75; 10×0.75 = 7 (floored to int contracts)
+    assert out.approved_qty == 7.0
+
+
+def test_extreme_heat_vetos():
+    """Heat 12% in BULL (cap 6%) → 2× → VETO."""
+    existing = _opt(qty=10, entry_price=6.0)  # $6k at-risk on $50k = 12%
+    snap = build_snapshot(equity=50_000, cash=50_000, open_positions=[existing])
+    out = decide(
+        RiskInput(
+            proposal=_proposal(qty=10),
+            portfolio=snap,
+            regime={"label": "BULL_TREND", "confidence": 0.85},
+        )
+    )
+    assert out.decision == "VETO"
+    assert out.approved_qty == 0.0
+
+
+def test_downsize_to_zero_contracts_becomes_veto():
+    """If suggested factor floors options to 0 contracts, that's a VETO."""
+    # Heat-only breach (no greek stress) so we get clean DOWNSIZE; tiny qty
+    # forces floor-to-int 0 contracts → flipped to VETO.
+    existing = _opt(qty=10, entry_price=4.0, delta=0.0, gamma=0.0, vega=0.0, theta=0.0)
+    snap = build_snapshot(equity=50_000, cash=50_000, open_positions=[existing])
+    out = decide(
+        RiskInput(
+            proposal=_proposal(qty=1, entry_price=0.01),
+            portfolio=snap,
+            regime={"label": "BULL_TREND", "confidence": 0.85},
+        )
+    )
+    # DOWNSIZE factor 0.75 × 1 contract = 0.75 → int floor 0 → VETO
+    assert out.decision == "VETO"
+    assert "downsize_to_zero_contracts" in out.reasons
+
+
+def test_data_quality_critical_defers():
+    """Stale Greeks (age >60min) on existing position → degradation_level=2 → DEFER."""
+    bad = _opt(delta=None, gamma=None)  # missing critical greeks
+    snap = build_snapshot(equity=100_000, cash=100_000, open_positions=[bad])
+    out = decide(
+        RiskInput(
+            proposal=_proposal(),
+            portfolio=snap,
+            regime={"label": "BULL_TREND", "confidence": 0.85},
+        )
+    )
+    assert out.decision == "DEFER"
+    assert out.approved_qty == 0.0
+
+
+def test_max_entry_price_includes_headroom():
+    """APPROVE max_entry_price = entry × 1.005 for limit-price headroom."""
+    out = decide(
+        RiskInput(
+            proposal=_proposal(entry_price=2.0),
+            portfolio=_empty_snapshot(),
+            regime={"label": "BULL_TREND", "confidence": 0.85},
+        )
+    )
+    assert abs(out.max_entry_price - 2.01) < 1e-6
+
+
+def test_decision_id_unique_and_expires_set():
+    out1 = decide(
+        RiskInput(
+            proposal=_proposal(),
+            portfolio=_empty_snapshot(),
+            regime={"label": "BULL_TREND", "confidence": 0.85},
+        )
+    )
+    out2 = decide(
+        RiskInput(
+            proposal=_proposal(),
+            portfolio=_empty_snapshot(),
+            regime={"label": "BULL_TREND", "confidence": 0.85},
+        )
+    )
+    assert out1.risk_decision_id != out2.risk_decision_id
+    assert out1.expires_at  # non-empty ISO string
+    # parseable
+    datetime.fromisoformat(out1.expires_at)
+
+
+def test_council_invoked_in_volatile_transition_regime():
+    """VOLATILE_TRANSITION always triggers stub council per §7.4."""
+    out = decide(
+        RiskInput(
+            proposal=_proposal(),
+            portfolio=_empty_snapshot(),
+            regime={"label": "VOLATILE_TRANSITION", "confidence": 0.65},
+        )
+    )
+    assert out.council_result is not None
+    assert out.council_result.arbiter_reason == "stub_no_llm"

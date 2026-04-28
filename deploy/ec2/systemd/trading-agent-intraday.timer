@@ -1,0 +1,15 @@
+[Unit]
+Description=trading-agent intraday monitor every 15 min during US hours
+Requires=trading-agent-brain@intraday_monitor.service
+
+[Timer]
+# US regular hours: ~13:30 - 20:00 UTC. Tick every 15 minutes during 13-20 UTC.
+# Plus one extra at 20:50 UTC (10 min before US close).
+# (13:00,13:15 fall outside US session and just no-op the graph cheaply.)
+OnCalendar=Mon..Fri *-*-* 13,14,15,16,17,18,19,20:00,15,30,45 UTC
+OnCalendar=Mon..Fri *-*-* 20:50:00 UTC
+Persistent=false
+Unit=trading-agent-brain@intraday_monitor.service
+
+[Install]
+WantedBy=timers.target
