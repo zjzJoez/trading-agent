@@ -246,6 +246,45 @@ def record_virtual_fill(
 
 
 @mcp.tool()
+def record_virtual_stock_fill(
+    ticker: str,
+    side: Literal["BUY", "SELL"],
+    qty: int,
+    price: float,
+    thesis_id: int,
+    strategy_label: str | None = None,
+    reasoning: str | None = None,
+) -> dict:
+    """Record a virtual stock/ETF fill — used to mirror real-account stock
+    positions into the paper journal for shadow tracking (e.g. logging an
+    AMZN holding so the post-mortem pipeline can reason about it without
+    actually placing a paper order).
+
+    Mirror of `record_virtual_fill` but for the stock leg of the asset
+    universe: `ticker` is the bare symbol ("AMZN", not "US.AMZN"), `qty` is
+    shares, `price` is the fill price. Stored in trades with
+    `broker_order_id='VIRTUAL-<uuid>'`, `asset_type='STK'`, `is_paper=1`.
+    `qty` is stored unsigned — `side` carries the direction (matching the
+    existing convention of `record_fill` / `record_virtual_fill`).
+    """
+    import uuid
+    virtual_id = f"VIRTUAL-{uuid.uuid4().hex[:12]}"
+    return _insert_fill(
+        broker_order_id=virtual_id,
+        symbol=ticker.upper(),
+        asset_type="STK",
+        side=side,
+        qty=qty,
+        fill_price=price,
+        thesis_id=thesis_id,
+        strategy_label=strategy_label,
+        stop=None,
+        target=None,
+        reasoning=reasoning,
+    )
+
+
+@mcp.tool()
 def close_trade(
     trade_id: int,
     exit_price: float,
