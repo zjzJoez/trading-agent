@@ -185,6 +185,10 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
 
     Designed to be called by ``eod_review_graph`` (already wired) and by
     ``weekly_learning_graph`` (Phase 2.7).
+
+    Phase 2.6.5: also updates the diversity archive
+    (``param_archive_cells``) with the realized R, electing a per-cell
+    champion when the candidate beats the current one.
     """
     enriched: list[int] = []
     try:
@@ -194,9 +198,12 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
                 SELECT jt.id, jt.entry_price, jt.exit_price, jt.stop,
                        jt.opened_at, jt.closed_at, jt.broker_fill_json,
                        jt.entry_regime_state_id, jt.exit_regime_state_id,
-                       jt.params_version_id, jt.risk_decision_id, jt.outcome
+                       jt.params_version_id, jt.risk_decision_id, jt.outcome,
+                       jth.strategy_label, rs.label AS entry_regime_label
                 FROM journal_trades jt
                 LEFT JOIN trade_outcome_features tof ON tof.trade_id = jt.id
+                LEFT JOIN journal_theses jth ON jth.id = jt.thesis_id
+                LEFT JOIN regime_states rs ON rs.id = jt.entry_regime_state_id
                 WHERE jt.outcome IN ('CLOSED', 'STOPPED', 'TARGET_HIT')
                   AND tof.id IS NULL
                 ORDER BY jt.closed_at DESC NULLS LAST
@@ -211,7 +218,8 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
 
     for r in rows:
         (tid, entry, exit_, stop, opened_at, closed_at, fill,
-         entry_rs, exit_rs, pvid, rdid, outcome) = r
+         entry_rs, exit_rs, pvid, rdid, outcome,
+         strategy_label, entry_regime_label) = r
         trade_row = {
             "id": tid,
             "entry_price": entry,
@@ -234,6 +242,17 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
         )
         if new_id is not None:
             enriched.append(int(tid))
+            # Phase 2.6.5 — diversity archive update (best-effort; isolated
+            # from the outcome write so a failure here can't lose the audit row)
+            if metrics.realized_r is not None and pvid is not None:
+                _try_archive_update(
+                    closed_at=closed_at,
+                    realized_R=metrics.realized_r,
+                    param_version_id=int(pvid),
+                    fill_blob=fill,
+                    strategy_label=strategy_label,
+                    entry_regime_label=entry_regime_label,
+                )
 
     if enriched:
         emit(
@@ -244,6 +263,51 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
             payload={"trade_ids": enriched, "n": len(enriched)},
         )
     return enriched
+
+
+def _try_archive_update(
+    *,
+    closed_at,
+    realized_R: float,
+    param_version_id: int,
+    fill_blob,
+    strategy_label: str | None,
+    entry_regime_label: str | None,
+) -> None:
+    """Best-effort hook from outcome enrichment into the diversity archive.
+
+    Pulls option_dte / option_iv from the broker_fill_json (or proposal
+    field stashed therein) and computes the (regime, strategy, dte_bucket,
+    iv_bucket) cell, then calls archive.update_champion. Never raises.
+    """
+    try:
+        from trading_agent.learning.archive import (
+            cell_for_trade, update_champion,
+        )
+    except Exception as e:
+        log.warning("archive import failed: %s", e)
+        return
+
+    fb = fill_blob if isinstance(fill_blob, dict) else (
+        json.loads(fill_blob) if isinstance(fill_blob, str) and fill_blob else {}
+    )
+    option_dte = _safe_float(fb.get("option_dte")) if isinstance(fb, dict) else None
+    option_iv = _safe_float(fb.get("option_iv")) if isinstance(fb, dict) else None
+    cell = cell_for_trade(
+        regime_label=entry_regime_label,
+        strategy_label=strategy_label,
+        option_dte=option_dte,
+        option_iv=option_iv,
+    )
+    res = update_champion(
+        cell, param_version_id, realized_R, trade_at=closed_at,
+    )
+    log.info(
+        "[archive] cell=%s pv=%s R=%.4f n=%s score=%s champion_changed=%s",
+        cell.to_text(), param_version_id, realized_R,
+        res.get("n_trades"), res.get("score_after"),
+        res.get("champion_changed"),
+    )
 
 
 def _lookup_risk_snapshot_id(risk_decision_id: str | None) -> int | None:

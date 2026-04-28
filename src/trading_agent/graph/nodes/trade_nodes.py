@@ -744,8 +744,19 @@ def persist_trade_event(state: TradingGraphState) -> dict:
                     risk.get("risk_decision_id"),
                     learning.get("params_version_id"),
                     regime.get("state_id"),
-                    _json.dumps({**fill, "raw_response": order.get("raw_response")},
-                                default=str),
+                    _json.dumps(
+                        {
+                            **fill,
+                            "raw_response": order.get("raw_response"),
+                            # Phase 2.6.5 — stash a few proposal fields for the
+                            # diversity-archive cell calculation post-close
+                            "option_dte": proposal.get("option_dte"),
+                            "option_iv": proposal.get("option_iv"),
+                            "option_delta": proposal.get("option_delta"),
+                            "strategy_label": proposal.get("strategy_label"),
+                        },
+                        default=str,
+                    ),
                 ),
             )
             trade_id = int(cur.fetchone()[0])
