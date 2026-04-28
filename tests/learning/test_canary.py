@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from trading_agent.learning.canary import (
+    CANARY_INELIGIBLE_FAMILIES,
     DEFAULT_INITIAL_TRAFFIC_PCT,
     ActiveCanary,
     MultiFamilyCanary,
@@ -141,6 +142,18 @@ def test_route_zero_traffic_never_routes_canary():
     assert routed.routed_to_control
     # Resolver still defaults
     assert routed.resolver.get("r1_soft_cap_pct") == 0.020
+
+
+def test_ineligible_families_documented():
+    """Codex review 🔴 — ENTRY_FILTERS and CANDIDATE_COUNT take effect upstream
+    of assign_canary_node and would mis-attribute outcomes if routed live."""
+    assert ParamFamily.ENTRY_FILTERS in CANARY_INELIGIBLE_FAMILIES
+    assert ParamFamily.CANDIDATE_COUNT in CANARY_INELIGIBLE_FAMILIES
+    # The deterministic-replay families MUST stay eligible
+    assert ParamFamily.SIZING_AGGRESSION not in CANARY_INELIGIBLE_FAMILIES
+    assert ParamFamily.STOP_DISTANCES not in CANARY_INELIGIBLE_FAMILIES
+    assert ParamFamily.REGIME_THRESHOLDS not in CANARY_INELIGIBLE_FAMILIES
+    assert ParamFamily.REGIME_SIZE_MULTIPLIERS not in CANARY_INELIGIBLE_FAMILIES
 
 
 def test_route_does_not_mutate_control():

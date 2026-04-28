@@ -143,6 +143,16 @@ def _composite_from_running(
     """Compute `sharpe − λ·MDD` from running aggregates.
 
     Returns ``None`` until at least 2 trades exist (variance undefined).
+
+    Note (intentional): ``var`` is the **population** variance
+    ``E[X²] − E[X]²`` rather than the sample variance ``Σ(x−μ)²/(n−1)``.
+    At cell granularity we routinely operate at ``n ∈ [3, 20]`` where
+    Bessel-corrected sample variance amplifies noise more than it
+    corrects bias for the comparison we care about (cell ranking, not
+    absolute Sharpe).  Switching to sample variance would require
+    re-tuning ``MIN_TRADES_FOR_CHAMPION`` and the Phase 2.7.5 weekly
+    Critic's selection thresholds — kept as population variance until
+    that calibration round.
     """
     if n < 2:
         return None

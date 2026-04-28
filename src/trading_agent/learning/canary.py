@@ -344,28 +344,30 @@ def maybe_ramp_traffic(canary_version_id: int) -> bool:
     "Clean" here means simply: no rollback fired yet.  If a rollback
     occurred the row has status=REJECTED and this function returns False.
     Returns True if a ramp UPDATE was applied.
+
+    Atomic: the conditional UPDATE eliminates the SELECT/UPDATE TOCTOU —
+    concurrent eod runs cannot double-ramp because only the first one
+    matches ``traffic_pct < RAMPED_TRAFFIC_PCT`` and reserves the row.
     """
+    n = n_trades_for_canary(canary_version_id)
+    if n < RAMP_AFTER_N_TRADES:
+        return False
     try:
         with cursor() as cur:
             cur.execute(
-                "SELECT status, traffic_pct FROM param_versions WHERE id = %s",
-                (canary_version_id,),
+                """
+                UPDATE param_versions
+                SET traffic_pct = %s
+                WHERE id = %s
+                  AND status = 'CANARY'
+                  AND traffic_pct < %s
+                RETURNING traffic_pct
+                """,
+                (RAMPED_TRAFFIC_PCT, canary_version_id, RAMPED_TRAFFIC_PCT),
             )
             row = cur.fetchone()
             if row is None:
                 return False
-            status, traffic = row
-            if str(status) != "CANARY":
-                return False
-            if float(traffic) >= RAMPED_TRAFFIC_PCT:
-                return False
-            n = n_trades_for_canary(canary_version_id)
-            if n < RAMP_AFTER_N_TRADES:
-                return False
-            cur.execute(
-                "UPDATE param_versions SET traffic_pct = %s WHERE id = %s",
-                (RAMPED_TRAFFIC_PCT, canary_version_id),
-            )
             cur.execute(
                 """
                 INSERT INTO learning_events (event_type, param_version_id, payload)
@@ -374,7 +376,6 @@ def maybe_ramp_traffic(canary_version_id: int) -> bool:
                 (
                     canary_version_id,
                     json.dumps({
-                        "from_pct": float(traffic),
                         "to_pct": RAMPED_TRAFFIC_PCT,
                         "n_trades": n,
                     }),
@@ -390,6 +391,21 @@ def maybe_ramp_traffic(canary_version_id: int) -> bool:
 # Insertion helper for Phase 2.7.5 (LLM Critic creates CANARYs)
 # ---------------------------------------------------------------------------
 
+CANARY_INELIGIBLE_FAMILIES: frozenset[ParamFamily] = frozenset({
+    # ENTRY_FILTERS and CANDIDATE_COUNT take effect upstream of
+    # assign_canary_node (in scout / research_ticker / build_trade_proposal).
+    # Routing them at sizing time would mis-attribute outcomes to the
+    # canary version since the candidates were already chosen under control.
+    # Keep them in shadow-only mode until the node ordering is rearchitected.
+    ParamFamily.ENTRY_FILTERS,
+    ParamFamily.CANDIDATE_COUNT,
+})
+
+
+class CanaryFamilyIneligible(RuntimeError):
+    """Raised when a CANARY targets a family that can't yet be routed live."""
+
+
 def insert_canary(
     *,
     parent_version_id: int,
@@ -401,6 +417,11 @@ def insert_canary(
     """Create a CANARY row.  Validates single-family + no active canary
     in that family; raises on conflict so the caller learns immediately."""
     fam = family_of_params(params)  # raises MultiFamilyCanary if invalid
+    if fam in CANARY_INELIGIBLE_FAMILIES:
+        raise CanaryFamilyIneligible(
+            f"family {fam.value} cannot be routed live yet — "
+            "use SHADOW status until node-ordering rearchitect lands"
+        )
     actives = list_active_canaries()
     for a in actives:
         if a.family == fam and a.version_id != parent_version_id:
@@ -427,11 +448,13 @@ def insert_canary(
 
 
 __all__ = [
+    "CANARY_INELIGIBLE_FAMILIES",
     "DEFAULT_INITIAL_TRAFFIC_PCT",
     "RAMPED_TRAFFIC_PCT",
     "RAMP_AFTER_N_TRADES",
     "N_CANARY_MIN",
     "ActiveCanary",
+    "CanaryFamilyIneligible",
     "MultiFamilyCanary",
     "RouteDecision",
     "RoutedResolver",

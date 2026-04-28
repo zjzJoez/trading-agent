@@ -59,10 +59,34 @@ def compute_outcome(trade_row: dict[str, Any]) -> OutcomeMetrics:
 
     Inputs needed: ``entry_price``, ``exit_price``, ``stop``, ``opened_at``,
     ``closed_at``, ``broker_fill_json``.  Anything missing → metric is ``None``.
+
+    Virtual fills (``broker_order_id`` starts with ``VIRTUAL-``) prefer
+    ``broker_fill_json.{entry_price,exit_price,stop}`` over the columns,
+    since the columns may carry placeholder zeros for shadow-only stock
+    positions logged via ``record_virtual_stock_fill``.
     """
-    entry = _safe_float(trade_row.get("entry_price"))
-    exit_ = _safe_float(trade_row.get("exit_price"))
-    stop = _safe_float(trade_row.get("stop"))
+    fill_blob = trade_row.get("broker_fill_json") or {}
+    if isinstance(fill_blob, str):
+        try:
+            fill_blob = json.loads(fill_blob)
+        except (TypeError, ValueError):
+            fill_blob = {}
+    if not isinstance(fill_blob, dict):
+        fill_blob = {}
+
+    is_virtual = str(trade_row.get("broker_order_id") or "").startswith("VIRTUAL-")
+
+    if is_virtual:
+        entry = (_safe_float(fill_blob.get("entry_price"))
+                 or _safe_float(trade_row.get("entry_price")))
+        exit_ = (_safe_float(fill_blob.get("exit_price"))
+                 or _safe_float(trade_row.get("exit_price")))
+        stop = (_safe_float(fill_blob.get("stop"))
+                or _safe_float(trade_row.get("stop")))
+    else:
+        entry = _safe_float(trade_row.get("entry_price"))
+        exit_ = _safe_float(trade_row.get("exit_price"))
+        stop = _safe_float(trade_row.get("stop"))
     opened_at = trade_row.get("opened_at")
     closed_at = trade_row.get("closed_at")
 
@@ -78,12 +102,6 @@ def compute_outcome(trade_row: dict[str, Any]) -> OutcomeMetrics:
         holding_days = round(delta.total_seconds() / 86400.0, 4)
 
     slippage_bps: float | None = None
-    fill_blob = trade_row.get("broker_fill_json") or {}
-    if isinstance(fill_blob, str):
-        try:
-            fill_blob = json.loads(fill_blob)
-        except (TypeError, ValueError):
-            fill_blob = {}
     requested = _safe_float(fill_blob.get("requested_price"))
     filled = _safe_float(fill_blob.get("avg_fill_price"))
     if requested is not None and filled is not None and requested > 1e-9:
@@ -101,8 +119,8 @@ def compute_outcome(trade_row: dict[str, Any]) -> OutcomeMetrics:
         try:
             from trading_agent.learning.excursion import read_extremes
             mae, mfe = read_extremes(int(tid))
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("read_extremes(%s) failed: %s", tid, e)
 
     return OutcomeMetrics(
         realized_r=realized_r,

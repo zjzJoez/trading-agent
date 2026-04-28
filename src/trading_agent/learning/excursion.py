@@ -46,8 +46,44 @@ def _safe_float(x: Any) -> float | None:
         return None
 
 
+_STALE_QUOTE_MAX_AGE_S = 300.0  # 5 minutes — drop fallback quotes older than this
+
+
+def _quote_age_seconds(row: dict) -> float | None:
+    """Best-effort age of a moomoo quote row.  Tries common timestamp fields;
+    returns None when no timestamp is available (caller may then accept the
+    quote conservatively or skip it)."""
+    for key in ("update_time", "data_time", "ts", "timestamp"):
+        v = row.get(key)
+        if not v:
+            continue
+        try:
+            from datetime import datetime, timezone
+            if isinstance(v, (int, float)):
+                ts = datetime.fromtimestamp(float(v), tz=timezone.utc)
+            else:
+                # Most moomoo timestamps are 'YYYY-MM-DD HH:MM:SS' local;
+                # fall back to ISO parsing.
+                s = str(v).replace("Z", "+00:00")
+                ts = datetime.fromisoformat(s) if "T" in s else datetime.fromisoformat(
+                    s.replace(" ", "T")
+                )
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - ts).total_seconds()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
 def _get_latest_mid(symbol: str) -> float | None:
-    """Best-effort latest mid price.  Returns None if quote layer is down."""
+    """Best-effort latest mid price.  Returns None when:
+      * quote layer is down
+      * no rows
+      * neither bid/ask nor last_price is positive
+      * we fell back to last_price AND the quote age is > 5 minutes
+        (avoids using stale prints for expired-or-halted contracts)
+    """
     try:
         from trading_agent.mcp_servers.moomoo.server import get_quote
         q = get_quote(symbol)
@@ -63,6 +99,15 @@ def _get_latest_mid(symbol: str) -> float | None:
     if bid and ask and bid > 0 and ask > 0:
         return (bid + ask) / 2.0
     last = _safe_float(row.get("last_price") or row.get("cur_price") or row.get("price"))
+    if last is None or last <= 0:
+        return None
+    age = _quote_age_seconds(row)
+    if age is not None and age > _STALE_QUOTE_MAX_AGE_S:
+        log.warning(
+            "_get_latest_mid(%s) dropping stale fallback quote: age=%.0fs",
+            symbol, age,
+        )
+        return None
     return last
 
 
