@@ -76,19 +76,43 @@ def _quote_age_seconds(row: dict) -> float | None:
     return None
 
 
+_QUOTE_FETCH_TIMEOUT_S = 5.0
+
+
+def _fetch_quote_with_timeout(symbol: str, timeout_s: float = _QUOTE_FETCH_TIMEOUT_S) -> dict | None:
+    """Wrap get_quote in a thread + timeout.  moomoo's get_market_snapshot
+    can hang on option contracts that aren't subscribed (no auto-subscribe
+    on the free OpenD path); a hard timeout is the only safe defense.
+    """
+    import concurrent.futures
+    try:
+        from trading_agent.mcp_servers.moomoo.server import get_quote
+    except Exception as e:
+        log.warning("excursion: get_quote import failed: %s", e)
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        # NOTE: get_quote signature is `symbols: list[str]`, not `str`.
+        future = ex.submit(get_quote, [symbol])
+        try:
+            return future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            log.warning("excursion: get_quote(%s) timed out after %.1fs", symbol, timeout_s)
+            return None
+        except Exception as e:
+            log.warning("excursion: get_quote(%s) failed: %s", symbol, e)
+            return None
+
+
 def _get_latest_mid(symbol: str) -> float | None:
     """Best-effort latest mid price.  Returns None when:
-      * quote layer is down
+      * quote layer is down or hangs (5s timeout)
       * no rows
       * neither bid/ask nor last_price is positive
       * we fell back to last_price AND the quote age is > 5 minutes
         (avoids using stale prints for expired-or-halted contracts)
     """
-    try:
-        from trading_agent.mcp_servers.moomoo.server import get_quote
-        q = get_quote(symbol)
-    except Exception as e:
-        log.warning("get_quote(%s) failed: %s", symbol, e)
+    q = _fetch_quote_with_timeout(symbol)
+    if q is None:
         return None
     rows = (q or {}).get("rows") or []
     if not rows:
@@ -117,14 +141,26 @@ def _R_per_unit(entry: float, stop: float | None) -> float:
     return max(1e-9, abs(entry) * IMPLICIT_STOP_FRAC)
 
 
+_TOTAL_UPDATE_BUDGET_S = 60.0  # whole node must finish well inside the 15-min timer
+
+
 def update_excursions_once(now: datetime | None = None) -> list[ExcursionUpdate]:
     """Walk all OPEN journal_trades rows and update mae/mfe.
 
     Returns the list of updates applied (for logging in agent_events).
     Never raises — DB or quote failures degrade to skipping that row.
+
+    Total wall-clock budget: 60 s.  Once exceeded, remaining open positions
+    are skipped this tick — the next intraday timer fire (15 min later) will
+    pick them back up.  This bound exists because moomoo OpenD's
+    get_market_snapshot can hang on un-subscribed option contracts; without
+    a hard ceiling here, a portfolio of N positions that all hang would
+    prevent the rest of intraday_monitor from running.
     """
+    import time
     out: list[ExcursionUpdate] = []
     now = now or datetime.now(timezone.utc)
+    deadline = time.monotonic() + _TOTAL_UPDATE_BUDGET_S
     try:
         with cursor() as cur:
             cur.execute(
@@ -140,6 +176,12 @@ def update_excursions_once(now: datetime | None = None) -> list[ExcursionUpdate]
         return out
 
     for tid, symbol, entry, stop, mae, mfe in rows:
+        if time.monotonic() > deadline:
+            log.warning(
+                "update_excursions_once: budget %.0fs exhausted; %d positions skipped",
+                _TOTAL_UPDATE_BUDGET_S, len(rows) - len(out),
+            )
+            break
         entry_f = _safe_float(entry)
         if entry_f is None:
             continue
