@@ -220,6 +220,8 @@ class OAuthLLMRouter:
                     raw = self._invoke_cc(cfg, user_prompt, timeout_s)
                 elif cfg.channel == "codex":
                     raw = self._invoke_codex(cfg, user_prompt, timeout_s)
+                elif cfg.channel == "deepseek":
+                    raw = self._invoke_deepseek(cfg, user_prompt, timeout_s)
                 else:
                     raise RuntimeError(f"Unknown channel: {cfg.channel}")
         except RuntimeError as e:
@@ -271,6 +273,61 @@ class OAuthLLMRouter:
             log.error("claude returncode=%d stderr=%s", proc.returncode, proc.stderr[:500])
             raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:200]}")
         return _extract_text_from_claude_json(proc.stdout)
+
+    def _invoke_deepseek(self, cfg: RoleConfig, user_prompt: str, timeout_s: int) -> str:
+        """Universal-fallback channel: DeepSeek API (OpenAI-compatible).
+
+        Used as the degrade target for every role with a DEGRADE_TABLE
+        entry. The agent file is looked up under .codex/agents/<name>.md
+        first (closer in style to GPT/DeepSeek), falling back to
+        .claude/agents/<name>.md.
+
+        Reads ``DEEPSEEK_API_KEY`` (required), ``DEEPSEEK_BASE_URL``
+        (default ``https://api.deepseek.com/v1``), and ``DEEPSEEK_MODEL``
+        (default ``deepseek-v4-pro``) from env. The model from cfg
+        wins if set; env var is the project-wide default.
+        """
+        import httpx
+
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise RuntimeError("DEEPSEEK_API_KEY not set — deepseek channel unavailable")
+        base = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+        model = cfg.model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+
+        system_prompt = _read_codex_system_prompt(cfg.agent_name)
+        try:
+            r = httpx.post(
+                f"{base}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 4000,
+                },
+                timeout=timeout_s,
+            )
+        except httpx.HTTPError as e:
+            raise RuntimeError(f"deepseek HTTP error: {e}") from e
+        if r.status_code != 200:
+            # Quota-shaped errors will be caught by the caller via
+            # _CODEX_QUOTA_PATTERNS — extend that match if a new shape shows up.
+            log.error("deepseek returned %d: %s", r.status_code, r.text[:300])
+            raise RuntimeError(
+                f"deepseek HTTP {r.status_code}: {r.text[:200]}"
+            )
+        body = r.json()
+        try:
+            return body["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError) as e:
+            raise RuntimeError(f"deepseek response shape unexpected: {body}") from e
 
     def _invoke_codex(self, cfg: RoleConfig, user_prompt: str, timeout_s: int) -> str:
         # Codex CLI has no --system-from-file flag — read the agent file and

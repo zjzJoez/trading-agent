@@ -14,8 +14,9 @@ MODEL_OPUS = "opus"  # Claude Code accepts "opus" as a shortcut → claude-opus-
 MODEL_SONNET = "sonnet"  # → claude-sonnet-4-6
 MODEL_HAIKU = "haiku"  # → claude-haiku-4-5
 MODEL_GPT55 = "gpt-5.5"
+MODEL_DEEPSEEK_V4_PRO = "deepseek-v4-pro"
 
-Channel = Literal["claude_code", "codex"]
+Channel = Literal["claude_code", "codex", "deepseek"]
 
 
 @dataclass(frozen=True)
@@ -45,49 +46,58 @@ ROLE_CONFIG: dict[str, RoleConfig] = {
         "claude_code", MODEL_HAIKU, "ntfy-digest-composer", 50_000
     ),
 
-    # Claude-side analogs of the Codex challenger roles.  Used as degrade
-    # targets when codex Plus quota is exhausted (or LLM_DISABLE_CODEX=1).
-    # Each one reads its own .claude/agents/<name>.md (forked from the
-    # codex original) and produces output matching the SAME pydantic schema
-    # as the codex role it replaces — so the orchestrator path doesn't
-    # have to branch on which channel ran.
-    # Trade-off: we lose the cross-family diversity signal but keep every
-    # decision accompanied by some LLM perspective.
-    "bear_researcher_claude": RoleConfig(
-        "claude_code", MODEL_SONNET, "bear-researcher", 100_000
-    ),
-    "fundamental_analyst_claude": RoleConfig(
-        "claude_code", MODEL_SONNET, "fundamental-analyst", 80_000
-    ),
-    "risk_opportunity_claude": RoleConfig(
-        "claude_code", MODEL_SONNET, "risk-opportunity", 80_000
-    ),
-    "learning_critic_claude": RoleConfig(
-        "claude_code", MODEL_SONNET, "learning-critic", 50_000
-    ),
-
     # Codex (Plus plan) — challenger / cross-family roles
     "fundamental_analyst": RoleConfig("codex", MODEL_GPT55, "fundamental-analyst", 80_000),
     "bear_researcher": RoleConfig("codex", MODEL_GPT55, "bear-researcher", 100_000),
     "risk_opportunity": RoleConfig("codex", MODEL_GPT55, "risk-opportunity", 80_000),
     "learning_critic": RoleConfig("codex", MODEL_GPT55, "learning-critic", 50_000),
+
+    # DeepSeek (universal-fallback channel) — schema-matched degrade
+    # targets for every role with a DEGRADE_TABLE entry.  Each reuses the
+    # SAME agent file as its source role (looked up first under
+    # .codex/agents/<name>.md, then .claude/agents/<name>.md) so the
+    # produced JSON validates against the source role's pydantic schema.
+    # Uses DEEPSEEK_API_KEY from env, OpenAI-compatible chat completions.
+    "trader_synthesizer_deepseek": RoleConfig(
+        "deepseek", MODEL_DEEPSEEK_V4_PRO, "trader-synthesizer", 200_000
+    ),
+    "risk_arbiter_deepseek": RoleConfig(
+        "deepseek", MODEL_DEEPSEEK_V4_PRO, "risk-arbiter", 200_000
+    ),
+    "bear_researcher_deepseek": RoleConfig(
+        "deepseek", MODEL_DEEPSEEK_V4_PRO, "bear-researcher", 100_000
+    ),
+    "fundamental_analyst_deepseek": RoleConfig(
+        "deepseek", MODEL_DEEPSEEK_V4_PRO, "fundamental-analyst", 80_000
+    ),
+    "risk_opportunity_deepseek": RoleConfig(
+        "deepseek", MODEL_DEEPSEEK_V4_PRO, "risk-opportunity", 80_000
+    ),
+    "learning_critic_deepseek": RoleConfig(
+        "deepseek", MODEL_DEEPSEEK_V4_PRO, "learning-critic", 50_000
+    ),
 }
 
 
 # When a role's weekly cap or channel cap is hit (OR codex itself returns a
-# quota-shaped error / LLM_DISABLE_CODEX=1 is set), degrade to this fallback
-# role.  Updated 2026-04-30: every Codex role now has a Claude fallback so
-# the system keeps running on Claude Code Max alone when Codex is unavailable.
+# quota-shaped error), degrade to this fallback role.
+#
+# Updated 2026-04-30: every degrade now lands on a schema-matched DeepSeek
+# variant. Single universal fallback channel keeps the topology simple —
+# any LLM role that fails its primary path tries DeepSeek with the SAME
+# agent file (so the same pydantic schema validates against the result).
+# DeepSeek API key in EC2 .env (DEEPSEEK_API_KEY); model
+# defaults to deepseek-v4-pro.
+#
 # `None` = defer (skip the LLM call entirely; downstream defaults to safe path).
 DEGRADE_TABLE: dict[str, str | None] = {
-    "trader_synthesizer": "risk_conservative",  # Sonnet fallback for synthesis
-    "risk_arbiter": "risk_conservative",  # if Opus is over-cap, use Sonnet conservative-only
-    # Codex challenger roles → schema-matched Claude forks (each
-    # ``*_claude`` role reads its own .claude/agents/<name>.md and produces
-    # the SAME schema as the codex original, so callers don't branch).
-    "bear_researcher": "bear_researcher_claude",
-    "fundamental_analyst": "fundamental_analyst_claude",
-    "risk_opportunity": "risk_opportunity_claude",
-    "learning_critic": "learning_critic_claude",
-    # Other roles: no degrade — if their cap is hit, the entire run defers
+    "trader_synthesizer": "trader_synthesizer_deepseek",
+    "risk_arbiter": "risk_arbiter_deepseek",
+    "bear_researcher": "bear_researcher_deepseek",
+    "fundamental_analyst": "fundamental_analyst_deepseek",
+    "risk_opportunity": "risk_opportunity_deepseek",
+    "learning_critic": "learning_critic_deepseek",
+    # Other roles (regime_reviewer, scout, technical_analyst, etc.): no
+    # degrade configured — if their cap is hit, the entire run defers.
+    # Add `<role>_deepseek` entries above + map them here if needed.
 }

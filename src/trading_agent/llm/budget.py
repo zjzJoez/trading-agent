@@ -13,7 +13,7 @@ from typing import Literal
 
 log = logging.getLogger(__name__)
 
-Channel = Literal["claude_code", "codex"]
+Channel = Literal["claude_code", "codex", "deepseek"]
 
 
 # Conservative weekly token caps. Tune from Postgres usage stats over the
@@ -21,6 +21,7 @@ Channel = Literal["claude_code", "codex"]
 WEEKLY_CAP: dict[Channel, int] = {
     "claude_code": 5_000_000,
     "codex": 800_000,
+    "deepseek": 5_000_000,  # universal fallback — prepaid API, can absorb load
 }
 
 # Soft trigger fraction: degrade kicks in at this much of cap consumed.
