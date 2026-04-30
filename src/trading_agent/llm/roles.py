@@ -45,6 +45,27 @@ ROLE_CONFIG: dict[str, RoleConfig] = {
         "claude_code", MODEL_HAIKU, "ntfy-digest-composer", 50_000
     ),
 
+    # Claude-side analogs of the Codex challenger roles.  Used as degrade
+    # targets when codex Plus quota is exhausted (or LLM_DISABLE_CODEX=1).
+    # Each one reads its own .claude/agents/<name>.md (forked from the
+    # codex original) and produces output matching the SAME pydantic schema
+    # as the codex role it replaces — so the orchestrator path doesn't
+    # have to branch on which channel ran.
+    # Trade-off: we lose the cross-family diversity signal but keep every
+    # decision accompanied by some LLM perspective.
+    "bear_researcher_claude": RoleConfig(
+        "claude_code", MODEL_SONNET, "bear-researcher", 100_000
+    ),
+    "fundamental_analyst_claude": RoleConfig(
+        "claude_code", MODEL_SONNET, "fundamental-analyst", 80_000
+    ),
+    "risk_opportunity_claude": RoleConfig(
+        "claude_code", MODEL_SONNET, "risk-opportunity", 80_000
+    ),
+    "learning_critic_claude": RoleConfig(
+        "claude_code", MODEL_SONNET, "learning-critic", 50_000
+    ),
+
     # Codex (Plus plan) — challenger / cross-family roles
     "fundamental_analyst": RoleConfig("codex", MODEL_GPT55, "fundamental-analyst", 80_000),
     "bear_researcher": RoleConfig("codex", MODEL_GPT55, "bear-researcher", 100_000),
@@ -53,14 +74,20 @@ ROLE_CONFIG: dict[str, RoleConfig] = {
 }
 
 
-# When a role's weekly cap or channel cap is hit, degrade to this fallback role.
+# When a role's weekly cap or channel cap is hit (OR codex itself returns a
+# quota-shaped error / LLM_DISABLE_CODEX=1 is set), degrade to this fallback
+# role.  Updated 2026-04-30: every Codex role now has a Claude fallback so
+# the system keeps running on Claude Code Max alone when Codex is unavailable.
 # `None` = defer (skip the LLM call entirely; downstream defaults to safe path).
 DEGRADE_TABLE: dict[str, str | None] = {
     "trader_synthesizer": "risk_conservative",  # Sonnet fallback for synthesis
     "risk_arbiter": "risk_conservative",  # if Opus is over-cap, use Sonnet conservative-only
-    "bear_researcher": "risk_conservative",  # Cross-family unavailable → Claude Sonnet
-    "fundamental_analyst": "news_analyst",  # closest equivalent on Claude
-    "risk_opportunity": None,  # defer council (deterministic decision wins)
-    "learning_critic": None,  # defer to next week
+    # Codex challenger roles → schema-matched Claude forks (each
+    # ``*_claude`` role reads its own .claude/agents/<name>.md and produces
+    # the SAME schema as the codex original, so callers don't branch).
+    "bear_researcher": "bear_researcher_claude",
+    "fundamental_analyst": "fundamental_analyst_claude",
+    "risk_opportunity": "risk_opportunity_claude",
+    "learning_critic": "learning_critic_claude",
     # Other roles: no degrade — if their cap is hit, the entire run defers
 }

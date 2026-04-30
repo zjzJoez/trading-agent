@@ -160,9 +160,33 @@ class StubLLMRouter:
 class OAuthLLMRouter:
     """OAuth-subscription router. Spawns claude/codex CLI subprocesses."""
 
+    # Patterns we treat as "this channel is over quota / unavailable".
+    # Conservative — a false positive only burns one extra subprocess; a
+    # false negative makes us re-spawn slow CLIs that will keep failing.
+    _CODEX_QUOTA_PATTERNS: tuple[str, ...] = (
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "usage limit",
+        "weekly limit",
+        "you have exceeded",
+        "exceeded your",
+        "limit reached",
+        "429",
+    )
+
     def __init__(self, max_concurrent: int = 2):
         self.budget = WeeklyBudget(dsn=os.environ.get("TRADING_PG_DSN"))
         self._sem = _proc_semaphore(max_concurrent)
+        # Per-process "channel unhealthy" cache.  Once a codex call returns
+        # a quota-shaped error, every subsequent codex role call inside the
+        # same Python process immediately degrades without spawning the CLI
+        # (each subprocess attempt costs ~3-10 s startup + 2x the timeout).
+        self._channel_unhealthy: dict[str, str] = {}
+        # Operator override: LLM_DISABLE_CODEX=1 forces every codex role to
+        # degrade immediately. Documented in plan §11.5.
+        if os.environ.get("LLM_DISABLE_CODEX", "").strip() in ("1", "true", "yes"):
+            self._channel_unhealthy["codex"] = "disabled by LLM_DISABLE_CODEX env"
 
     # -------------- public API --------------
 
@@ -181,14 +205,37 @@ class OAuthLLMRouter:
             return self._degrade(role, user_prompt, schema, max_tokens, timeout_s)
         if self.budget.would_exceed_role(role, cfg.weekly_token_cap, max_tokens):
             return self._degrade(role, user_prompt, schema, max_tokens, timeout_s)
+        # Pre-flight: per-process channel-unhealthy cache (set by an
+        # earlier failed codex call that matched _CODEX_QUOTA_PATTERNS).
+        if cfg.channel in self._channel_unhealthy:
+            log.warning(
+                "[%s] channel %s flagged unhealthy (%s) — degrading without CLI spawn",
+                role, cfg.channel, self._channel_unhealthy[cfg.channel],
+            )
+            return self._degrade(role, user_prompt, schema, max_tokens, timeout_s)
 
-        with self._sem:
-            if cfg.channel == "claude_code":
-                raw = self._invoke_cc(cfg, user_prompt, timeout_s)
-            elif cfg.channel == "codex":
-                raw = self._invoke_codex(cfg, user_prompt, timeout_s)
-            else:
-                raise RuntimeError(f"Unknown channel: {cfg.channel}")
+        try:
+            with self._sem:
+                if cfg.channel == "claude_code":
+                    raw = self._invoke_cc(cfg, user_prompt, timeout_s)
+                elif cfg.channel == "codex":
+                    raw = self._invoke_codex(cfg, user_prompt, timeout_s)
+                else:
+                    raise RuntimeError(f"Unknown channel: {cfg.channel}")
+        except RuntimeError as e:
+            # Detect quota / rate-limit shaped failures from the subprocess
+            # and route through the degrade table.  Other RuntimeError shapes
+            # (network, parsing, real bugs) propagate so we see them.
+            err_str = str(e).lower()
+            if cfg.channel == "codex" and any(p in err_str for p in self._CODEX_QUOTA_PATTERNS):
+                log.warning(
+                    "[%s] codex returned quota-shaped error: %s — flagging codex "
+                    "unhealthy for this process and degrading",
+                    role, str(e)[:200],
+                )
+                self._channel_unhealthy["codex"] = str(e)[:200]
+                return self._degrade(role, user_prompt, schema, max_tokens, timeout_s)
+            raise
 
         parsed: BaseModel | dict | None = None
         if schema is not None:
