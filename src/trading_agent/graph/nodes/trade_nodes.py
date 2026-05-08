@@ -1421,3 +1421,118 @@ def regime_execution_gate(state: TradingGraphState) -> dict:
                      "label": regime.get("label")},
         )
     return {"proposal": {**proposal, "qty": new_qty}}
+
+
+# ---------------------------------------------------------------------------
+# Entry-termination nodes — VETO / DEFER paths
+# ---------------------------------------------------------------------------
+
+def persist_veto(state: TradingGraphState) -> dict:
+    """Persist a VETO outcome to agent_events + risk_decisions audit trail."""
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[trade/persist_veto] run_id=%s", run_id)
+
+    risk = state.get("risk") or {}
+    proposal = state.get("proposal") or {}
+    hard_violations = risk.get("hard_violations") or []
+    reasons = risk.get("reasons") or []
+
+    emit(
+        run_id=run_id, trigger=trigger, agent="persist_veto",
+        event_type="veto_persisted",
+        severity=1,  # warn — a veto is notable
+        payload={
+            "ticker": proposal.get("ticker", "?"),
+            "proposal_id": proposal.get("proposal_id"),
+            "hard_violations": hard_violations,
+            "reasons": reasons,
+        },
+    )
+    return {}
+
+
+def ntfy_risk_block(state: TradingGraphState) -> dict:
+    """Push a ntfy notification for a VETO-blocked trade."""
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[trade/ntfy_risk_block] run_id=%s", run_id)
+
+    risk = state.get("risk") or {}
+    proposal = state.get("proposal") or {}
+    ticker = proposal.get("ticker", "?")
+    hard_violations = risk.get("hard_violations") or []
+    reasons = risk.get("reasons") or []
+
+    try:
+        from trading_agent.notify import send as ntfy_send
+        ntfy_send(
+            topic="risk",
+            title=f"VETO — {ticker}",
+            body=(
+                f"Trade blocked for {ticker}.\n"
+                f"Hard violations: {', '.join(str(v) for v in hard_violations) or 'none'}\n"
+                f"Reasons: {'; '.join(str(r) for r in reasons[:3])}"
+            ),
+            priority=4,
+            tags=["no_entry", "rotating_light"],
+        )
+    except Exception as e:
+        log.warning("[ntfy_risk_block] ntfy failed: %s", e)
+
+    emit(run_id=run_id, trigger=trigger, agent="ntfy_risk_block",
+         event_type="veto_notification_sent", payload={"ticker": ticker})
+    return {}
+
+
+def persist_defer(state: TradingGraphState) -> dict:
+    """Persist a DEFER outcome — market conditions not suitable right now."""
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[trade/persist_defer] run_id=%s", run_id)
+
+    risk = state.get("risk") or {}
+    proposal = state.get("proposal") or {}
+    reasons = risk.get("reasons") or []
+
+    emit(
+        run_id=run_id, trigger=trigger, agent="persist_defer",
+        event_type="defer_persisted",
+        payload={
+            "ticker": proposal.get("ticker", "?"),
+            "proposal_id": proposal.get("proposal_id"),
+            "reasons": reasons,
+        },
+    )
+    return {}
+
+
+def ntfy_defer(state: TradingGraphState) -> dict:
+    """Push a ntfy notification for a DEFER decision."""
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[trade/ntfy_defer] run_id=%s", run_id)
+
+    risk = state.get("risk") or {}
+    proposal = state.get("proposal") or {}
+    ticker = proposal.get("ticker", "?")
+    reasons = risk.get("reasons") or []
+
+    try:
+        from trading_agent.notify import send as ntfy_send
+        ntfy_send(
+            topic="risk",
+            title=f"DEFER — {ticker}",
+            body=(
+                f"Entry deferred for {ticker}.\n"
+                f"Reasons: {'; '.join(str(r) for r in reasons[:3]) or 'regime or risk conditions'}"
+            ),
+            priority=2,
+            tags=["hourglass", "chart_with_upwards_trend"],
+        )
+    except Exception as e:
+        log.warning("[ntfy_defer] ntfy failed: %s", e)
+
+    emit(run_id=run_id, trigger=trigger, agent="ntfy_defer",
+         event_type="defer_notification_sent", payload={"ticker": ticker})
+    return {}

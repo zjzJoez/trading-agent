@@ -1,12 +1,15 @@
-"""Compile the LangGraph subgraphs from stubs.
+"""Compile the LangGraph subgraphs.
 
-Each `build_*` function returns a compiled graph keyed off the same state
-schema. The compiled graphs are persisted via PostgresSaver (see
-checkpointer.py) so a kill-9 mid-run can resume from the last completed
-node on the next start.
+Phase 2.5+ — all nodes are real implementations. Stubs.py is kept for
+future scaffolding but no longer imported here.
 
-This is Phase 2.1 — every node is a stub. Phase 2.2-2.5 swap the stubs
-for real implementations one node at a time.
+Subgraph → primary module mapping:
+    premarket_scan_graph   regime_nodes + premarket_nodes
+    candidate_entry_graph  trade_nodes + risk_nodes + learning_nodes
+    intraday_monitor_graph intraday_nodes + eod_learning + health_nodes
+    eod_review_graph       eod_nodes + eod_learning
+    healthcheck_graph      health_nodes
+    weekly_learning_graph  weekly_learning
 """
 from __future__ import annotations
 
@@ -16,12 +19,15 @@ from langgraph.graph import END, START, StateGraph
 
 from trading_agent.graph.checkpointer import get_saver
 from trading_agent.graph.nodes import eod_learning as EL
+from trading_agent.graph.nodes import eod_nodes as EOD
+from trading_agent.graph.nodes import health_nodes as H
+from trading_agent.graph.nodes import intraday_nodes as IN
 from trading_agent.graph.nodes import learning_nodes as L
+from trading_agent.graph.nodes import premarket_nodes as PM
 from trading_agent.graph.nodes import regime_nodes as R
-from trading_agent.graph.nodes import weekly_learning as WL
 from trading_agent.graph.nodes import risk_nodes as RK
-from trading_agent.graph.nodes import stubs as N
 from trading_agent.graph.nodes import trade_nodes as T
+from trading_agent.graph.nodes import weekly_learning as WL
 from trading_agent.graph.state import TradingGraphState
 
 log = logging.getLogger(__name__)
@@ -32,15 +38,14 @@ log = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 def build_premarket_scan_graph():
     g = StateGraph(TradingGraphState)
-    # Phase 2.2: real regime nodes; everything downstream still stubs.
     g.add_node("collect_macro_market_data", R.collect_macro_market_data)
     g.add_node("compute_regime_features", R.compute_regime_features)
     g.add_node("classify_regime", R.classify_regime)
     g.add_node("maybe_llm_regime_review", R.maybe_llm_regime_review)
     g.add_node("persist_regime", R.persist_regime)
-    g.add_node("collect_watchlist_data", N.collect_watchlist_data)
-    g.add_node("rank_candidates", N.rank_candidates)
-    g.add_node("ntfy_scan_digest", N.ntfy_scan_digest)
+    g.add_node("collect_watchlist_data", PM.collect_watchlist_data)
+    g.add_node("rank_candidates", PM.rank_candidates)
+    g.add_node("ntfy_scan_digest", PM.ntfy_scan_digest)
 
     g.add_edge(START, "collect_macro_market_data")
     g.add_edge("collect_macro_market_data", "compute_regime_features")
@@ -68,8 +73,8 @@ def build_candidate_entry_graph():
         ("assign_canary", L.assign_canary_node),
         ("researcher_debate", T.researcher_debate),
         ("retrieve_past_lessons", T.retrieve_past_lessons),
-        ("create_or_refresh_thesis", T.create_or_refresh_thesis),
         ("build_trade_proposal", T.build_trade_proposal),
+        ("create_or_refresh_thesis", T.create_or_refresh_thesis),
         ("deterministic_sizing", T.deterministic_sizing),
         ("shadow_track", L.shadow_track_node),
         ("regime_execution_gate", T.regime_execution_gate),
@@ -81,10 +86,10 @@ def build_candidate_entry_graph():
         ("capture_fill", T.capture_fill),
         ("persist_trade_event", T.persist_trade_event),
         ("ntfy_trade_event", T.ntfy_trade_event),
-        ("persist_veto", N.persist_veto),
-        ("ntfy_risk_block", N.ntfy_risk_block),
-        ("persist_defer", N.persist_defer),
-        ("ntfy_defer", N.ntfy_defer),
+        ("persist_veto", T.persist_veto),
+        ("ntfy_risk_block", T.ntfy_risk_block),
+        ("persist_defer", T.persist_defer),
+        ("ntfy_defer", T.ntfy_defer),
     ]:
         g.add_node(name, fn)
 
@@ -95,8 +100,6 @@ def build_candidate_entry_graph():
     g.add_edge("research_ticker", "assign_canary")
     g.add_edge("assign_canary", "researcher_debate")
     g.add_edge("researcher_debate", "retrieve_past_lessons")
-    # Build the proposal first, then bind a thesis row to it (so the thesis
-    # row has the concrete strategy_label / direction / numeric levels).
     g.add_edge("retrieve_past_lessons", "build_trade_proposal")
     g.add_edge("build_trade_proposal", "create_or_refresh_thesis")
     g.add_edge("create_or_refresh_thesis", "deterministic_sizing")
@@ -107,7 +110,6 @@ def build_candidate_entry_graph():
     g.add_edge("deterministic_risk_guardrails", "maybe_risk_llm_council")
     g.add_edge("maybe_risk_llm_council", "finalize_risk_decision")
 
-    # Conditional routing on risk decision (real Phase 2.3 router)
     g.add_conditional_edges(
         "finalize_risk_decision",
         RK.route_risk_decision,
@@ -138,14 +140,14 @@ def build_candidate_entry_graph():
 def build_intraday_monitor_graph():
     g = StateGraph(TradingGraphState)
     g.add_node("load_active_params", L.load_active_params_node)
-    g.add_node("opend_health", N.opend_health)
+    g.add_node("opend_health", H.opend_health)
     g.add_node("load_open_positions", T.load_open_positions)
-    g.add_node("refresh_quotes_and_greeks", N.refresh_quotes_and_greeks)
+    g.add_node("refresh_quotes_and_greeks", IN.refresh_quotes_and_greeks)
     g.add_node("update_excursions", EL.update_excursions_node)
     g.add_node("load_latest_regime", T.load_latest_regime)
     g.add_node("active_risk_snapshot", RK.active_risk_snapshot)
-    g.add_node("detect_exit_triggers", N.detect_exit_triggers)
-    g.add_node("route_exit_or_hold", N.route_exit_or_hold)
+    g.add_node("detect_exit_triggers", IN.detect_exit_triggers)
+    g.add_node("route_exit_or_hold", IN.route_exit_or_hold)
 
     g.add_edge(START, "load_active_params")
     g.add_edge("load_active_params", "opend_health")
@@ -166,14 +168,14 @@ def build_intraday_monitor_graph():
 # -----------------------------------------------------------------------------
 def build_eod_review_graph():
     g = StateGraph(TradingGraphState)
-    g.add_node("reconcile_journal", N.reconcile_journal)
-    g.add_node("mark_to_market", N.mark_to_market)
-    g.add_node("persist_daily_marks", N.persist_daily_marks)
-    g.add_node("update_regime_accuracy_labels", N.update_regime_accuracy_labels)
+    g.add_node("reconcile_journal", EOD.reconcile_journal)
+    g.add_node("mark_to_market", EOD.mark_to_market)
+    g.add_node("persist_daily_marks", EOD.persist_daily_marks)
+    g.add_node("update_regime_accuracy_labels", EOD.update_regime_accuracy_labels)
     g.add_node("enrich_outcomes", EL.enrich_outcomes_node)
     g.add_node("promote_or_rollback", EL.promote_or_rollback_node)
-    g.add_node("generate_eod_digest", N.generate_eod_digest)
-    g.add_node("ntfy_daily_summary", N.ntfy_daily_summary)
+    g.add_node("generate_eod_digest", EOD.generate_eod_digest)
+    g.add_node("ntfy_daily_summary", EOD.ntfy_daily_summary)
 
     g.add_edge(START, "reconcile_journal")
     g.add_edge("reconcile_journal", "mark_to_market")
@@ -193,9 +195,9 @@ def build_eod_review_graph():
 # -----------------------------------------------------------------------------
 def build_healthcheck_graph():
     g = StateGraph(TradingGraphState)
-    g.add_node("opend_health", N.opend_health)
-    g.add_node("postgres_health", N.postgres_health)
-    g.add_node("ntfy_health", N.ntfy_health)
+    g.add_node("opend_health", H.opend_health)
+    g.add_node("postgres_health", H.postgres_health)
+    g.add_node("ntfy_health", H.ntfy_health)
 
     g.add_edge(START, "opend_health")
     g.add_edge("opend_health", "postgres_health")
@@ -206,7 +208,7 @@ def build_healthcheck_graph():
 
 
 # -----------------------------------------------------------------------------
-# weekly_learning_graph (Phase 2.7.5) — Saturday post-close LLM Critic loop
+# weekly_learning_graph — Saturday post-close LLM Critic loop
 # -----------------------------------------------------------------------------
 def build_weekly_learning_graph():
     g = StateGraph(TradingGraphState)
