@@ -163,11 +163,24 @@ def mark_to_market(state: TradingGraphState) -> dict:
         return {}
 
     try:
-        from trading_agent.mcp_servers.moomoo.server import get_quote, get_option_chain_snapshot
+        from trading_agent.mcp_servers.moomoo.server import get_quote
         moomoo_ok = True
     except Exception as e:
         log.error("[mark_to_market] moomoo import failed: %s", e)
         moomoo_ok = False
+
+    # Batch fetch all symbols in one call (signature: list[str])
+    quote_by_symbol: dict[str, dict] = {}
+    if moomoo_ok and open_trades:
+        symbols_to_fetch = [t.get("symbol") for t in open_trades if t.get("symbol")]
+        try:
+            result = get_quote(symbols_to_fetch)
+            for r in (result.get("rows") or []):
+                code = r.get("code") or r.get("symbol") or ""
+                if code:
+                    quote_by_symbol[code] = r
+        except Exception as e:
+            log.warning("[mark_to_market] get_quote batch failed: %s", e)
 
     marked_positions: list[dict] = []
     total_unrealized_pnl = 0.0
@@ -181,31 +194,24 @@ def mark_to_market(state: TradingGraphState) -> dict:
         iv: float | None = None
         dte: int | None = None
 
-        if moomoo_ok and symbol:
+        r = quote_by_symbol.get(symbol)
+        if r:
             try:
+                mark = float(r.get("last_price") or entry)
                 if is_opt:
-                    snap = get_option_chain_snapshot(symbol=symbol)
-                    rows = snap.get("rows") or []
-                    if rows:
-                        r = rows[0]
-                        mark = float(r.get("last_price") or r.get("option_premium") or entry)
-                        if r.get("imp_volatility") is not None:
-                            iv = float(r["imp_volatility"])
-                        if r.get("expiry_date") is not None:
-                            from datetime import date
-                            try:
-                                exp = date.fromisoformat(str(r["expiry_date"]))
-                                dte = (exp - date.today()).days
-                            except Exception:
-                                pass
-                else:
-                    underlying = "US." + _bare_ticker(symbol) if not symbol.startswith("US.") else symbol
-                    qr = get_quote(symbol=underlying)
-                    rows = qr.get("rows") or []
-                    if rows:
-                        mark = float(rows[0].get("last_price") or entry)
+                    iv_raw = r.get("imp_volatility") or r.get("implied_volatility") or r.get("iv")
+                    if iv_raw is not None:
+                        iv = float(iv_raw)
+                    exp_raw = r.get("expiry_date") or r.get("strike_time")
+                    if exp_raw is not None:
+                        from datetime import date
+                        try:
+                            exp = date.fromisoformat(str(exp_raw)[:10])
+                            dte = (exp - date.today()).days
+                        except Exception:
+                            pass
             except Exception as e:
-                log.warning("[mark_to_market] %s quote failed: %s", symbol, e)
+                log.warning("[mark_to_market] %s parse failed: %s", symbol, e)
 
         mult = 100 if is_opt else 1
         unrealized_pnl = (mark - entry) * qty * mult

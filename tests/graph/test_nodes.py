@@ -151,21 +151,25 @@ class TestRefreshQuotesAndGreeks:
         )
         with _patch_all_emits():
             with patch("trading_agent.mcp_servers.moomoo.server.get_quote",
-                       return_value={"rows": [{"last_price": 210.0}]}):
+                       return_value={"rows": [{"code": "US.AAPL", "last_price": 210.0}]}):
                 from trading_agent.graph.nodes.intraday_nodes import refresh_quotes_and_greeks
                 result = refresh_quotes_and_greeks(state)
         assert result["positions"][0]["mark"] == 210.0
 
     def test_option_greeks_refreshed(self):
+        opt_sym = "US.AAPL260117C00200000"
         state = _base_state(
             trigger="intraday_monitor",
-            positions=[self._make_pos("US.AAPL260117C00200000", "OPT")],
+            positions=[self._make_pos(opt_sym, "OPT")],
         )
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.moomoo.server.get_option_chain_snapshot",
-                       return_value={"rows": [{"last_price": 5.5, "imp_volatility": 0.35,
-                                               "delta": 0.45, "gamma": 0.02,
-                                               "vega": 0.1, "theta": -0.05}]}):
+            with patch("trading_agent.mcp_servers.moomoo.server.get_quote",
+                       return_value={"rows": [{
+                           "code": opt_sym, "last_price": 5.5,
+                           "imp_volatility": 0.35,
+                           "delta": 0.45, "gamma": 0.02,
+                           "vega": 0.1, "theta": -0.05,
+                       }]}):
                 from trading_agent.graph.nodes.intraday_nodes import refresh_quotes_and_greeks
                 result = refresh_quotes_and_greeks(state)
         pos = result["positions"][0]
@@ -273,10 +277,10 @@ class TestRouteExitOrHold:
         )
         mock_order = {"order_id": "ORD123"}
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order",
-                       return_value=mock_order) as mock_place:
-                with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                           return_value={"rows": [{"symbol": "US.AAPL", "trade_id": 7}]}):
+            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
+                       return_value={"rows": [{"symbol": "US.AAPL", "trade_id": 7}]}):
+                with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order",
+                           return_value=mock_order) as mock_place:
                     with patch("trading_agent.mcp_servers.journal.server.close_trade"):
                         with patch("trading_agent.notify.send"):
                             from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
@@ -284,16 +288,18 @@ class TestRouteExitOrHold:
             mock_place.assert_called_once()
             call_kwargs = mock_place.call_args[1] if mock_place.call_args[1] else {}
             assert call_kwargs.get("side") == "SELL"
+            assert call_kwargs.get("thesis_id") == 7  # journal trade_id used as link
 
     def test_exit_option_uses_option_placer(self):
+        opt_sym = "US.AAPL260117C00200000"
         state = _base_state(
             trigger="intraday_monitor",
             journal={"exit_decisions": [
-                {"symbol": "US.AAPL260117C00200000", "action": "EXIT_TARGET",
+                {"symbol": opt_sym, "action": "EXIT_TARGET",
                  "exit_qty_factor": 1.0, "reason": "target hit"},
             ]},
             positions=[{
-                "symbol": "US.AAPL260117C00200000", "asset_type": "OPT",
+                "symbol": opt_sym, "asset_type": "OPT",
                 "qty": 2, "entry_price": 3.0, "mark": 6.5,
                 "thesis_id": 9, "strategy_label": "earnings_long_call",
                 "delta": 0.52, "dte": 20,
@@ -301,10 +307,10 @@ class TestRouteExitOrHold:
         )
         mock_order = {"order_id": "OPT456"}
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
-                       return_value=mock_order) as mock_place_opt:
-                with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                           return_value={"rows": [{"symbol": "US.AAPL260117C00200000", "trade_id": 15}]}):
+            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
+                       return_value={"rows": [{"symbol": opt_sym, "trade_id": 15}]}):
+                with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
+                           return_value=mock_order) as mock_place_opt:
                     with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
                         with patch("trading_agent.notify.send"):
                             from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
@@ -325,12 +331,41 @@ class TestRouteExitOrHold:
             }],
         )
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order",
-                       side_effect=ConnectionError("OpenD down")):
-                with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
-                    with patch("trading_agent.notify.send"):
-                        from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
-                        route_exit_or_hold(state)
+            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
+                       return_value={"rows": [{"symbol": "US.SPY", "trade_id": 99}]}):
+                with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order",
+                           side_effect=ConnectionError("OpenD down")):
+                    with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
+                        with patch("trading_agent.notify.send"):
+                            from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                            route_exit_or_hold(state)
+        mock_close.assert_not_called()
+
+    def test_no_journal_entry_skips_close(self):
+        """Position exists at broker but not in journal — must NOT close."""
+        state = _base_state(
+            trigger="intraday_monitor",
+            journal={"exit_decisions": [
+                {"symbol": "US.MANUAL", "action": "EXIT_CAUTIOUS", "exit_qty_factor": 0.5, "reason": "no thesis"},
+            ]},
+            positions=[{
+                "symbol": "US.MANUAL", "asset_type": "OPT",
+                "qty": 1, "entry_price": 5.0, "mark": 4.5,
+                "thesis_id": None, "strategy_label": None,
+            }],
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
+                       return_value={"rows": []}):  # empty journal
+                with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order") as mock_place:
+                    with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order") as mock_place_opt:
+                        with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
+                            with patch("trading_agent.notify.send"):
+                                from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                route_exit_or_hold(state)
+        # No order should be placed, no journal close, no ntfy
+        mock_place.assert_not_called()
+        mock_place_opt.assert_not_called()
         mock_close.assert_not_called()
 
 
@@ -381,7 +416,7 @@ class TestMarkToMarket:
         )
         with _patch_all_emits():
             with patch("trading_agent.mcp_servers.moomoo.server.get_quote",
-                       return_value={"rows": [{"last_price": 205.0}]}):
+                       return_value={"rows": [{"code": "US.AAPL", "last_price": 205.0}]}):
                 from trading_agent.graph.nodes.eod_nodes import mark_to_market
                 result = mark_to_market(state)
         pos = result["journal"]["marked_positions"][0]

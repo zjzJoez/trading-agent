@@ -66,16 +66,25 @@ def refresh_quotes_and_greeks(state: TradingGraphState) -> dict:
         return {}
 
     try:
-        from trading_agent.mcp_servers.moomoo.server import (
-            get_quote,
-            get_option_chain_snapshot,
-        )
+        from trading_agent.mcp_servers.moomoo.server import get_quote
     except Exception as e:
         log.error("[refresh_quotes] moomoo import failed: %s", e)
         return {}
 
     refreshed: list[dict] = []
     stale_count = 0
+
+    # Batch fetch all symbols in one get_quote call (signature: list[str])
+    symbols_to_fetch = [p["symbol"] for p in positions if p.get("symbol")]
+    quote_by_symbol: dict[str, dict] = {}
+    try:
+        result = get_quote(symbols_to_fetch)
+        for row in (result.get("rows") or []):
+            code = row.get("code") or row.get("symbol") or ""
+            if code:
+                quote_by_symbol[code] = row
+    except Exception as e:
+        log.warning("[refresh_quotes] get_quote batch failed: %s", e)
 
     for pos in positions:
         symbol = pos.get("symbol") or ""
@@ -84,50 +93,40 @@ def refresh_quotes_and_greeks(state: TradingGraphState) -> dict:
             continue
 
         updated = dict(pos)
+        row = quote_by_symbol.get(symbol)
+        if row is None:
+            stale_count += 1
+            refreshed.append(updated)
+            continue
+
         try:
+            mark = float(row.get("last_price") or pos.get("mark") or 0)
+            if mark > 0:
+                updated["mark"] = mark
+
             if _is_option_code(symbol):
-                snap = get_option_chain_snapshot(symbol=symbol)
-                rows = snap.get("rows") or []
-                if rows:
-                    row = rows[0]
-                    mark = float(
-                        row.get("last_price") or row.get("option_premium") or pos["mark"]
-                    )
-                    updated["mark"] = mark
-                    # Greeks — moomoo returns them in the snapshot
-                    if row.get("delta") is not None:
-                        updated["delta"] = float(row["delta"])
-                    if row.get("gamma") is not None:
-                        updated["gamma"] = float(row["gamma"])
-                    if row.get("vega") is not None:
-                        updated["vega"] = float(row["vega"])
-                    if row.get("theta") is not None:
-                        updated["theta"] = float(row["theta"])
-                    if row.get("imp_volatility") is not None:
-                        updated["iv"] = float(row["imp_volatility"])
-                    # DTE from row
-                    if row.get("expiry_date") is not None:
-                        from datetime import date
-                        try:
-                            exp = date.fromisoformat(str(row["expiry_date"]))
-                            updated["dte"] = (exp - date.today()).days
-                        except Exception:
-                            pass
-                else:
-                    stale_count += 1
-            else:
-                # Stock underlying
-                underlying = pos.get("underlying") or symbol
-                qr = get_quote(symbol=underlying)
-                rows = qr.get("rows") or []
-                if rows:
-                    row = rows[0]
-                    mark = float(row.get("last_price") or pos["mark"])
-                    updated["mark"] = mark
-                else:
-                    stale_count += 1
+                # Options: greeks/iv/expiry come back in the same row per docstring
+                if row.get("delta") is not None:
+                    updated["delta"] = float(row["delta"])
+                if row.get("gamma") is not None:
+                    updated["gamma"] = float(row["gamma"])
+                if row.get("vega") is not None:
+                    updated["vega"] = float(row["vega"])
+                if row.get("theta") is not None:
+                    updated["theta"] = float(row["theta"])
+                iv_raw = row.get("imp_volatility") or row.get("implied_volatility") or row.get("iv")
+                if iv_raw is not None:
+                    updated["iv"] = float(iv_raw)
+                exp_raw = row.get("expiry_date") or row.get("strike_time")
+                if exp_raw is not None:
+                    from datetime import date
+                    try:
+                        exp = date.fromisoformat(str(exp_raw)[:10])
+                        updated["dte"] = (exp - date.today()).days
+                    except Exception:
+                        pass
         except Exception as e:
-            log.warning("[refresh_quotes] symbol=%s failed: %s", symbol, e)
+            log.warning("[refresh_quotes] symbol=%s parse failed: %s", symbol, e)
             stale_count += 1
 
         refreshed.append(updated)
@@ -319,8 +318,7 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
 
     try:
         from trading_agent.mcp_servers.moomoo.server import (
-            cancel_paper_order,
-            get_orders,
+            place_paper_option_order,
             place_paper_order,
         )
         moomoo_available = True
@@ -334,8 +332,25 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
     except Exception:
         ntfy_available = False
 
+    # Build a one-shot map of journal trade_ids by symbol so we never close
+    # a position the journal doesn't know about (i.e. user-placed manual fills).
+    journal_trade_id_by_symbol: dict[str, int] = {}
+    try:
+        from trading_agent.mcp_servers.journal.server import (
+            close_trade as journal_close_trade,
+            get_open_positions_with_thesis,
+        )
+        for row in (get_open_positions_with_thesis().get("rows") or []):
+            sym = row.get("symbol")
+            tid = row.get("trade_id")
+            if sym and tid:
+                journal_trade_id_by_symbol[str(sym)] = int(tid)
+    except Exception as e:
+        log.warning("[route_exit_or_hold] journal lookup failed: %s", e)
+
     closed_symbols: list[str] = []
     failed_symbols: list[str] = []
+    skipped_no_journal: list[str] = []
 
     for dec in exits:
         symbol = dec["symbol"]
@@ -349,6 +364,24 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             failed_symbols.append(symbol)
             continue
 
+        # Safety guard — only close positions the journal knows about. Manual
+        # broker positions without a thesis must be left alone for the operator
+        # to handle. The exit-monitor LLM may flag them, but this node refuses.
+        trade_id = journal_trade_id_by_symbol.get(symbol)
+        if trade_id is None:
+            log.warning(
+                "[route_exit_or_hold] %s has no journal trade — refusing to close (manual position)",
+                symbol,
+            )
+            emit(
+                run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                event_type="exit_skipped_no_journal",
+                severity=1,
+                payload={"symbol": symbol, "action": action, "reason": reason},
+            )
+            skipped_no_journal.append(symbol)
+            continue
+
         full_qty = float(pos.get("qty") or 0)
         close_qty = max(1, round(full_qty * qty_factor)) if qty_factor < 1.0 else full_qty
         if close_qty <= 0:
@@ -356,50 +389,49 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             continue
 
         asset_type = pos.get("asset_type", "STK")
-        is_option = asset_type == "OPT"
         side_close = "SELL"  # we only hold long positions
-
         placed_order_id: str | None = None
         exit_price = float(pos.get("mark") or pos.get("entry_price") or 0)
-        thesis_id = pos.get("thesis_id") or 0
 
         if moomoo_available:
             try:
                 if asset_type == "OPT":
-                    # Options: use the option-specific placer (limit-price only, no MARKET)
-                    from trading_agent.mcp_servers.moomoo.server import place_paper_option_order
                     result = place_paper_option_order(
                         option_symbol=symbol,
                         side=side_close,
                         contracts=int(close_qty),
                         price=exit_price,
-                        thesis_id=int(thesis_id),
+                        thesis_id=int(trade_id),  # use journal trade_id as link
                         strategy_label=pos.get("strategy_label"),
                         delta=pos.get("delta"),
                         dte=pos.get("dte"),
                     )
                 else:
-                    # Stocks: limit at mark; NORMAL order type avoids wide fills
                     result = place_paper_order(
                         symbol=symbol,
                         side=side_close,
                         qty=int(close_qty),
                         price=exit_price,
-                        thesis_id=int(thesis_id),
+                        thesis_id=int(trade_id),
                         order_type="NORMAL",
                     )
-                placed_order_id = str(result.get("order_id") or "")
-                log.info(
-                    "[route_exit_or_hold] %s order placed %s qty=%s order_id=%s",
-                    asset_type, symbol, close_qty, placed_order_id,
-                )
+                raw_oid = str(result.get("order_id") or "").strip()
+                if raw_oid:
+                    placed_order_id = raw_oid
+                else:
+                    # Empty order_id → broker accepted but didn't echo; treat as failure
+                    log.warning("[route_exit_or_hold] %s broker returned empty order_id (raw=%r)", symbol, result)
+                    placed_order_id = None
+                if placed_order_id:
+                    log.info(
+                        "[route_exit_or_hold] %s order placed %s qty=%s order_id=%s",
+                        asset_type, symbol, close_qty, placed_order_id,
+                    )
             except Exception as e:
                 log.warning("[route_exit_or_hold] order placement %s failed: %s", symbol, e)
                 placed_order_id = None
 
         if placed_order_id is None:
-            # Order placement failed — do NOT journal close or notify as closed.
-            # Operator will see the failed event in agent_events and can act manually.
             emit(
                 run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
                 event_type="exit_order_failed",
@@ -409,36 +441,18 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             failed_symbols.append(symbol)
             continue
 
-        # Order placed — journal the close and notify
+        # Order placed — close journal entry
         try:
-            from trading_agent.mcp_servers.journal.server import (
-                close_trade as journal_close_trade,
-                get_open_positions_with_thesis,
+            entry_price_j = float(pos.get("entry_price") or 0)
+            mult_j = 100 if asset_type == "OPT" else 1
+            pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
+            outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
+            journal_close_trade(
+                trade_id=trade_id,
+                exit_price=exit_price,
+                outcome=outcome_j,
+                pnl=pnl_j,
             )
-            # Resolve trade_id from journal (required positional arg)
-            trade_id: int | None = None
-            try:
-                for row in (get_open_positions_with_thesis().get("rows") or []):
-                    if row.get("symbol") == symbol:
-                        trade_id = int(row["trade_id"])
-                        break
-            except Exception:
-                pass
-
-            if trade_id is not None:
-                entry_price_j = float(pos.get("entry_price") or 0)
-                is_opt_j = asset_type == "OPT"
-                mult_j = 100 if is_opt_j else 1
-                pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
-                outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
-                journal_close_trade(
-                    trade_id=trade_id,
-                    exit_price=exit_price,
-                    outcome=outcome_j,
-                    pnl=pnl_j,
-                )
-            else:
-                log.warning("[route_exit_or_hold] trade_id not found for %s — journal not closed", symbol)
         except Exception as e:
             log.warning("[route_exit_or_hold] journal close_trade %s failed: %s", symbol, e)
 

@@ -29,30 +29,41 @@ log = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_quote_for_ticker(ticker: str) -> dict[str, Any]:
-    """Return a minimal quote dict for one ticker.  Never raises."""
-    symbol = f"US.{ticker}" if not ticker.startswith("US.") else ticker
+def _fetch_quotes_batch(tickers: list[str]) -> dict[str, dict[str, Any]]:
+    """Batch fetch quotes for multiple tickers; returns ticker → quote dict.
+    Never raises."""
+    out: dict[str, dict[str, Any]] = {}
+    symbols = [f"US.{t}" if not t.startswith("US.") else t for t in tickers]
     try:
         from trading_agent.mcp_servers.moomoo.server import get_quote
-        qr = get_quote(symbol=symbol)
-        rows = qr.get("rows") or []
-        if rows:
-            r = rows[0]
-            return {
-                "ticker": ticker,
-                "symbol": symbol,
-                "last": float(r.get("last_price") or 0),
-                "volume": float(r.get("volume") or 0),
-                "turnover": float(r.get("turnover") or 0),
-                "change_pct": float(r.get("change_rate") or r.get("price_spread") or 0),
-                "high": float(r.get("high_price") or 0),
-                "low": float(r.get("low_price") or 0),
-                "open": float(r.get("open_price") or 0),
-                "prev_close": float(r.get("prev_close_price") or 0),
-            }
+        result = get_quote(symbols)
+        rows_by_code: dict[str, dict] = {}
+        for r in (result.get("rows") or []):
+            code = r.get("code") or r.get("symbol") or ""
+            if code:
+                rows_by_code[code] = r
+        for ticker, sym in zip(tickers, symbols):
+            r = rows_by_code.get(sym)
+            if r:
+                out[ticker] = {
+                    "ticker": ticker,
+                    "symbol": sym,
+                    "last": float(r.get("last_price") or 0),
+                    "volume": float(r.get("volume") or 0),
+                    "turnover": float(r.get("turnover") or 0),
+                    "change_pct": float(r.get("change_rate") or 0),
+                    "high": float(r.get("high_price") or 0),
+                    "low": float(r.get("low_price") or 0),
+                    "open": float(r.get("open_price") or 0),
+                    "prev_close": float(r.get("prev_close_price") or 0),
+                }
+            else:
+                out[ticker] = {"ticker": ticker, "symbol": sym, "last": 0.0, "error": "fetch_failed"}
     except Exception as e:
-        log.warning("[premarket] quote %s failed: %s", ticker, e)
-    return {"ticker": ticker, "symbol": symbol, "last": 0.0, "error": "fetch_failed"}
+        log.warning("[premarket] get_quote batch failed: %s", e)
+        for ticker, sym in zip(tickers, symbols):
+            out[ticker] = {"ticker": ticker, "symbol": sym, "last": 0.0, "error": "fetch_failed"}
+    return out
 
 
 def _fetch_recent_filing_headline(ticker: str) -> str | None:
@@ -92,14 +103,12 @@ def collect_watchlist_data(state: TradingGraphState) -> dict:
         ]
         log.info("[premarket/collect_watchlist_data] using default watchlist (%d tickers)", len(watchlist))
 
-    quote_data: dict[str, Any] = {}
-    for ticker in watchlist:
-        quote_data[ticker] = _fetch_quote_for_ticker(ticker)
+    quote_data = _fetch_quotes_batch(watchlist)
 
     # Also grab one recent EDGAR filing per ticker (best-effort, sequential)
     for ticker in watchlist[:6]:  # limit to top 6 to avoid rate-limit
         headline = _fetch_recent_filing_headline(ticker)
-        if headline:
+        if headline and ticker in quote_data:
             quote_data[ticker]["recent_filing"] = headline
 
     emit(
