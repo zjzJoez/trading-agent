@@ -50,3 +50,4 @@ agent_events.fallback.jsonl
 # Editor
 .vscode/
 .idea/
+.claude/worktrees/
