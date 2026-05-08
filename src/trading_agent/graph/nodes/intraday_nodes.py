@@ -51,9 +51,10 @@ def refresh_quotes_and_greeks(state: TradingGraphState) -> dict:
     """Refresh last-price marks (and option Greeks if available) for every
     open position in state["positions"].
 
-    Uses moomoo get_quote for underlying prices and get_option_chain_snapshot
-    for option contracts.  Failures per-position are logged and skipped; the
-    position keeps its stale mark so downstream nodes still function.
+    Uses moomoo get_quote (batched, list[str] signature) for both stock and
+    option symbols. Per the API docstring, get_quote returns greeks/iv/expiry
+    in the same row when the symbol is an option. Failures degrade to stale
+    marks so downstream nodes still function.
     """
     run_id = state["run_id"]
     trigger = state["trigger"]
