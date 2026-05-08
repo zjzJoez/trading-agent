@@ -19,5 +19,5 @@ CREATE INDEX IF NOT EXISTS idx_regime_states_accuracy
 
 -- Record this migration
 INSERT INTO schema_migrations (version, applied_at)
-VALUES ('003', NOW())
+VALUES ('006', NOW())
 ON CONFLICT (version) DO NOTHING;
