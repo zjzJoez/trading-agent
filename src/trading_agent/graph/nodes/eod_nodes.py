@@ -404,7 +404,8 @@ def update_regime_accuracy_labels(state: TradingGraphState) -> dict:
         else:
             accuracy_label = "neutral"
 
-        # Attempt to write accuracy_label back — column may not exist in older migrations
+        # Attempt to write accuracy_label back if the column exists.
+        # If the column is absent (pre-migration), fall back to agent_events only.
         with cursor() as cur:
             try:
                 cur.execute(
@@ -416,8 +417,10 @@ def update_regime_accuracy_labels(state: TradingGraphState) -> dict:
                     (accuracy_label, round(spy_return, 6), regime_id),
                 )
             except Exception:
-                # Column absent — non-fatal
-                pass
+                # Column absent in this migration version — write to agent_events instead
+                # so the data isn't lost (readable via SELECT * FROM agent_events WHERE
+                # event_type = 'regime_accuracy_label').
+                pass  # emit below covers the audit record
 
     except Exception as e:
         log.warning("[update_regime_accuracy_labels] DB failed: %s", e)

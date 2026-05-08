@@ -360,26 +360,56 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
         side_close = "SELL"  # we only hold long positions
 
         placed_order_id: str | None = None
+        exit_price = float(pos.get("mark") or pos.get("entry_price") or 0)
+        thesis_id = pos.get("thesis_id") or 0
+
         if moomoo_available:
             try:
-                mark = float(pos.get("mark") or pos.get("entry_price") or 0)
-                # Use MARKET order for exits (speed > price in exit scenarios)
-                result = place_paper_order(
-                    symbol=symbol,
-                    side=side_close,
-                    qty=int(close_qty),
-                    price=mark,          # limit at mark (moomoo fallback)
-                    order_type="MARKET",
-                )
+                if asset_type == "OPT":
+                    # Options: use the option-specific placer (limit-price only, no MARKET)
+                    from trading_agent.mcp_servers.moomoo.server import place_paper_option_order
+                    result = place_paper_option_order(
+                        option_symbol=symbol,
+                        side=side_close,
+                        contracts=int(close_qty),
+                        price=exit_price,
+                        thesis_id=int(thesis_id),
+                        strategy_label=pos.get("strategy_label"),
+                        delta=pos.get("delta"),
+                        dte=pos.get("dte"),
+                    )
+                else:
+                    # Stocks: limit at mark; NORMAL order type avoids wide fills
+                    result = place_paper_order(
+                        symbol=symbol,
+                        side=side_close,
+                        qty=int(close_qty),
+                        price=exit_price,
+                        thesis_id=int(thesis_id),
+                        order_type="NORMAL",
+                    )
                 placed_order_id = str(result.get("order_id") or "")
-                log.info("[route_exit_or_hold] closed %s qty=%s order_id=%s", symbol, close_qty, placed_order_id)
+                log.info(
+                    "[route_exit_or_hold] %s order placed %s qty=%s order_id=%s",
+                    asset_type, symbol, close_qty, placed_order_id,
+                )
             except Exception as e:
-                log.warning("[route_exit_or_hold] place_paper_order %s failed: %s", symbol, e)
+                log.warning("[route_exit_or_hold] order placement %s failed: %s", symbol, e)
                 placed_order_id = None
 
-        # Best-effort: close trade in journal via MCP server Python module
-        thesis_id = pos.get("thesis_id")
-        exit_price = float(pos.get("mark") or pos.get("entry_price") or 0)
+        if placed_order_id is None:
+            # Order placement failed — do NOT journal close or notify as closed.
+            # Operator will see the failed event in agent_events and can act manually.
+            emit(
+                run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                event_type="exit_order_failed",
+                severity=1,
+                payload={"symbol": symbol, "action": action, "reason": reason},
+            )
+            failed_symbols.append(symbol)
+            continue
+
+        # Order placed — journal the close and notify
         try:
             from trading_agent.mcp_servers.journal.server import close_trade as journal_close_trade
             journal_close_trade(
