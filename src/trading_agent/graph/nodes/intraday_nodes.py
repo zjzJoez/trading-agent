@@ -411,12 +411,34 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
 
         # Order placed — journal the close and notify
         try:
-            from trading_agent.mcp_servers.journal.server import close_trade as journal_close_trade
-            journal_close_trade(
-                symbol=symbol,
-                exit_price=exit_price,
-                close_reason=action,
+            from trading_agent.mcp_servers.journal.server import (
+                close_trade as journal_close_trade,
+                get_open_positions_with_thesis,
             )
+            # Resolve trade_id from journal (required positional arg)
+            trade_id: int | None = None
+            try:
+                for row in (get_open_positions_with_thesis().get("rows") or []):
+                    if row.get("symbol") == symbol:
+                        trade_id = int(row["trade_id"])
+                        break
+            except Exception:
+                pass
+
+            if trade_id is not None:
+                entry_price_j = float(pos.get("entry_price") or 0)
+                is_opt_j = asset_type == "OPT"
+                mult_j = 100 if is_opt_j else 1
+                pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
+                outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
+                journal_close_trade(
+                    trade_id=trade_id,
+                    exit_price=exit_price,
+                    outcome=outcome_j,
+                    pnl=pnl_j,
+                )
+            else:
+                log.warning("[route_exit_or_hold] trade_id not found for %s — journal not closed", symbol)
         except Exception as e:
             log.warning("[route_exit_or_hold] journal close_trade %s failed: %s", symbol, e)
 

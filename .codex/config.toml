@@ -1,0 +1,8 @@
+[mcp_servers.edgar-mcp]
+command = "/Users/joez/Desktop/trading-agent/.venv/bin/edgar-mcp"
+
+[mcp_servers.journal-mcp]
+command = "/Users/joez/Desktop/trading-agent/.venv/bin/journal-mcp"
+
+[mcp_servers.moomoo-mcp]
+command = "/Users/joez/Desktop/trading-agent/.venv/bin/moomoo-mcp"

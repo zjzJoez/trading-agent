@@ -352,12 +352,17 @@ def update_regime_accuracy_labels(state: TradingGraphState) -> dict:
     # Fetch SPY close for today
     spy_return: float | None = None
     try:
+        from datetime import date as _date, timedelta as _td
         from trading_agent.mcp_servers.moomoo.server import get_historical_kline
-        klines = get_historical_kline(symbol="US.SPY", ktype="K_DAY", num=2)
+        today = _date.today()
+        start = (today - _td(days=7)).isoformat()   # 7-day buffer covers weekends/holidays
+        end = today.isoformat()
+        klines = get_historical_kline(symbol="US.SPY", start=start, end=end, ktype="K_DAY", max_count=5)
         rows = klines.get("rows") or []
         if len(rows) >= 2:
-            prev_close = float(rows[-2].get("close_price") or rows[-2].get("close") or 0)
-            today_close = float(rows[-1].get("close_price") or rows[-1].get("close") or 0)
+            # column name from moomoo API is "close", not "close_price"
+            prev_close = float(rows[-2].get("close") or rows[-2].get("close_price") or 0)
+            today_close = float(rows[-1].get("close") or rows[-1].get("close_price") or 0)
             if prev_close > 0:
                 spy_return = (today_close - prev_close) / prev_close
     except Exception as e:
@@ -404,23 +409,16 @@ def update_regime_accuracy_labels(state: TradingGraphState) -> dict:
         else:
             accuracy_label = "neutral"
 
-        # Attempt to write accuracy_label back if the column exists.
-        # If the column is absent (pre-migration), fall back to agent_events only.
+        # Write accuracy_label to regime_states (migration 003 adds the columns).
         with cursor() as cur:
-            try:
-                cur.execute(
-                    """
-                    UPDATE regime_states
-                    SET accuracy_label = %s, spy_next_day_return = %s
-                    WHERE id = %s
-                    """,
-                    (accuracy_label, round(spy_return, 6), regime_id),
-                )
-            except Exception:
-                # Column absent in this migration version — write to agent_events instead
-                # so the data isn't lost (readable via SELECT * FROM agent_events WHERE
-                # event_type = 'regime_accuracy_label').
-                pass  # emit below covers the audit record
+            cur.execute(
+                """
+                UPDATE regime_states
+                SET accuracy_label = %s, spy_next_day_return = %s
+                WHERE id = %s
+                """,
+                (accuracy_label, round(spy_return, 6), regime_id),
+            )
 
     except Exception as e:
         log.warning("[update_regime_accuracy_labels] DB failed: %s", e)

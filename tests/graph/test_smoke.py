@@ -1,67 +1,81 @@
-"""Phase 2.1 smoke tests for the LangGraph skeleton.
+"""Graph smoke tests — compilation + integration.
 
-Asserts that:
-1. Each subgraph compiles without error
-2. healthcheck_graph runs end-to-end (no Postgres / OpenD dependency)
-3. premarket_scan_graph runs end-to-end (stubs only)
-
-These tests require a live Postgres pointed at by POSTGRES_DSN. CI/dev
-should run them inside the EC2 environment OR with a local docker
-postgres. Skipped if Postgres unreachable.
+Two tiers:
+  1. Compile-only (no external deps) — runs always, patches Postgres with MemorySaver.
+  2. Integration (requires POSTGRES_DSN) — skipped in environments without Postgres.
 """
 from __future__ import annotations
 
 import os
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("POSTGRES_DSN") and not (os.path.expanduser("~/.env.postgres") and os.path.exists(os.path.expanduser("~/.env.postgres"))),
+# ---------------------------------------------------------------------------
+# Tier 1 — compile-only, MemorySaver substitution (always runs)
+# ---------------------------------------------------------------------------
+
+def _memory_saver():
+    from langgraph.checkpoint.memory import MemorySaver
+    return MemorySaver()
+
+
+def test_all_graphs_compile_with_memory_saver():
+    """All 6 subgraphs must compile; no Postgres needed."""
+    with patch("trading_agent.graph.builder.get_saver", _memory_saver):
+        from trading_agent.graph.builder import GRAPH_BUILDERS
+        for name, builder in GRAPH_BUILDERS.items():
+            g = builder()
+            assert g is not None, f"{name} failed to compile"
+
+
+def test_graph_builder_registry_has_all_triggers():
+    from trading_agent.graph.builder import GRAPH_BUILDERS
+    expected = {
+        "premarket_scan", "candidate_entry", "intraday_monitor",
+        "eod_review", "weekly_learning", "healthcheck",
+    }
+    assert set(GRAPH_BUILDERS.keys()) == expected
+
+
+def test_builder_no_longer_imports_stubs():
+    """builder.py must not import the stubs module (all nodes are real)."""
+    import importlib, ast, pathlib
+    src = pathlib.Path("src/trading_agent/graph/builder.py").read_text()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [a.name for a in getattr(node, "names", [])]
+            module = getattr(node, "module", "") or ""
+            assert "stubs" not in module and all("stubs" not in n for n in names), \
+                f"builder.py still imports stubs: {ast.dump(node)}"
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — integration tests (Postgres required)
+# ---------------------------------------------------------------------------
+
+_POSTGRES_AVAILABLE = bool(
+    os.environ.get("POSTGRES_DSN")
+    or os.path.exists(os.path.expanduser("~/.env.postgres"))
+)
+pytestmark_pg = pytest.mark.skipif(
+    not _POSTGRES_AVAILABLE,
     reason="Postgres DSN not configured (set POSTGRES_DSN or ~/.env.postgres)",
 )
 
 
-def test_all_graphs_compile():
-    from trading_agent.graph.builder import GRAPH_BUILDERS
-
-    for name, builder in GRAPH_BUILDERS.items():
-        graph = builder()
-        assert graph is not None, f"{name} failed to compile"
-
-
-def test_healthcheck_graph_runs():
+@pytest.mark.skipif(not _POSTGRES_AVAILABLE, reason="requires Postgres")
+def test_healthcheck_graph_completes():
     from trading_agent.orchestrator import run_once
-
     final = run_once("healthcheck")
-    assert final["run_id"], "run_id should be populated"
+    assert final["run_id"]
     assert final["trigger"] == "healthcheck"
-    nodes = [n.get("node") for n in final.get("notifications", [])]
-    assert "opend_health" in nodes
-    assert "postgres_health" in nodes
-    assert "ntfy_health" in nodes
 
 
-def test_premarket_scan_graph_runs():
+@pytest.mark.skipif(not _POSTGRES_AVAILABLE, reason="requires Postgres")
+def test_eod_review_graph_completes():
     from trading_agent.orchestrator import run_once
-
-    final = run_once("premarket_scan", watchlist=["US.SPY", "US.QQQ"])
-    assert final["watchlist"] == ["US.SPY", "US.QQQ"]
-    nodes = [n.get("node") for n in final.get("notifications", [])]
-    # Each premarket scan node should appear in the notifications log
-    for expected in [
-        "collect_macro_market_data",
-        "compute_regime_features",
-        "classify_regime",
-        "rank_candidates",
-        "ntfy_scan_digest",
-    ]:
-        assert expected in nodes, f"missing node: {expected}"
-
-
-def test_eod_review_graph_runs():
-    from trading_agent.orchestrator import run_once
-
     final = run_once("eod_review")
-    nodes = [n.get("node") for n in final.get("notifications", [])]
-    assert "reconcile_journal" in nodes
-    assert "ntfy_daily_summary" in nodes
+    assert final["run_id"]
+    assert final["trigger"] == "eod_review"

@@ -1305,6 +1305,20 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
         )
         return {"sizing": {"r1_r6_violations": [], "approved_qty": 0.0, "infeasible": True}}
 
+    # Soak TINY_PAPER cap: hard ceiling before R1-R6 candidates are tried
+    try:
+        from trading_agent.learning.soak import tiny_paper_qty_cap
+        soak_cap = tiny_paper_qty_cap()
+        if soak_cap is not None and requested_qty > soak_cap:
+            emit(
+                run_id=run_id, trigger=trigger, agent="deterministic_sizing",
+                event_type="tiny_paper_cap_applied",
+                payload={"requested": requested_qty, "cap": soak_cap},
+            )
+            requested_qty = float(soak_cap)
+    except Exception as e:
+        log.warning("[deterministic_sizing] soak cap check failed: %s", e)
+
     # Try requested qty, then 75%, 50%, 25%, 10% — coarse but sufficient for R1
     candidate_qtys = [
         requested_qty,
@@ -1389,7 +1403,7 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
 
 
 def regime_execution_gate(state: TradingGraphState) -> dict:
-    """Apply the regime gate (size_multiplier + allow_new_entries)."""
+    """Apply the regime gate (size_multiplier + allow_new_entries) + soak-phase gate."""
     run_id = state["run_id"]
     trigger = state["trigger"]
     log.info("[trade/regime_execution_gate] run_id=%s", run_id)
@@ -1397,6 +1411,20 @@ def regime_execution_gate(state: TradingGraphState) -> dict:
     proposal = state.get("proposal")
     if not proposal:
         return {}
+
+    # Soak-phase gate: READ_ONLY blocks all new entries regardless of regime
+    try:
+        from trading_agent.learning.soak import is_new_entry_allowed, current_phase
+        soak_phase = current_phase()
+        if not is_new_entry_allowed(soak_phase):
+            emit(
+                run_id=run_id, trigger=trigger, agent="regime_execution_gate",
+                event_type="blocked",
+                payload={"reason": "soak_read_only", "soak_phase": soak_phase.value},
+            )
+            return {"proposal": {**proposal, "qty": 0.0}}
+    except Exception as e:
+        log.warning("[regime_execution_gate] soak check failed: %s", e)
 
     regime = state.get("regime") or {}
     gate = regime.get("gate") or {}
