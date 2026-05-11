@@ -335,7 +335,12 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
 
     # Build a one-shot map of journal trade_ids by symbol so we never close
     # a position the journal doesn't know about (i.e. user-placed manual fills).
-    journal_trade_id_by_symbol: dict[str, int] = {}
+    # Multi-source resolver: SQLite journal MCP first (canonical), then
+    # Postgres journal_trades as a fallback when SQLite is empty / out of sync.
+    # Value is (trade_id, source) where source ∈ {"sqlite", "postgres"}.
+    journal_trade_id_by_symbol: dict[str, tuple[int, str]] = {}
+
+    # Source 1: SQLite journal MCP
     try:
         from trading_agent.mcp_servers.journal.server import (
             close_trade as journal_close_trade,
@@ -345,9 +350,29 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             sym = row.get("symbol")
             tid = row.get("trade_id")
             if sym and tid:
-                journal_trade_id_by_symbol[str(sym)] = int(tid)
+                journal_trade_id_by_symbol[str(sym)] = (int(tid), "sqlite")
     except Exception as e:
-        log.warning("[route_exit_or_hold] journal lookup failed: %s", e)
+        log.warning("[route_exit_or_hold] sqlite journal lookup failed: %s", e)
+        journal_close_trade = None  # type: ignore[assignment]
+
+    # Source 2: Postgres journal_trades (fallback for symbols not in SQLite)
+    needed_symbols = {d["symbol"] for d in exits} - set(journal_trade_id_by_symbol)
+    if needed_symbols:
+        try:
+            from trading_agent.store.postgres import cursor
+            with cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, symbol FROM journal_trades
+                    WHERE outcome = 'OPEN' AND symbol = ANY(%s)
+                    ORDER BY opened_at DESC
+                    """,
+                    (list(needed_symbols),),
+                )
+                for tid, sym in cur.fetchall():
+                    journal_trade_id_by_symbol.setdefault(str(sym), (int(tid), "postgres"))
+        except Exception as e:
+            log.warning("[route_exit_or_hold] postgres journal fallback failed: %s", e)
 
     closed_symbols: list[str] = []
     failed_symbols: list[str] = []
@@ -368,8 +393,8 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
         # Safety guard — only close positions the journal knows about. Manual
         # broker positions without a thesis must be left alone for the operator
         # to handle. The exit-monitor LLM may flag them, but this node refuses.
-        trade_id = journal_trade_id_by_symbol.get(symbol)
-        if trade_id is None:
+        resolved = journal_trade_id_by_symbol.get(symbol)
+        if resolved is None:
             log.warning(
                 "[route_exit_or_hold] %s has no journal trade — refusing to close (manual position)",
                 symbol,
@@ -382,6 +407,7 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             )
             skipped_no_journal.append(symbol)
             continue
+        trade_id, trade_id_source = resolved
 
         full_qty = float(pos.get("qty") or 0)
         close_qty = max(1, round(full_qty * qty_factor)) if qty_factor < 1.0 else full_qty
@@ -442,20 +468,44 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             failed_symbols.append(symbol)
             continue
 
-        # Order placed — close journal entry
-        try:
-            entry_price_j = float(pos.get("entry_price") or 0)
-            mult_j = 100 if asset_type == "OPT" else 1
-            pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
-            outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
-            journal_close_trade(
-                trade_id=trade_id,
-                exit_price=exit_price,
-                outcome=outcome_j,
-                pnl=pnl_j,
-            )
-        except Exception as e:
-            log.warning("[route_exit_or_hold] journal close_trade %s failed: %s", symbol, e)
+        # Order placed — close journal entry on whichever source the trade lives in.
+        entry_price_j = float(pos.get("entry_price") or 0)
+        mult_j = 100 if asset_type == "OPT" else 1
+        pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
+        outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
+
+        closed_ok = False
+        if trade_id_source == "sqlite" and journal_close_trade is not None:
+            try:
+                journal_close_trade(
+                    trade_id=trade_id,
+                    exit_price=exit_price,
+                    outcome=outcome_j,
+                    pnl=pnl_j,
+                )
+                closed_ok = True
+            except Exception as e:
+                log.warning("[route_exit_or_hold] sqlite close_trade %s failed: %s", symbol, e)
+        if not closed_ok:
+            # Either source was postgres, or sqlite path raised — write directly to Postgres.
+            try:
+                from trading_agent.store.postgres import cursor
+                with cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE journal_trades
+                        SET exit_price = %s,
+                            outcome = %s,
+                            closed_at = COALESCE(closed_at, NOW()),
+                            close_reason = COALESCE(close_reason, %s)
+                        WHERE id = %s AND outcome = 'OPEN'
+                        """,
+                        (exit_price, outcome_j, action, trade_id),
+                    )
+                closed_ok = True
+                log.info("[route_exit_or_hold] %s journal closed via postgres trade_id=%s", symbol, trade_id)
+            except Exception as e:
+                log.warning("[route_exit_or_hold] postgres close %s failed: %s", symbol, e)
 
         emit(
             run_id=run_id, trigger=trigger, agent="route_exit_or_hold",

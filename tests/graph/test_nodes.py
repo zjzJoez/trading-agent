@@ -341,8 +341,18 @@ class TestRouteExitOrHold:
                             route_exit_or_hold(state)
         mock_close.assert_not_called()
 
+    def _mock_pg_cursor(self, fetchall_rows: list[tuple]):
+        """Build a Postgres cursor mock returning the given rows from fetchall."""
+        mock_cur = MagicMock()
+        mock_cur.__enter__ = lambda s: mock_cur
+        mock_cur.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchall.return_value = fetchall_rows
+        mock_cur.execute = MagicMock()
+        return mock_cur
+
     def test_no_journal_entry_skips_close(self):
-        """Position exists at broker but not in journal — must NOT close."""
+        """Position exists at broker but not in journal — must NOT close.
+        Both SQLite and Postgres lookups return empty."""
         state = _base_state(
             trigger="intraday_monitor",
             journal={"exit_decisions": [
@@ -356,17 +366,62 @@ class TestRouteExitOrHold:
         )
         with _patch_all_emits():
             with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": []}):  # empty journal
-                with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order") as mock_place:
-                    with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order") as mock_place_opt:
-                        with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
-                            with patch("trading_agent.notify.send"):
-                                from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
-                                route_exit_or_hold(state)
+                       return_value={"rows": []}):  # empty SQLite
+                with patch("trading_agent.store.postgres.cursor",
+                           return_value=self._mock_pg_cursor([])):  # empty Postgres
+                    with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order") as mock_place:
+                        with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order") as mock_place_opt:
+                            with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
+                                with patch("trading_agent.notify.send"):
+                                    from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                    route_exit_or_hold(state)
         # No order should be placed, no journal close, no ntfy
         mock_place.assert_not_called()
         mock_place_opt.assert_not_called()
         mock_close.assert_not_called()
+
+    def test_postgres_fallback_resolves_trade_id(self):
+        """When SQLite is empty but Postgres journal_trades has the symbol,
+        the resolver must fall back to Postgres, place the order, and close
+        the trade via Postgres UPDATE (not the SQLite MCP)."""
+        opt_sym = "US.QQQ260605C665000"
+        state = _base_state(
+            trigger="intraday_monitor",
+            journal={"exit_decisions": [
+                {"symbol": opt_sym, "action": "EXIT_TARGET", "exit_qty_factor": 1.0, "reason": "target hit"},
+            ]},
+            positions=[{
+                "symbol": opt_sym, "asset_type": "OPT",
+                "qty": 1, "entry_price": 18.51, "mark": 25.00,
+                "strategy_label": "earnings_long_call",
+            }],
+        )
+        mock_order = {"order_id": "QQQ789"}
+        pg_cursor = self._mock_pg_cursor([(42, opt_sym)])
+
+        with _patch_all_emits():
+            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
+                       return_value={"rows": []}):  # SQLite empty
+                with patch("trading_agent.store.postgres.cursor", return_value=pg_cursor):
+                    with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
+                               return_value=mock_order) as mock_place_opt:
+                        with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_sqlite_close:
+                            with patch("trading_agent.notify.send"):
+                                from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                route_exit_or_hold(state)
+
+        # Order placed with the Postgres-resolved trade_id (42)
+        mock_place_opt.assert_called_once()
+        opt_kwargs = mock_place_opt.call_args[1]
+        assert opt_kwargs.get("thesis_id") == 42
+
+        # SQLite close_trade should NOT be called (trade not in SQLite)
+        mock_sqlite_close.assert_not_called()
+
+        # Postgres cursor should have received an UPDATE journal_trades call
+        executes = [c.args[0] for c in pg_cursor.execute.call_args_list if c.args]
+        update_called = any("UPDATE journal_trades" in q for q in executes)
+        assert update_called, f"expected UPDATE journal_trades in executes: {executes!r}"
 
 
 # ---------------------------------------------------------------------------
