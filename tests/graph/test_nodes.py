@@ -275,7 +275,7 @@ class TestRouteExitOrHold:
                 "thesis_id": 42, "strategy_label": "momentum_long",
             }],
         )
-        mock_order = {"order_id": "ORD123"}
+        mock_order = {"thesis_id": 7, "rows": [{"order_id": "ORD123", "order_status": "SUBMITTED"}]}
         with _patch_all_emits():
             with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
                        return_value={"rows": [{"symbol": "US.AAPL", "trade_id": 7}]}):
@@ -305,7 +305,7 @@ class TestRouteExitOrHold:
                 "delta": 0.52, "dte": 20,
             }],
         )
-        mock_order = {"order_id": "OPT456"}
+        mock_order = {"thesis_id": 15, "rows": [{"order_id": "OPT456", "order_status": "SUBMITTED"}]}
         with _patch_all_emits():
             with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
                        return_value={"rows": [{"symbol": opt_sym, "trade_id": 15}]}):
@@ -396,7 +396,7 @@ class TestRouteExitOrHold:
                 "strategy_label": "earnings_long_call",
             }],
         )
-        mock_order = {"order_id": "QQQ789"}
+        mock_order = {"thesis_id": 42, "rows": [{"order_id": "QQQ789", "order_status": "SUBMITTED"}]}
         pg_cursor = self._mock_pg_cursor([(42, opt_sym)])
 
         with _patch_all_emits():

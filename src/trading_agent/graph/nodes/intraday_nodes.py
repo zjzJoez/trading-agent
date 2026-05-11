@@ -442,13 +442,22 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                         thesis_id=int(trade_id),
                         order_type="NORMAL",
                     )
-                raw_oid = str(result.get("order_id") or "").strip()
-                if raw_oid:
-                    placed_order_id = raw_oid
-                else:
-                    # Empty order_id → broker accepted but didn't echo; treat as failure
-                    log.warning("[route_exit_or_hold] %s broker returned empty order_id (raw=%r)", symbol, result)
-                    placed_order_id = None
+                # Both place_paper_order and place_paper_option_order return
+                # {thesis_id, ..., rows: [{order_id, order_status, ...}, ...]}
+                # — NOT a top-level "order_id". Pattern matches trade_nodes.execute_paper_order.
+                rows = result.get("rows") or []
+                placed_order_id = None
+                if rows:
+                    placed_order_id = (
+                        str(rows[0].get("order_id") or rows[0].get("orderID") or "").strip()
+                        or None
+                    )
+                if not placed_order_id and result.get("virtual_fill_suggested"):
+                    # Moomoo rejected paper order; fall through to virtual close in journal.
+                    log.warning(
+                        "[route_exit_or_hold] %s virtual fallback (broker rejected): %s",
+                        symbol, result.get("reason"),
+                    )
                 if placed_order_id:
                     log.info(
                         "[route_exit_or_hold] %s order placed %s qty=%s order_id=%s",
