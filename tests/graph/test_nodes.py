@@ -583,19 +583,109 @@ class TestRankCandidates:
 
 
 class TestNtfyScanDigest:
+    def _patch_dispatch_no_op(self):
+        """Disable the candidate_entry subprocess fork in tests that don't care about it."""
+        return patch("trading_agent.graph.nodes.premarket_nodes._dispatch_candidate_entry_if_eligible",
+                     return_value=None)
+
     def test_sends_to_trades_topic(self):
         state = _base_state(
             trigger="premarket_scan",
             candidates=[{"ticker": "AAPL", "score": 0.9, "reason": "breakout"}],
             regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
         )
-        with _patch_all_emits():
+        with _patch_all_emits(), self._patch_dispatch_no_op():
             with patch("trading_agent.notify.send") as mock_send:
                 from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
                 ntfy_scan_digest(state)
         mock_send.assert_called_once()
         kwargs = mock_send.call_args[1] if mock_send.call_args[1] else {}
         assert kwargs.get("topic") == "trades"
+
+    def test_dispatch_forks_when_eligible(self):
+        """High-score top candidate + clean state → subprocess.Popen fires."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "NVDA", "score": 0.85, "reason": "momentum breakout"}],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.notify.send"):
+                with patch("pathlib.Path.exists", return_value=False):  # halt flag absent
+                    with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                        with patch("subprocess.Popen") as mock_popen:
+                            mock_popen.return_value.pid = 12345
+                            from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                            ntfy_scan_digest(state)
+        mock_popen.assert_called_once()
+        call_args = mock_popen.call_args[0][0]
+        # Verify CLI: python -m trading_agent.orchestrator --trigger=candidate_entry --ticker NVDA
+        assert "trading_agent.orchestrator" in call_args
+        assert "--trigger=candidate_entry" in call_args
+        assert "NVDA" in call_args
+        # Detached
+        assert mock_popen.call_args[1].get("start_new_session") is True
+
+    def test_dispatch_skipped_below_threshold(self):
+        """Top candidate score < 0.6 must NOT trigger dispatch."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "AAPL", "score": 0.45, "reason": "weak setup"}],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.notify.send"):
+                with patch("subprocess.Popen") as mock_popen:
+                    from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                    ntfy_scan_digest(state)
+        mock_popen.assert_not_called()
+
+    def test_dispatch_skipped_when_halt_flag(self):
+        """Halt flag set → no dispatch even if score is high."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "strong setup"}],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.notify.send"):
+                with patch("pathlib.Path.exists", return_value=True):  # halt flag PRESENT
+                    with patch("subprocess.Popen") as mock_popen:
+                        from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                        ntfy_scan_digest(state)
+        mock_popen.assert_not_called()
+
+    def test_dispatch_skipped_when_regime_blocks(self):
+        """Regime gate says no new entries → no dispatch."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "strong setup"}],
+            regime={"label": "CRISIS", "gate": {"allow_new_entries": False}},
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.notify.send"):
+                with patch("pathlib.Path.exists", return_value=False):
+                    with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                        with patch("subprocess.Popen") as mock_popen:
+                            from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                            ntfy_scan_digest(state)
+        mock_popen.assert_not_called()
+
+    def test_dispatch_skipped_when_soak_read_only(self):
+        """Soak phase READ_ONLY → no dispatch."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "strong setup"}],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.notify.send"):
+                with patch("pathlib.Path.exists", return_value=False):
+                    with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=False):
+                        with patch("subprocess.Popen") as mock_popen:
+                            from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                            ntfy_scan_digest(state)
+        mock_popen.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

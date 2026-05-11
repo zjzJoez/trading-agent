@@ -229,6 +229,11 @@ def rank_candidates(state: TradingGraphState) -> dict:
         payload={
             "n_candidates": len(candidates),
             "top_ticker": candidates[0]["ticker"] if candidates else None,
+            # Include top-3 with scores for downstream debugging + dispatch decision
+            "top": [
+                {"ticker": c["ticker"], "score": round(c["score"], 3), "reason": c["reason"][:120]}
+                for c in candidates[:3]
+            ],
         },
     )
     return {"candidates": candidates}
@@ -289,7 +294,154 @@ def ntfy_scan_digest(state: TradingGraphState) -> dict:
             "ntfy_status": ntfy_status,
         },
     )
+
+    # ---- Autonomous handoff: dispatch candidate_entry for top pick ----
+    _dispatch_candidate_entry_if_eligible(state, candidates, regime)
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Autonomous handoff to candidate_entry
+# ---------------------------------------------------------------------------
+
+# Score threshold below which we do NOT dispatch. Above this, scout has at
+# least moderate conviction and the full pipeline (Bull/Bear debate + Risk
+# Council) is worth the LLM spend. Tuned conservatively — bump up to 0.7 if
+# false-positive rate of full-pipeline-then-decline is too high.
+DISPATCH_MIN_SCORE = 0.6
+
+
+def _dispatch_candidate_entry_if_eligible(
+    state: TradingGraphState,
+    candidates: list[dict],
+    regime: dict,
+) -> None:
+    """Spin off the candidate_entry subgraph for the highest-scoring candidate.
+
+    Conditions for dispatch (all must hold):
+      * at least one candidate, top score ≥ DISPATCH_MIN_SCORE
+      * halt flag absent
+      * soak phase allows new entries
+      * regime gate allows new entries
+
+    Mechanism: ``subprocess.Popen`` with ``start_new_session=True`` so the
+    child outlives the premarket graph's runtime. The child runs the full
+    candidate_entry pipeline (research → debate → propose → size → risk
+    council → execute or veto) independently.
+
+    Never raises — failures only log + emit. Worst case the user gets an
+    audit row with rationale and the candidate is skipped that day.
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+
+    if not candidates:
+        return
+    top = candidates[0]
+    top_score = float(top.get("score") or 0.0)
+    ticker = (top.get("ticker") or "").strip().upper()
+    if not ticker:
+        return
+
+    # Guard 1: score threshold
+    if top_score < DISPATCH_MIN_SCORE:
+        emit(
+            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+            event_type="candidate_entry_skipped",
+            payload={"ticker": ticker, "score": top_score, "reason": "below_score_threshold",
+                     "threshold": DISPATCH_MIN_SCORE},
+        )
+        return
+
+    # Guard 2: halt flag
+    from pathlib import Path
+    halt_flag = Path.home() / "trading-agent" / "data" / "halt.flag"
+    if halt_flag.exists():
+        emit(
+            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+            event_type="candidate_entry_skipped",
+            payload={"ticker": ticker, "reason": "halt_flag_set"},
+        )
+        return
+
+    # Guard 3: soak phase
+    try:
+        from trading_agent.learning.soak import current_phase, is_new_entry_allowed
+        phase = current_phase()
+        if not is_new_entry_allowed(phase):
+            emit(
+                run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+                event_type="candidate_entry_skipped",
+                payload={"ticker": ticker, "reason": "soak_read_only", "soak_phase": phase.value},
+            )
+            return
+    except Exception as e:
+        log.warning("[dispatch] soak check failed: %s", e)
+
+    # Guard 4: regime gate
+    gate = regime.get("gate") or {}
+    if not gate.get("allow_new_entries", True):
+        emit(
+            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+            event_type="candidate_entry_skipped",
+            payload={"ticker": ticker, "reason": "regime_blocks_new_entries",
+                     "regime_label": regime.get("label")},
+        )
+        return
+
+    # All guards passed — fork detached child to run candidate_entry.
+    import os
+    import subprocess
+    import sys
+    venv_python = Path(sys.executable)  # /home/ubuntu/trading-agent/.venv/bin/python
+    project_root = Path(__file__).resolve().parents[3]  # /home/ubuntu/trading-agent
+    log_dir = Path("/var/log")
+    out_log = log_dir / "trading-agent-brain.log"
+    err_log = log_dir / "trading-agent-brain.err"
+
+    try:
+        # Open log files for the child. Fall back to /tmp if /var/log is not writable.
+        try:
+            out_fp = open(out_log, "a")
+            err_fp = open(err_log, "a")
+        except PermissionError:
+            out_fp = open("/tmp/candidate_entry_dispatch.log", "a")
+            err_fp = open("/tmp/candidate_entry_dispatch.err", "a")
+
+        child = subprocess.Popen(
+            [
+                str(venv_python),
+                "-m", "trading_agent.orchestrator",
+                "--trigger=candidate_entry",
+                "--ticker", ticker,
+            ],
+            cwd=str(project_root),
+            stdout=out_fp,
+            stderr=err_fp,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach from parent's session/process group
+            env={**os.environ},  # carry POSTGRES_DSN, SOAK_PHASE, etc.
+        )
+        emit(
+            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+            event_type="candidate_entry_dispatched",
+            payload={
+                "ticker": ticker,
+                "score": top_score,
+                "reason": top.get("reason", "")[:160],
+                "child_pid": child.pid,
+            },
+        )
+        log.info("[dispatch] candidate_entry forked for %s (score=%.2f, pid=%s)",
+                 ticker, top_score, child.pid)
+    except Exception as e:
+        log.error("[dispatch] subprocess fork failed for %s: %s", ticker, e)
+        emit(
+            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+            event_type="candidate_entry_dispatch_failed",
+            severity=2,
+            payload={"ticker": ticker, "error": str(e)[:200]},
+        )
 
 
 __all__ = [
