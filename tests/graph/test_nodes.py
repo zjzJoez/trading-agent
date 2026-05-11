@@ -588,6 +588,25 @@ class TestNtfyScanDigest:
         return patch("trading_agent.graph.nodes.premarket_nodes._dispatch_candidate_entry_if_eligible",
                      return_value=None)
 
+    def _patch_clean_guards(self):
+        """Mock the position/cooldown guards to allow dispatch by default."""
+        from contextlib import ExitStack
+        class _CleanGuards:
+            def __enter__(self):
+                self._stack = ExitStack()
+                self._stack.enter_context(patch(
+                    "trading_agent.graph.nodes.premarket_nodes._existing_exposure",
+                    return_value=None,
+                ))
+                self._stack.enter_context(patch(
+                    "trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown",
+                    return_value=None,
+                ))
+                return self
+            def __exit__(self, *a):
+                return self._stack.__exit__(*a)
+        return _CleanGuards()
+
     def test_sends_to_trades_topic(self):
         state = _base_state(
             trigger="premarket_scan",
@@ -609,7 +628,7 @@ class TestNtfyScanDigest:
             candidates=[{"ticker": "NVDA", "score": 0.85, "reason": "momentum breakout"}],
             regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
         )
-        with _patch_all_emits():
+        with _patch_all_emits(), self._patch_clean_guards():
             with patch("trading_agent.notify.send"):
                 with patch("pathlib.Path.exists", return_value=False):  # halt flag absent
                     with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
@@ -625,6 +644,97 @@ class TestNtfyScanDigest:
         assert "NVDA" in call_args
         # Detached
         assert mock_popen.call_args[1].get("start_new_session") is True
+
+    def test_dispatch_skipped_when_already_exposed(self):
+        """Same underlying already held → no dispatch."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "strong setup"}],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.notify.send"):
+                with patch("pathlib.Path.exists", return_value=False):
+                    with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                        with patch("trading_agent.graph.nodes.premarket_nodes._existing_exposure",
+                                   return_value={"reason": "already_holding_same_underlying",
+                                                 "detail": "US.NVDA qty=1"}):
+                            with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown",
+                                       return_value=None):
+                                with patch("subprocess.Popen") as mock_popen:
+                                    from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                    ntfy_scan_digest(state)
+        mock_popen.assert_not_called()
+
+    def test_dispatch_skipped_when_in_cooldown(self):
+        """Same ticker dispatched within last 7 days → no dispatch."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "strong setup"}],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.notify.send"):
+                with patch("pathlib.Path.exists", return_value=False):
+                    with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                        with patch("trading_agent.graph.nodes.premarket_nodes._existing_exposure",
+                                   return_value=None):
+                            with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown",
+                                       return_value={"last_ts": "2026-05-10T12:30Z", "age_days": 1.2}):
+                                with patch("subprocess.Popen") as mock_popen:
+                                    from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                    ntfy_scan_digest(state)
+        mock_popen.assert_not_called()
+
+    def test_existing_exposure_same_underlying(self):
+        """Direct unit test: _existing_exposure flags same-underlying holding."""
+        with patch("trading_agent.mcp_servers.moomoo.server.get_positions",
+                   return_value={"rows": [{"code": "US.NVDA260605C500000", "qty": 1.0}]}):
+            with patch("trading_agent.sectors.lookup", return_value="Technology"):
+                with patch("trading_agent.store.postgres.cursor") as mock_cur_ctx:
+                    mock_cur = MagicMock()
+                    mock_cur.__enter__ = lambda s: mock_cur
+                    mock_cur.__exit__ = MagicMock(return_value=False)
+                    mock_cur.fetchall.return_value = []
+                    mock_cur_ctx.return_value = mock_cur
+                    from trading_agent.graph.nodes.premarket_nodes import _existing_exposure
+                    result = _existing_exposure("NVDA")
+        assert result is not None
+        assert result["reason"] == "already_holding_same_underlying"
+
+    def test_existing_exposure_same_sector(self):
+        """Direct unit test: _existing_exposure flags same-sector concentration."""
+        def fake_lookup(t):
+            return {"NVDA": "Technology", "AMD": "Technology"}.get(t.upper())
+        with patch("trading_agent.mcp_servers.moomoo.server.get_positions",
+                   return_value={"rows": [{"code": "US.AMD260605C150000", "qty": 1.0}]}):
+            with patch("trading_agent.sectors.lookup", side_effect=fake_lookup):
+                with patch("trading_agent.store.postgres.cursor") as mock_cur_ctx:
+                    mock_cur = MagicMock()
+                    mock_cur.__enter__ = lambda s: mock_cur
+                    mock_cur.__exit__ = MagicMock(return_value=False)
+                    mock_cur.fetchall.return_value = []
+                    mock_cur_ctx.return_value = mock_cur
+                    from trading_agent.graph.nodes.premarket_nodes import _existing_exposure
+                    result = _existing_exposure("NVDA")
+        assert result is not None
+        assert result["reason"] == "already_exposed_to_sector"
+        assert "Technology" in result["detail"]
+
+    def test_existing_exposure_ignores_zombie_positions(self):
+        """qty=0 broker rows (zombies) should NOT count as exposure."""
+        with patch("trading_agent.mcp_servers.moomoo.server.get_positions",
+                   return_value={"rows": [{"code": "US.NVDA260605C500000", "qty": 0.0}]}):
+            with patch("trading_agent.sectors.lookup", return_value="Technology"):
+                with patch("trading_agent.store.postgres.cursor") as mock_cur_ctx:
+                    mock_cur = MagicMock()
+                    mock_cur.__enter__ = lambda s: mock_cur
+                    mock_cur.__exit__ = MagicMock(return_value=False)
+                    mock_cur.fetchall.return_value = []
+                    mock_cur_ctx.return_value = mock_cur
+                    from trading_agent.graph.nodes.premarket_nodes import _existing_exposure
+                    result = _existing_exposure("NVDA")
+        assert result is None  # zombie ignored → dispatch allowed
 
     def test_dispatch_skipped_below_threshold(self):
         """Top candidate score < 0.6 must NOT trigger dispatch."""
@@ -662,7 +772,7 @@ class TestNtfyScanDigest:
             candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "strong setup"}],
             regime={"label": "CRISIS", "gate": {"allow_new_entries": False}},
         )
-        with _patch_all_emits():
+        with _patch_all_emits(), self._patch_clean_guards():
             with patch("trading_agent.notify.send"):
                 with patch("pathlib.Path.exists", return_value=False):
                     with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
@@ -678,7 +788,7 @@ class TestNtfyScanDigest:
             candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "strong setup"}],
             regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
         )
-        with _patch_all_emits():
+        with _patch_all_emits(), self._patch_clean_guards():
             with patch("trading_agent.notify.send"):
                 with patch("pathlib.Path.exists", return_value=False):
                     with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=False):

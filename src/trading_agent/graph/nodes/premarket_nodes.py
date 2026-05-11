@@ -310,6 +310,11 @@ def ntfy_scan_digest(state: TradingGraphState) -> dict:
 # false-positive rate of full-pipeline-then-decline is too high.
 DISPATCH_MIN_SCORE = 0.6
 
+# Don't dispatch the same ticker more than once in this many days. Prevents
+# the scout's daily "top pick" from collapsing onto a handful of names if the
+# same underlying keeps rotating to the top of the watchlist.
+SAME_TICKER_COOLDOWN_DAYS = 7
+
 
 def _dispatch_candidate_entry_if_eligible(
     state: TradingGraphState,
@@ -389,6 +394,29 @@ def _dispatch_candidate_entry_if_eligible(
         )
         return
 
+    # Guard 5: position-aware skip — already exposed to this ticker or sector
+    exposure = _existing_exposure(ticker)
+    if exposure:
+        emit(
+            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+            event_type="candidate_entry_skipped",
+            payload={"ticker": ticker, "reason": exposure["reason"],
+                     "detail": exposure["detail"]},
+        )
+        return
+
+    # Guard 6: cooldown — recent dispatch on same ticker
+    cd = _in_dispatch_cooldown(ticker, days=SAME_TICKER_COOLDOWN_DAYS)
+    if cd:
+        emit(
+            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+            event_type="candidate_entry_skipped",
+            payload={"ticker": ticker, "reason": "ticker_cooldown",
+                     "last_dispatch_age_days": cd["age_days"],
+                     "cooldown_days": SAME_TICKER_COOLDOWN_DAYS},
+        )
+        return
+
     # All guards passed — fork detached child to run candidate_entry.
     import os
     import subprocess
@@ -442,6 +470,103 @@ def _dispatch_candidate_entry_if_eligible(
             severity=2,
             payload={"ticker": ticker, "error": str(e)[:200]},
         )
+
+
+# ---------------------------------------------------------------------------
+# Dispatch-guard helpers
+# ---------------------------------------------------------------------------
+
+def _existing_exposure(ticker: str) -> dict | None:
+    """Return a reason dict if we already have exposure to this ticker.
+
+    Two checks:
+      1. Same underlying — moomoo broker has a non-zero qty position OR
+         Postgres journal_trades has an OPEN entry for the same underlying.
+      2. Same GICS sector — any open broker position whose bare ticker
+         maps to the same sector via sectors.lookup().
+
+    Both checks ignore zombie positions (qty=0). Returns None when no
+    relevant exposure exists, i.e. dispatch is allowed to proceed.
+    """
+    from trading_agent import sectors as sectors_lookup
+
+    norm_ticker = (ticker or "").strip().upper()
+    if not norm_ticker:
+        return None
+    target_sector = sectors_lookup.lookup(norm_ticker)
+
+    # Pull open broker positions
+    broker_positions: list[dict] = []
+    try:
+        from trading_agent.mcp_servers.moomoo.server import get_positions
+        rows = (get_positions().get("rows") or [])
+        broker_positions = [r for r in rows if float(r.get("qty") or 0) != 0]
+    except Exception as e:
+        log.warning("[exposure] broker positions fetch failed: %s", e)
+
+    for p in broker_positions:
+        code = p.get("code") or p.get("symbol") or ""
+        # Strip option strike to get the underlying ticker.
+        import re
+        bare = code.split(".", 1)[-1]
+        m = re.match(r"^([A-Z\.]+?)\d{6,8}[CP]\d+$", bare)
+        underlying = (m.group(1) if m else bare).upper()
+        if underlying == norm_ticker:
+            return {"reason": "already_holding_same_underlying",
+                    "detail": f"{code} qty={p.get('qty')}"}
+        if target_sector and target_sector == sectors_lookup.lookup(underlying):
+            return {"reason": "already_exposed_to_sector",
+                    "detail": f"{underlying} in {target_sector}"}
+
+    # Postgres journal — catch OPEN trades broker forgot to clear
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT symbol FROM journal_trades
+                WHERE outcome = 'OPEN' AND qty > 0
+                """,
+            )
+            for (sym,) in cur.fetchall():
+                import re
+                bare = (sym or "").split(".", 1)[-1]
+                m = re.match(r"^([A-Z\.]+?)\d{6,8}[CP]\d+$", bare)
+                underlying = (m.group(1) if m else bare).upper()
+                if underlying == norm_ticker:
+                    return {"reason": "journal_open_same_underlying",
+                            "detail": str(sym)}
+    except Exception as e:
+        log.warning("[exposure] journal check failed: %s", e)
+
+    return None
+
+
+def _in_dispatch_cooldown(ticker: str, days: int = 7) -> dict | None:
+    """Return cooldown info if `ticker` has been dispatched within `days`,
+    else None. Reads agent_events for prior candidate_entry_dispatched rows.
+    """
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT MAX(ts) FROM agent_events
+                WHERE event_type = 'candidate_entry_dispatched'
+                  AND payload->>'ticker' = %s
+                  AND ts > NOW() - (%s::text || ' days')::interval
+                """,
+                (ticker.upper(), str(days)),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                from datetime import datetime, timezone
+                last_ts = row[0]
+                age_days = (datetime.now(timezone.utc) - last_ts).total_seconds() / 86400
+                return {"last_ts": last_ts.isoformat(), "age_days": round(age_days, 2)}
+    except Exception as e:
+        log.warning("[cooldown] db check failed: %s", e)
+    return None
 
 
 __all__ = [
