@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>trading-agent · dashboard</title>
+<link rel="stylesheet" href="/static/styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='44' fill='none' stroke='%230f766e' stroke-width='6'/></svg>" />
+<script src="https://unpkg.com/lightweight-charts@4.1.7/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="brand">
+    <h1>trading-agent</h1>
+    <p class="subtitle">multi-agent autonomous paper trading</p>
+  </div>
+  <div class="status-bar">
+    <span class="status-pill" id="status-soak"><label>soak</label><strong>—</strong></span>
+    <span class="status-pill" id="status-regime"><label>regime</label><strong>—</strong></span>
+    <span class="status-pill" id="status-halt"><label>halt</label><strong>—</strong></span>
+  </div>
+</header>
+
+<main>
+
+<section class="card span-2">
+  <header class="card-head">
+    <h2>Pipeline</h2>
+    <span class="card-meta" id="pipeline-meta">—</span>
+  </header>
+  <div class="pipeline-grid" id="pipeline-grid">
+    <div class="empty">loading…</div>
+  </div>
+</section>
+
+<section class="card span-2">
+  <header class="card-head">
+    <h2>Open positions</h2>
+    <span class="card-meta" id="positions-meta">—</span>
+  </header>
+  <div class="positions-list" id="positions-list">
+    <div class="empty">loading…</div>
+  </div>
+</section>
+
+<section class="card span-2">
+  <header class="card-head">
+    <h2>Chart</h2>
+    <div class="chart-controls">
+      <select id="ticker-select" class="select"></select>
+      <div class="ticker-quote" id="ticker-quote">—</div>
+    </div>
+  </header>
+  <div class="chart-wrap">
+    <div id="chart-container"></div>
+  </div>
+</section>
+
+<section class="card">
+  <header class="card-head">
+    <h2>Risk</h2>
+    <span class="card-meta" id="risk-meta">—</span>
+  </header>
+  <div class="risk-grid" id="risk-grid">
+    <div class="empty">loading…</div>
+  </div>
+</section>
+
+<section class="card">
+  <header class="card-head">
+    <h2>Regime</h2>
+    <span class="card-meta" id="regime-meta">—</span>
+  </header>
+  <div class="regime-block" id="regime-block">
+    <div class="empty">loading…</div>
+  </div>
+</section>
+
+<section class="card span-2">
+  <header class="card-head">
+    <h2>Agent activity</h2>
+    <div class="filter-row">
+      <button class="chip active" data-sev="0">all</button>
+      <button class="chip" data-sev="1">warn+</button>
+      <button class="chip" data-sev="2">errors</button>
+    </div>
+  </header>
+  <div class="agent-stream" id="agent-stream">
+    <div class="empty">loading…</div>
+  </div>
+</section>
+
+<section class="card span-2">
+  <header class="card-head">
+    <h2>Closed trades</h2>
+    <span class="card-meta" id="trades-meta">—</span>
+  </header>
+  <div class="trades-list" id="trades-list">
+    <div class="empty">loading…</div>
+  </div>
+</section>
+
+<section class="card span-2">
+  <header class="card-head">
+    <h2>Learning</h2>
+    <span class="card-meta" id="learning-meta">—</span>
+  </header>
+  <div class="learning-block" id="learning-block">
+    <div class="empty">loading…</div>
+  </div>
+</section>
+
+</main>
+
+<footer class="footnote">
+  <span><span class="live-dot" id="live-dot"></span> auto-refresh every 10s · <span id="last-refresh">never</span></span>
+  <span><a href="https://github.com/zjzJoez/trading-agent" target="_blank" rel="noopener">source ↗</a></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

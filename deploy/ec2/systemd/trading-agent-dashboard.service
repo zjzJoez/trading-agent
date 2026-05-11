@@ -1,0 +1,34 @@
+[Unit]
+Description=trading-agent dashboard — read-only observability UI
+After=network.target postgresql.service trading-agent-opend.service
+Wants=postgresql.service trading-agent-opend.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading-agent
+EnvironmentFile=/home/ubuntu/trading-agent/.env
+EnvironmentFile=/home/ubuntu/.env.postgres
+ExecStart=/home/ubuntu/trading-agent/.venv/bin/uvicorn trading_agent.web.api:app \
+  --host 0.0.0.0 --port 8002 \
+  --proxy-headers --forwarded-allow-ips='*' \
+  --log-level info
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/trading-agent-dashboard.log
+StandardError=append:/var/log/trading-agent-dashboard.err
+
+# Security hardening: read-only project tree, dashboard cannot write anywhere
+# except its own log targets (which are configured above) and the moomoo SDK
+# log directory (which the SDK opens on every connection).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log /home/ubuntu/.com.moomoo.OpenD /home/ubuntu/trading-agent/data
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
