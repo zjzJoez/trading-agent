@@ -314,10 +314,14 @@ async def api_positions():
         except Exception as e:
             log.warning("quote batch failed: %s", e)
 
-    # Step 4: combine
+    # Step 4: combine — skip qty=0 zombie rows the broker keeps echoing
+    # after a position is fully closed (broker tracks lifetime cost basis
+    # even at zero size; treating those as live positions is misleading).
     for r in moomoo_rows:
         code = r.get("code") or r.get("symbol") or ""
         qty = float(r.get("qty") or 0)
+        if qty == 0:
+            continue
         broker_entry = float(r.get("cost_price") or r.get("avg_price") or 0)
         broker_mark = float(r.get("nominal_price") or r.get("current_price") or broker_entry)
         broker_pnl = float(r.get("pl_val") or 0.0)
