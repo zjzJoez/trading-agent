@@ -47,6 +47,46 @@ def test_get_router_returns_singleton():
     assert r1 is r2
 
 
+# ---------------------------------------------------------------------------
+# JSON repair — fixes the trader_synthesizer-malformed-JSON class of failure
+# ---------------------------------------------------------------------------
+
+def test_json_repair_handles_trailing_comma():
+    """Output with a trailing comma is recovered by json_repair, no LLM round-trip."""
+    from trading_agent.llm.schemas import RegimeReviewerOutput
+    router = OAuthLLMRouter()
+    # Trailing comma before }, common LLM quirk
+    malformed = '{"review_label": "CONFIRM", "confidence_adjustment": -0.1, "risk_notes": ["ok"], "must_defer_new_entries": false,}'
+    parsed = router._parse_json_with_retry(
+        malformed, RegimeReviewerOutput, "regime_reviewer", "<original prompt>"
+    )
+    assert parsed.review_label == "CONFIRM"
+    assert parsed.confidence_adjustment == -0.1
+
+
+def test_json_repair_handles_missing_comma():
+    """Missing field-separator comma is the exact failure mode from 5/12 NVDA run."""
+    from trading_agent.llm.schemas import RegimeReviewerOutput
+    router = OAuthLLMRouter()
+    # No comma between the first and second field
+    malformed = '{"review_label": "CONFIRM" "confidence_adjustment": -0.1, "risk_notes": ["ok"], "must_defer_new_entries": false}'
+    parsed = router._parse_json_with_retry(
+        malformed, RegimeReviewerOutput, "regime_reviewer", "<original prompt>"
+    )
+    assert parsed.review_label == "CONFIRM"
+
+
+def test_json_repair_handles_markdown_fence():
+    """Markdown-fenced output should be stripped THEN repaired."""
+    from trading_agent.llm.schemas import RegimeReviewerOutput
+    router = OAuthLLMRouter()
+    raw = '```json\n{"review_label": "CONFIRM", "confidence_adjustment": -0.05, "risk_notes": [], "must_defer_new_entries": false,}\n```'
+    parsed = router._parse_json_with_retry(
+        raw, RegimeReviewerOutput, "regime_reviewer", "<original prompt>"
+    )
+    assert parsed.review_label == "CONFIRM"
+
+
 def test_strip_markdown_fences_handles_json_fence():
     raw = '```json\n{"x": 1}\n```'
     assert _strip_markdown_fences(raw) == '{"x": 1}'

@@ -355,19 +355,47 @@ class OAuthLLMRouter:
     def _parse_json_with_retry(
         self, raw: str, schema: type[BaseModel], role: str, original_prompt: str
     ) -> BaseModel:
-        for attempt in (1, 2):
+        """Parse `raw` into `schema`. Robust to common LLM JSON quirks:
+          1. Try strict json.loads on stripped output.
+          2. If that fails, try json_repair (handles trailing commas,
+             missing delimiters, unescaped newlines, smart quotes, etc.) —
+             repair is free, no LLM round-trip.
+          3. Either parsed object goes through schema.model_validate.
+          4. On any failure, retry up to 2x with the error fed back as a
+             repair prompt (so up to 3 total LLM calls).
+        """
+        last_err: Exception | None = None
+        for attempt in (1, 2, 3):
             try:
                 cleaned = _strip_markdown_fences(raw)
-                obj = json.loads(cleaned)
+                # 1) Strict parse first
+                try:
+                    obj = json.loads(cleaned)
+                except json.JSONDecodeError as strict_err:
+                    # 2) Fall back to json_repair without spending an LLM round-trip
+                    try:
+                        from json_repair import repair_json
+                        repaired = repair_json(cleaned, return_objects=False)
+                        obj = json.loads(repaired) if isinstance(repaired, str) else repaired
+                        log.warning(
+                            "[%s] json strict-parse failed (%s); recovered via json_repair",
+                            role, str(strict_err)[:120],
+                        )
+                    except Exception:
+                        # Repair also failed — surface the original strict-parse error
+                        raise strict_err
                 return schema.model_validate(obj)
             except (json.JSONDecodeError, ValidationError) as e:
-                if attempt == 1:
-                    log.warning("[%s] schema retry: %s", role, e)
+                last_err = e
+                if attempt < 3:
+                    log.warning("[%s] schema retry %d/2: %s", role, attempt, str(e)[:200])
                     retry_prompt = (
                         original_prompt
                         + "\n\nYour previous response failed validation:\n"
                         + str(e)[:500]
-                        + "\n\nReturn ONLY the JSON object — no fences, no preamble."
+                        + "\n\nReturn ONLY the JSON object — no fences, no preamble, "
+                          "no trailing comma, all strings properly quoted with no "
+                          "unescaped newlines or smart quotes."
                     )
                     cfg = ROLE_CONFIG[role]
                     if cfg.channel == "claude_code":
@@ -375,9 +403,9 @@ class OAuthLLMRouter:
                     else:
                         raw = self._invoke_codex(cfg, retry_prompt, 120)
                     continue
-                log.error("[%s] schema violation after retry: %s", role, e)
+                log.error("[%s] schema violation after 3 attempts: %s", role, e)
                 raise LLMSchemaViolation(f"role={role}: {e}") from e
-        raise LLMSchemaViolation(f"role={role}: unreachable")
+        raise LLMSchemaViolation(f"role={role}: unreachable (last_err={last_err})")
 
     # -------------- degrade --------------
 

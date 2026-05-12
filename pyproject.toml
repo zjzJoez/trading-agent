@@ -29,6 +29,10 @@ dependencies = [
     "scikit-learn>=1.5.0",
     "pandas-market-calendars>=4.4.0",
     "scipy>=1.13.0",
+    # LLM output is best-effort JSON; json-repair fixes common LLM quirks
+    # (trailing commas, missing delimiters, unescaped newlines) before we
+    # spend another LLM round-trip on a retry.
+    "json-repair>=0.30.0",
 ]
 
 [project.optional-dependencies]

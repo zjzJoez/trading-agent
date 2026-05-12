@@ -433,6 +433,15 @@ wheels = [
 ]
 
 [[package]]
+name = "json-repair"
+version = "0.59.9"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d9/f4/bf2e3fb48517a74c75bc08a85f781f3229cfe09fb1292d6969228be378b7/json_repair-0.59.9.tar.gz", hash = "sha256:761f495a9c0d4ff7d56aa8859b470b072f9470a8280797ea5da246736c294324", size = 49000, upload-time = "2026-05-12T12:28:49.662Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/6b/8c42827dc2a7ac4d28340da81f816ee89f9e0b1588497b5ada2de3aefca1/json_repair-0.59.9-py3-none-any.whl", hash = "sha256:5264909878c4214e16342485559998d9735befd6ad44a802f3768eb7b95d0a55", size = 47660, upload-time = "2026-05-12T12:28:47.937Z" },
+]
+
+[[package]]
 name = "jsonpatch"
 version = "1.33"
 source = { registry = "https://pypi.org/simple" }
@@ -1670,6 +1679,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "hmmlearn" },
     { name = "httpx" },
+    { name = "json-repair" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-postgres" },
     { name = "lxml" },
@@ -1700,6 +1710,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "hmmlearn", specifier = ">=0.3.2" },
     { name = "httpx", specifier = ">=0.27.0" },
+    { name = "json-repair", specifier = ">=0.30.0" },
     { name = "langgraph", specifier = ">=0.2.50" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=2.0.0" },
     { name = "lxml", specifier = ">=5.2.0" },
