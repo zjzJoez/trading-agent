@@ -1439,7 +1439,11 @@ def regime_execution_gate(state: TradingGraphState) -> dict:
     qty = float(proposal.get("qty", 0))
     new_qty = qty * mult
     if proposal.get("asset_type") == "OPT":
-        new_qty = float(int(new_qty))
+        # Round half-away-from-zero so 0.5 → 1 (preserve trade) but 0.4 → 0
+        # (honor a regime that strongly wants to sit out). Previously used
+        # int() truncation which zeroed every 1-contract * sub-1.0-multiplier
+        # case under tiny_paper, silently turning APPROVE into approved_qty=0.
+        new_qty = float(int(new_qty + 0.5)) if new_qty > 0 else 0.0
 
     if new_qty != qty:
         emit(

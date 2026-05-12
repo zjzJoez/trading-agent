@@ -894,6 +894,36 @@ class TestSoakGates:
         # qty unchanged at 2 (size_multiplier=1.0)
         assert result["proposal"]["qty"] == 2.0
 
+    def test_regime_gate_rounds_half_up_for_options(self):
+        """1 contract × 0.5 multiplier must round to 1, not 0 (the 5/12 bug)."""
+        state = _base_state(
+            trigger="candidate_entry",
+            proposal={"ticker": "NVDA", "qty": 1, "asset_type": "OPT"},
+            regime={"label": "BULL_TREND",
+                    "gate": {"allow_new_entries": True, "size_multiplier": 0.5}},
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                from trading_agent.graph.nodes.trade_nodes import regime_execution_gate
+                result = regime_execution_gate(state)
+        # 1 * 0.5 = 0.5 → round half-up → 1 (was 0 with int truncation)
+        assert result["proposal"]["qty"] == 1.0
+
+    def test_regime_gate_rounds_down_for_aggressive_downsize(self):
+        """When size_multiplier is small enough that scaled qty < 0.5, must round to 0."""
+        state = _base_state(
+            trigger="candidate_entry",
+            proposal={"ticker": "NVDA", "qty": 1, "asset_type": "OPT"},
+            regime={"label": "VOLATILE_TRANSITION",
+                    "gate": {"allow_new_entries": True, "size_multiplier": 0.3}},
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                from trading_agent.graph.nodes.trade_nodes import regime_execution_gate
+                result = regime_execution_gate(state)
+        # 1 * 0.3 = 0.3 → round half-up → 0 (regime strongly downsizes)
+        assert result["proposal"]["qty"] == 0.0
+
     def test_tiny_paper_caps_qty(self):
         """In TINY_PAPER phase, deterministic_sizing must cap at 1 contract."""
         from trading_agent.sizing import SizingContext, ProposedTrade, SizingViolation
