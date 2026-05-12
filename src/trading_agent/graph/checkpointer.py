@@ -50,3 +50,24 @@ def get_saver() -> PostgresSaver:
 def saver_context() -> Iterator[PostgresSaver]:
     """Convenience: yield the saver. Exists for parity with the docs idiom."""
     yield get_saver()
+
+
+def shutdown(timeout: float = 5.0) -> None:
+    """Close the checkpointer's connection pool. Idempotent.
+
+    `psycopg_pool.ConnectionPool` spawns non-daemon scheduler + worker threads
+    that keep the Python interpreter alive after `main()` returns — verified
+    via py-spy on a hanging orchestrator process. Without this call, oneshot
+    runs hang in `threading._shutdown()` until systemd's TimeoutStartSec
+    SIGTERMs them (we saw ~5 min wall-clock for ~3 s of real CPU work).
+
+    Call from `orchestrator.main()`'s finally clause.
+    """
+    global _pool, _saver
+    if _pool is not None:
+        try:
+            _pool.close(timeout=timeout)
+        except Exception as e:
+            log.warning("checkpointer pool close failed: %s", e)
+        _pool = None
+        _saver = None

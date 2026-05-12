@@ -59,6 +59,23 @@ def get_pool(min_size: int = 1, max_size: int = 8) -> ConnectionPool:
     return _pool
 
 
+def shutdown(timeout: float = 5.0) -> None:
+    """Close the singleton ConnectionPool. Idempotent.
+
+    Paired with the same cleanup hook in ``graph/checkpointer.py`` — both
+    pools spawn non-daemon worker + scheduler threads that block interpreter
+    exit. Call from ``orchestrator.main()``'s finally clause before
+    ``os._exit(0)``.
+    """
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.close(timeout=timeout)
+        except Exception as e:
+            log.warning("store pool close failed: %s", e)
+        _pool = None
+
+
 @contextmanager
 def conn() -> Iterator[psycopg.Connection]:
     """Borrow a connection from the pool; commits on success, rolls back on error."""

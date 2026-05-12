@@ -796,6 +796,9 @@ def persist_trade_event(state: TradingGraphState) -> dict:
             "trade_id": trade_id, "broker_order_id": broker_order_id,
             "symbol": symbol, "qty": qty, "entry_price": entry_price,
             "thesis_id": proposal.get("thesis_id"),
+            # `ticker` lets _in_dispatch_cooldown match the underlying directly
+            # instead of regex-parsing the moomoo option symbol.
+            "ticker": proposal.get("ticker"),
         },
     )
     return {"order": {**order, "trade_id": trade_id}}

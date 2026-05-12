@@ -96,6 +96,31 @@ def _trade() -> OpenSecTradeContext:
     return _trade_ctx
 
 
+def shutdown() -> None:
+    """Close the singleton quote + trade contexts. Idempotent.
+
+    Both ``OpenQuoteContext`` and ``OpenSecTradeContext`` start non-daemon
+    background threads (a callback_executor + a select-loop network_manager
+    socket reader). Without ``close()`` these threads keep the interpreter
+    alive after ``main()`` returns — verified via py-spy stack dump on a
+    hanging orchestrator process. Errors are swallowed: the goal is fast
+    exit, not perfect cleanup.
+    """
+    global _quote_ctx, _trade_ctx
+    if _quote_ctx is not None:
+        try:
+            _quote_ctx.close()
+        except Exception as e:
+            print(f"moomoo quote_ctx close failed: {e}", file=sys.stderr)
+        _quote_ctx = None
+    if _trade_ctx is not None:
+        try:
+            _trade_ctx.close()
+        except Exception as e:
+            print(f"moomoo trade_ctx close failed: {e}", file=sys.stderr)
+        _trade_ctx = None
+
+
 def _require_ok(ret: int, data: Any, op: str) -> Any:
     if ret != RET_OK:
         raise RuntimeError(f"{op} failed: {data}")

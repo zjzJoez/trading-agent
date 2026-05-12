@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -25,6 +26,36 @@ from trading_agent.graph.builder import GRAPH_BUILDERS, build
 from trading_agent.graph.state import empty_state
 
 log = logging.getLogger(__name__)
+
+
+def _shutdown_resources() -> None:
+    """Close PostgresSaver pool, store pool, and moomoo SDK contexts.
+
+    Each of these spawns non-daemon background threads that block the
+    interpreter on exit. Without explicit close, oneshot CLI runs hang in
+    ``threading._shutdown()`` until systemd's TimeoutStartSec SIGTERMs them
+    (we observed ~5 min wall-clock for ~3 s of real CPU work via py-spy).
+
+    Errors are logged and swallowed — the goal is fast exit, not perfect
+    cleanup. After this call the caller should ``os._exit(0)`` as a final
+    belt-and-braces in case some transitively-imported library has its own
+    non-daemon thread we don't know about.
+    """
+    try:
+        from trading_agent.graph.checkpointer import shutdown as _ck_shutdown
+        _ck_shutdown()
+    except Exception as e:
+        log.warning("checkpointer shutdown failed: %s", e)
+    try:
+        from trading_agent.store.postgres import shutdown as _pg_shutdown
+        _pg_shutdown()
+    except Exception as e:
+        log.warning("store shutdown failed: %s", e)
+    try:
+        from trading_agent.mcp_servers.moomoo.server import shutdown as _mm_shutdown
+        _mm_shutdown()
+    except Exception as e:
+        log.warning("moomoo shutdown failed: %s", e)
 
 
 def run_once(
@@ -133,12 +164,37 @@ def main() -> None:
 
     watchlist = [t.strip() for t in args.watchlist.split(",") if t.strip()]
     ticker = args.ticker.strip() or None
-    final = run_once(args.trigger, watchlist=watchlist, ticker=ticker)
-    print(json.dumps({
-        "trigger": args.trigger,
-        "run_id": final.get("run_id"),
-        "nodes_visited": [n.get("node") for n in final.get("notifications", [])],
-    }, indent=2, default=str))
+
+    exit_code = 0
+    try:
+        final = run_once(args.trigger, watchlist=watchlist, ticker=ticker)
+        print(json.dumps({
+            "trigger": args.trigger,
+            "run_id": final.get("run_id"),
+            "nodes_visited": [n.get("node") for n in final.get("notifications", [])],
+        }, indent=2, default=str))
+    except SystemExit as e:
+        # Convert to plain exit_code so we still reach os._exit() below.
+        # Otherwise SystemExit would bypass the os._exit() hammer and we'd
+        # be back at the mercy of threading._shutdown() for any unknown
+        # non-daemon thread.
+        exit_code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+    except BaseException:  # noqa: BLE001 — we re-raise after cleanup
+        log.exception("orchestrator run failed")
+        exit_code = 1
+    finally:
+        _shutdown_resources()
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    # Bypass `threading._shutdown()` — we've closed every pool/socket we
+    # know about, but any transitively-imported library could still be
+    # holding a non-daemon thread. ``os._exit`` is the only guarantee that
+    # systemd sees a fast clean exit instead of the 5-minute TimeoutStartSec.
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":

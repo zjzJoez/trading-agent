@@ -405,14 +405,15 @@ def _dispatch_candidate_entry_if_eligible(
         )
         return
 
-    # Guard 6: cooldown — recent dispatch on same ticker
+    # Guard 6: cooldown — recent FILLED entry on same ticker (VETO/DEFER do
+    # not lock; only an executed fill within the window blocks re-dispatch).
     cd = _in_dispatch_cooldown(ticker, days=SAME_TICKER_COOLDOWN_DAYS)
     if cd:
         emit(
             run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
             event_type="candidate_entry_skipped",
             payload={"ticker": ticker, "reason": "ticker_cooldown",
-                     "last_dispatch_age_days": cd["age_days"],
+                     "last_fill_age_days": cd["age_days"],
                      "cooldown_days": SAME_TICKER_COOLDOWN_DAYS},
         )
         return
@@ -543,20 +544,41 @@ def _existing_exposure(ticker: str) -> dict | None:
 
 
 def _in_dispatch_cooldown(ticker: str, days: int = 7) -> dict | None:
-    """Return cooldown info if `ticker` has been dispatched within `days`,
-    else None. Reads agent_events for prior candidate_entry_dispatched rows.
+    """Return cooldown info if `ticker` has had a FILLED entry within `days`,
+    else None.
+
+    Cooldown semantics (revised):
+        * Locks the ticker only after a successful fill — event ``trade_recorded``
+          fired by ``persist_trade_event`` after the ``journal_trades`` insert.
+        * VETO and DEFER outcomes do NOT lock the ticker. The LLM can re-evaluate
+          the same name on the next trading day — a Risk Council veto is "this
+          setup isn't safe right now", not "blacklist this name for a week".
+        * Legacy fills (before ``ticker`` was added to the payload) are caught
+          by a regex against ``payload->>'symbol'`` (moomoo format
+          ``US.<TICKER><YYMMDD><C|P><strike>``). The digit-boundary anchor
+          ``([0-9]|$)`` ensures ``NVDA`` doesn't false-match ``NVDAB``.
+
+    Returns None on any DB error — cooldown is best-effort, not authoritative.
+    A position-aware skip (``_existing_exposure``) is the real defence against
+    double-opens; cooldown is just to keep the scout from churning on one name.
     """
     try:
         from trading_agent.store.postgres import cursor
+        norm = (ticker or "").strip().upper()
+        if not norm:
+            return None
+        # Regex parameter — anchor on US.<TICKER> + digit boundary
+        symbol_regex = rf"^US\.{norm}([0-9]|$)"
         with cursor() as cur:
             cur.execute(
                 """
                 SELECT MAX(ts) FROM agent_events
-                WHERE event_type = 'candidate_entry_dispatched'
-                  AND payload->>'ticker' = %s
+                WHERE event_type = 'trade_recorded'
+                  AND (payload->>'ticker' = %s
+                       OR (payload->>'symbol') ~ %s)
                   AND ts > NOW() - (%s::text || ' days')::interval
                 """,
-                (ticker.upper(), str(days)),
+                (norm, symbol_regex, str(days)),
             )
             row = cur.fetchone()
             if row and row[0]:
