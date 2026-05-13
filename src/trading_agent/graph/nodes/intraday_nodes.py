@@ -144,8 +144,78 @@ def refresh_quotes_and_greeks(state: TradingGraphState) -> dict:
 # Node 2: detect_exit_triggers
 # ---------------------------------------------------------------------------
 
+def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
+    """Return ``{broker_symbol: enrichment_dict}`` for every OPEN journal row.
+
+    The exit LLM needs ``thesis_id``, ``thesis_text``, ``direction``,
+    ``invalidation``, ``stop`` and ``target`` for each open position. These
+    live in Postgres ``journal_trades`` + ``journal_theses``, NOT in the
+    broker's ``get_positions()`` payload — so ``state["positions"]`` (which
+    comes straight from moomoo) is missing all of them.
+
+    Without this enrichment, ``_thesis_summary_for(pos)`` returns
+    "(no thesis linked)" for every position even when a real thesis row
+    exists (verified on the 5/12 NVDA SCRATCH self-exit). The exit_monitor
+    LLM then sees ``thesis_summary: (no thesis linked)`` and rationally
+    recommends EXIT_CAUTIOUS for "unvetted exposure" — closing the same
+    position the agent just opened.
+
+    Notes:
+        * Uses Postgres, NOT the journal-mcp SQLite ``trades`` table — the
+          MCP table is stale; autonomous fills only write to Postgres.
+        * Single batched query, not per-position lookup, so the lookup cost
+          is O(1) per intraday tick regardless of position count.
+        * Returns ``{}`` on DB error — the caller falls back to the legacy
+          per-position lookup in ``_thesis_summary_for``.
+    """
+    out: dict[str, dict] = {}
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT t.symbol, t.id AS trade_id, t.thesis_id,
+                       t.stop, t.target,
+                       th.direction, th.thesis_text, th.invalidation
+                FROM journal_trades t
+                LEFT JOIN journal_theses th ON th.id = t.thesis_id
+                WHERE t.outcome = 'OPEN'
+                """,
+            )
+            for row in cur.fetchall():
+                symbol, trade_id, thesis_id, stop, target, direction, thesis_text, invalidation = row
+                if not symbol:
+                    continue
+                out[str(symbol)] = {
+                    "trade_id": int(trade_id) if trade_id is not None else None,
+                    "thesis_id": int(thesis_id) if thesis_id is not None else None,
+                    "stop": float(stop) if stop is not None else None,
+                    "target": float(target) if target is not None else None,
+                    "direction": direction,
+                    "thesis_text": thesis_text,
+                    "invalidation": invalidation,
+                }
+    except Exception as e:
+        log.warning("[detect_exit_triggers] journal enrichment query failed: %s", e)
+    return out
+
+
 def _thesis_summary_for(pos: dict) -> str:
-    """Pull a short thesis text from Postgres journal_theses."""
+    """Format a thesis summary string for the exit-monitor LLM prompt.
+
+    Prefers fields already on ``pos`` (populated by
+    ``_load_journal_enrichment_by_symbol`` upstream). Falls back to a
+    direct ``journal_theses`` query if ``thesis_id`` is present but the
+    rich fields aren't — kept for backwards-compat with any future caller
+    that doesn't run the enrichment step.
+    """
+    # Preferred path: enrichment already attached the JOIN result.
+    if pos.get("thesis_text") or pos.get("direction"):
+        direction = pos.get("direction") or "?"
+        text = str(pos.get("thesis_text") or "")[:200]
+        inval = pos.get("invalidation") or "n/a"
+        return f"direction={direction} | thesis={text} | invalidation={inval}"
+
     thesis_id = pos.get("thesis_id")
     if not thesis_id:
         return "(no thesis linked)"
@@ -226,6 +296,34 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
     regime = state.get("regime") or {}
     # Simple approximation for prior label: not in state yet, use same label
     prior_regime_label = regime.get("label", "VOLATILE_TRANSITION")
+
+    # Enrich each broker position with its journal_trades + journal_theses row
+    # (thesis_id, thesis_text, direction, invalidation, stop, target). Without
+    # this, _thesis_summary_for sees pos.thesis_id=None and the LLM concludes
+    # "no thesis = unvetted exposure → EXIT_CAUTIOUS" — closing the same
+    # position we just opened. Empty map ⇒ legacy per-position fallback.
+    enrichment_by_symbol = _load_journal_enrichment_by_symbol()
+    enriched_count = 0
+    if enrichment_by_symbol:
+        for pos in positions:
+            symbol = pos.get("symbol") or ""
+            enrichment = enrichment_by_symbol.get(symbol)
+            if not enrichment:
+                continue
+            # Don't clobber broker-provided fields (qty, mark, etc.) — only
+            # fill in keys that aren't already populated. The enrichment
+            # keys (trade_id, thesis_id, stop, target, direction, thesis_text,
+            # invalidation) don't overlap with broker fields today; the
+            # ``k not in pos`` guard makes that invariant explicit so a
+            # future field-name collision fails-safe (broker wins).
+            for k, v in enrichment.items():
+                if v is not None and k not in pos:
+                    pos[k] = v
+            enriched_count += 1
+    log.info(
+        "[detect_exit_triggers] enriched %d/%d positions from Postgres journal",
+        enriched_count, len(positions),
+    )
 
     try:
         from trading_agent.llm import get_router

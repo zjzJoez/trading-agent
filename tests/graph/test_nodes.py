@@ -249,6 +249,95 @@ class TestDetectExitTriggers:
         decisions = result["journal"]["exit_decisions"]
         assert decisions[0]["action"] == "HOLD"
 
+    def test_enrichment_injects_thesis_into_prompt(self):
+        """Regression test for the 5/12 NVDA SCRATCH self-exit.
+
+        Without enrichment, ``state["positions"]`` from the broker has no
+        ``thesis_id`` field, ``_thesis_summary_for`` returns
+        ``"(no thesis linked)"`` and the exit_monitor LLM closes the
+        freshly-opened position citing "unvetted exposure".
+
+        Verify the enrichment helper merges thesis fields into the broker
+        pos and the formatted prompt now shows a real thesis summary.
+        """
+        from trading_agent.graph.nodes.intraday_nodes import (
+            _format_exit_prompt,
+            _thesis_summary_for,
+        )
+
+        broker_pos = self._make_pos()  # no thesis_id from broker
+        # Simulate what _load_journal_enrichment_by_symbol would attach.
+        broker_pos.update({
+            "trade_id": 3,
+            "thesis_id": 4,
+            "direction": "LONG_CALL",
+            "thesis_text": "post_consolidation_breakout_continuation",
+            "invalidation": "close below 215 EOD",
+        })
+
+        summary = _thesis_summary_for(broker_pos)
+        assert "(no thesis linked)" not in summary
+        assert "(thesis not found)" not in summary
+        assert "LONG_CALL" in summary
+        assert "post_consolidation_breakout_continuation" in summary
+
+        prompt = _format_exit_prompt(broker_pos, {"label": "BULL_TREND"}, "BULL_TREND")
+        assert "(no thesis linked)" not in prompt
+        assert "post_consolidation_breakout_continuation" in prompt
+
+    def test_enrichment_merges_via_detect_exit_triggers(self):
+        """End-to-end: enrichment runs inside detect_exit_triggers so the
+        prompt the LLM sees has real thesis text — caught the actual bug.
+        """
+        from trading_agent.llm.schemas import ExitMonitorOutput
+
+        broker_pos = self._make_pos()
+        broker_pos["symbol"] = "US.NVDA260605C220000"
+
+        captured_prompts: list[str] = []
+
+        def _capture(role, prompt, **_kwargs):
+            captured_prompts.append(prompt)
+            m = MagicMock()
+            m.parsed = ExitMonitorOutput(action="HOLD", exit_qty_factor=0.0, reason="thesis intact")
+            return m
+
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=[broker_pos],
+            regime={"label": "BULL_TREND", "confidence": 0.9, "gate": {}},
+        )
+
+        enrichment = {
+            "US.NVDA260605C220000": {
+                "trade_id": 3,
+                "thesis_id": 4,
+                "stop": 7.0,
+                "target": 18.0,
+                "direction": "LONG_CALL",
+                "thesis_text": "post_consolidation_breakout_continuation",
+                "invalidation": "close below 215 EOD",
+            }
+        }
+
+        with _patch_all_emits():
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value=enrichment,
+            ):
+                with patch("trading_agent.llm.get_router") as mock_router:
+                    mock_router.return_value.call.side_effect = _capture
+                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
+                    detect_exit_triggers(state)
+
+        assert len(captured_prompts) == 1, "exit_monitor should see exactly one prompt"
+        prompt = captured_prompts[0]
+        assert "(no thesis linked)" not in prompt, (
+            "regression: enrichment didn't reach the LLM prompt — NVDA self-exit bug returns"
+        )
+        assert "LONG_CALL" in prompt
+        assert "post_consolidation_breakout_continuation" in prompt
+
 
 class TestRouteExitOrHold:
     def test_all_hold_returns_empty(self):
