@@ -338,6 +338,214 @@ class TestDetectExitTriggers:
         assert "LONG_CALL" in prompt
         assert "post_consolidation_breakout_continuation" in prompt
 
+    def test_partial_exit_on_qty_1_demoted_to_hold(self):
+        """Regression for the 5/12 NVDA EXIT_CAUTIOUS-but-actually-closed-100% bug.
+
+        LLM returns EXIT_CAUTIOUS with exit_qty_factor=0.5 on a 1-contract
+        position. The downstream route_exit_or_hold would `max(1, round(0.5))`
+        and force a FULL close. Detect demotes to HOLD so the LLM's
+        "let some run" intent is preserved.
+        """
+        from trading_agent.llm.schemas import ExitMonitorOutput
+
+        pos = {
+            "symbol": "US.NVDA260605C220000",
+            "asset_type": "OPT", "qty": 1,  # ← single contract, partial impossible
+            "entry_price": 10.0, "mark": 9.8,
+            "stop": 7.0, "target": 18.0, "age_minutes": 120,
+        }
+        mock_res = MagicMock()
+        mock_res.parsed = ExitMonitorOutput(
+            action="EXIT_CAUTIOUS", exit_qty_factor=0.5,
+            reason="thesis weakening but not yet invalidated",
+        )
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=[pos],
+            regime={"label": "BULL_TREND", "confidence": 0.7, "gate": {}},
+        )
+        with _patch_all_emits():
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value={},
+            ):
+                with patch("trading_agent.llm.get_router") as mock_router:
+                    mock_router.return_value.call.return_value = mock_res
+                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
+                    result = detect_exit_triggers(state)
+        decisions = result["journal"]["exit_decisions"]
+        assert len(decisions) == 1
+        dec = decisions[0]
+        assert dec["action"] == "HOLD", (
+            "regression: partial exit on qty=1 should demote to HOLD, not force full close"
+        )
+        assert dec["exit_qty_factor"] == 0.0
+        assert "demoted_from_EXIT_CAUTIOUS" in dec["reason"]
+
+    def test_full_exit_on_qty_1_still_executes(self):
+        """Counter-check: action != EXIT_CAUTIOUS-style partial, factor=1.0 → not demoted."""
+        from trading_agent.llm.schemas import ExitMonitorOutput
+
+        pos = {
+            "symbol": "US.NVDA260605C220000",
+            "asset_type": "OPT", "qty": 1,
+            "entry_price": 10.0, "mark": 6.0,
+            "stop": 7.0, "target": 18.0, "age_minutes": 120,
+        }
+        mock_res = MagicMock()
+        mock_res.parsed = ExitMonitorOutput(
+            action="EXIT_STOP", exit_qty_factor=1.0, reason="stop hit",
+        )
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=[pos],
+            regime={"label": "BULL_TREND", "confidence": 0.7, "gate": {}},
+        )
+        with _patch_all_emits():
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value={},
+            ):
+                with patch("trading_agent.llm.get_router") as mock_router:
+                    mock_router.return_value.call.return_value = mock_res
+                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
+                    result = detect_exit_triggers(state)
+        dec = result["journal"]["exit_decisions"][0]
+        # Full exit (factor=1.0) is fine on qty=1 — 1×1=1 contract → real close.
+        assert dec["action"] == "EXIT_STOP"
+        assert dec["exit_qty_factor"] == 1.0
+
+    def test_escalation_fires_when_threshold_hit(self):
+        """5+ exit_monitor LLM failures in the last hour → ops alert.
+
+        Direct unit test of `_maybe_escalate_exit_monitor_failures` since
+        wiring it through detect_exit_triggers needs a real failure path —
+        but the contract we care about is: fail_count >= threshold AND no
+        recent suppression → emit severity-2 + ntfy.
+        """
+        fake_cur = MagicMock()
+        # First call: COUNT(*) → 5 failures (≥ threshold of 3)
+        # Second call: cooldown check → None (no recent alert)
+        fake_cur.fetchone.side_effect = [(5,), None]
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        emitted: list[dict] = []
+
+        def _capture_emit(**kwargs):
+            emitted.append(kwargs)
+
+        ntfy_sent: list[dict] = []
+
+        def _capture_ntfy(**kwargs):
+            ntfy_sent.append(kwargs)
+
+        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+            with patch("trading_agent.graph.nodes.intraday_nodes.emit", side_effect=_capture_emit):
+                with patch("trading_agent.notify.send", side_effect=_capture_ntfy):
+                    from trading_agent.graph.nodes.intraday_nodes import (
+                        _maybe_escalate_exit_monitor_failures,
+                    )
+                    _maybe_escalate_exit_monitor_failures("test_run", "intraday_monitor")
+
+        assert len(emitted) == 1, "should emit exactly one persistent_failure event"
+        assert emitted[0]["event_type"] == "exit_monitor_persistent_failure"
+        assert emitted[0]["severity"] == 2
+        assert emitted[0]["payload"]["fail_count"] == 5
+        assert len(ntfy_sent) == 1, "should fire one ntfy ops alert"
+        assert ntfy_sent[0]["priority"] == 5
+
+    def test_escalation_suppressed_when_recent_alert(self):
+        """Once an alert has fired within the cooldown window, further hits
+        should not re-fire (avoids ntfy spam)."""
+        fake_cur = MagicMock()
+        # COUNT(*) → 5 failures, cooldown check → already alerted (returns row)
+        fake_cur.fetchone.side_effect = [(5,), (1,)]
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        emitted: list[dict] = []
+        ntfy_sent: list[dict] = []
+        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes.emit",
+                side_effect=lambda **kw: emitted.append(kw),
+            ):
+                with patch(
+                    "trading_agent.notify.send",
+                    side_effect=lambda **kw: ntfy_sent.append(kw),
+                ):
+                    from trading_agent.graph.nodes.intraday_nodes import (
+                        _maybe_escalate_exit_monitor_failures,
+                    )
+                    _maybe_escalate_exit_monitor_failures("test_run", "intraday_monitor")
+
+        assert emitted == [], "alert should be suppressed during cooldown"
+        assert ntfy_sent == [], "ntfy should be suppressed during cooldown"
+
+    def test_escalation_silent_below_threshold(self):
+        """Fewer than threshold failures → no alert. Normal operation."""
+        fake_cur = MagicMock()
+        fake_cur.fetchone.return_value = (2,)  # only 2 failures < threshold of 3
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        emitted: list[dict] = []
+        ntfy_sent: list[dict] = []
+        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes.emit",
+                side_effect=lambda **kw: emitted.append(kw),
+            ):
+                with patch(
+                    "trading_agent.notify.send",
+                    side_effect=lambda **kw: ntfy_sent.append(kw),
+                ):
+                    from trading_agent.graph.nodes.intraday_nodes import (
+                        _maybe_escalate_exit_monitor_failures,
+                    )
+                    _maybe_escalate_exit_monitor_failures("test_run", "intraday_monitor")
+
+        assert emitted == []
+        assert ntfy_sent == []
+
+    def test_partial_exit_on_qty_2_not_demoted(self):
+        """Counter-check: partial-exit factor=0.5 on qty=2 is physically possible
+        (2 × 0.5 = 1 contract) — should NOT be demoted to HOLD."""
+        from trading_agent.llm.schemas import ExitMonitorOutput
+
+        pos = {
+            "symbol": "US.NVDA260605C220000",
+            "asset_type": "OPT", "qty": 2,  # ← can split
+            "entry_price": 10.0, "mark": 9.8,
+            "stop": 7.0, "target": 18.0, "age_minutes": 120,
+        }
+        mock_res = MagicMock()
+        mock_res.parsed = ExitMonitorOutput(
+            action="EXIT_CAUTIOUS", exit_qty_factor=0.5, reason="reduce exposure",
+        )
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=[pos],
+            regime={"label": "BULL_TREND", "confidence": 0.7, "gate": {}},
+        )
+        with _patch_all_emits():
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value={},
+            ):
+                with patch("trading_agent.llm.get_router") as mock_router:
+                    mock_router.return_value.call.return_value = mock_res
+                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
+                    result = detect_exit_triggers(state)
+        dec = result["journal"]["exit_decisions"][0]
+        # Partial on qty=2 is doable, must NOT be demoted.
+        assert dec["action"] == "EXIT_CAUTIOUS"
+        assert dec["exit_qty_factor"] == 0.5
+
 
 class TestRouteExitOrHold:
     def test_all_hold_returns_empty(self):

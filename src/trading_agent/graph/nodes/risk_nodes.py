@@ -304,7 +304,12 @@ def finalize_risk_decision(state: dict) -> dict:
     else:
         approved_qty = max(0.0, requested_qty * final_factor)
         if proposal.get("asset_type") == "OPT":
-            approved_qty = float(int(approved_qty))
+            # Round-half-up, NOT int() truncation.
+            # int(0.6) = 0 would convert "DOWNSIZE to 60% of 1 contract" into
+            # a forced VETO ("downsize_to_zero_contracts") — that's a bug we
+            # already fixed in regime_execution_gate; the same fix has to
+            # live here. 1 × 0.6 should round to 1, not 0.
+            approved_qty = float(int(approved_qty + 0.5)) if approved_qty > 0 else 0.0
             if approved_qty == 0 and requested_qty > 0:
                 final_decision = "VETO"
                 gc_dict.setdefault("reasons", []).append("downsize_to_zero_contracts")

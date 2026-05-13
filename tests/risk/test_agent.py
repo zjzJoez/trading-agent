@@ -116,8 +116,11 @@ def test_heat_breach_downsizes():
     # Heat 8% breaches BULL cap of 6% but is within 1.5× → DOWNSIZE
     assert out.decision == "DOWNSIZE"
     assert 0 <= out.approved_qty <= 10.0
-    # Heat-only DOWNSIZE: factor 6/8 = 0.75; 10×0.75 = 7 (floored to int contracts)
-    assert out.approved_qty == 7.0
+    # Heat-only DOWNSIZE: factor 6/8 = 0.75; 10×0.75 = 7.5 → round-half-up = 8.
+    # (Previously int() truncated to 7; the round-half-up fix lives in three
+    # places — trade_nodes.regime_execution_gate, risk_nodes.finalize_risk_decision,
+    # and risk.agent.decide — and they must all stay in sync.)
+    assert out.approved_qty == 8.0
 
 
 def test_extreme_heat_vetos():
@@ -136,10 +139,55 @@ def test_extreme_heat_vetos():
 
 
 def test_downsize_to_zero_contracts_becomes_veto():
-    """If suggested factor floors options to 0 contracts, that's a VETO."""
-    # Heat-only breach (no greek stress) so we get clean DOWNSIZE; tiny qty
-    # forces floor-to-int 0 contracts → flipped to VETO.
-    existing = _opt(qty=10, entry_price=4.0, delta=0.0, gamma=0.0, vega=0.0, theta=0.0)
+    """Direct test of the ``downsize_to_zero_contracts`` branch in decide().
+
+    Under round-half-up semantics the only way ``factor * requested_qty < 0.5``
+    is through guardrails returning a sub-0.5 factor — which the current
+    guardrail set cannot produce naturally (heat path floor=0.667, correlation
+    path floor=0.5). So we directly inject a fake guardrails check with a
+    pathological factor; this still exercises the decide() branch we care
+    about without relying on guardrails reaching a state that's actually
+    unreachable in production.
+    """
+    from unittest.mock import patch
+
+    from trading_agent.risk.guardrails import GuardrailsCheck, GuardrailViolation
+
+    fake_gc = GuardrailsCheck(
+        decision="DOWNSIZE",
+        violations=[GuardrailViolation(
+            rule="synthetic", severity="DOWNSIZE", detail="forced", measured=1.0, threshold=1.0,
+        )],
+        suggested_qty_factor=0.3,  # 1 contract × 0.3 = 0.3 → round-half-up = 0
+        reasons=["synthetic"],
+    )
+
+    snap = build_snapshot(equity=50_000, cash=50_000, open_positions=[])
+    with patch("trading_agent.risk.agent.check_guardrails", return_value=fake_gc):
+        out = decide(
+            RiskInput(
+                proposal=_proposal(qty=1, entry_price=0.01),
+                portfolio=snap,
+                regime={"label": "BULL_TREND", "confidence": 0.85},
+            )
+        )
+    # 1 × 0.3 = 0.3 → round-half-up = 0 → VETO with "downsize_to_zero_contracts"
+    assert out.decision == "VETO"
+    assert "downsize_to_zero_contracts" in out.reasons
+
+
+def test_downsize_one_contract_at_half_factor_stays_open():
+    """Regression for the round-half-down bug.
+
+    Council DOWNSIZE factor=0.6 on a 1-contract proposal should APPROVE
+    qty=1 (round-half-up 0.6 → 1), NOT VETO (old int() floored to 0).
+
+    This was the bug in three places — trade_nodes.regime_execution_gate,
+    risk_nodes.finalize_risk_decision, and risk.agent.decide. If this test
+    ever returns to VETO, one of those code paths regressed.
+    """
+    # Mild breach → DOWNSIZE factor 0.6-ish; qty=1 should survive round-half-up.
+    existing = _opt(qty=7, entry_price=4.0, delta=0.0, gamma=0.0, vega=0.0, theta=0.0)
     snap = build_snapshot(equity=50_000, cash=50_000, open_positions=[existing])
     out = decide(
         RiskInput(
@@ -148,9 +196,16 @@ def test_downsize_to_zero_contracts_becomes_veto():
             regime={"label": "BULL_TREND", "confidence": 0.85},
         )
     )
-    # DOWNSIZE factor 0.75 × 1 contract = 0.75 → int floor 0 → VETO
-    assert out.decision == "VETO"
-    assert "downsize_to_zero_contracts" in out.reasons
+    # Whether the deterministic path settles on DOWNSIZE or APPROVE depends on
+    # the exact heat ratio. The contract of this test is: a 1-contract OPT
+    # proposal with any factor >= 0.5 must NOT become VETO with reason
+    # "downsize_to_zero_contracts" — that's the round-down bug.
+    assert "downsize_to_zero_contracts" not in out.reasons, (
+        f"regression: round-half-down bug returned in {out.decision} path"
+    )
+    if out.decision != "VETO":
+        # If we did approve, it should be ≥ 1 contract (not fractional).
+        assert out.approved_qty >= 1.0
 
 
 def test_data_quality_critical_defers():

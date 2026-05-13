@@ -112,6 +112,20 @@ def postgres_health(state: TradingGraphState) -> dict:
             event_type="postgres_ok",
             payload={"latency_ms": elapsed_ms},
         )
+        # Postgres is reachable — drain any audit events buffered to
+        # the fallback JSONL during a prior outage. Without this hook
+        # the buffered events sit on disk forever.
+        try:
+            from trading_agent.events import replay_fallback_events
+            replay = replay_fallback_events()
+            if replay.get("file_existed"):
+                emit(
+                    run_id=run_id, trigger=trigger, agent="postgres_health",
+                    event_type="fallback_replayed",
+                    payload=replay,
+                )
+        except Exception as e:
+            log.warning("[postgres_health] fallback replay failed: %s", e)
     else:
         emit(
             run_id=run_id, trigger=trigger, agent="postgres_health",

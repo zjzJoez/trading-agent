@@ -360,6 +360,37 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
             action = "HOLD"
             reason = f"llm_error: {e}"
             qty_factor = 0.0
+            # Tracking event for escalation. One failure is fine (default HOLD
+            # is safe), but a *streak* of failures means every position is
+            # frozen at HOLD with no LLM oversight — stops won't fire, regime
+            # changes will be ignored. Audit row enables a window query below.
+            emit(
+                run_id=run_id, trigger=trigger, agent="detect_exit_triggers",
+                event_type="exit_monitor_llm_failed",
+                severity=1,
+                payload={"symbol": symbol, "error": str(e)[:300]},
+            )
+
+        # Sanity guard: a partial-exit signal on a 1-contract option position
+        # is physically impossible (options don't fractionate). The downstream
+        # route_exit_or_hold would `max(1, round(1 * 0.5)) = 1` and force a
+        # FULL close, contradicting the LLM's "let some run" signal. Demote
+        # the action to HOLD so the LLM's intent is preserved. (5/12 NVDA
+        # EXIT_CAUTIOUS @ factor 0.5 actually closed 100% — that's the bug.)
+        full_qty = float(pos.get("qty") or 0)
+        if action != "HOLD" and 0.0 < qty_factor < 1.0 and full_qty <= 1:
+            original_action = action
+            log.info(
+                "[detect_exit_triggers] %s demoting %s (factor=%.2f, qty=%.0f) → HOLD: "
+                "partial exit physically impossible on 1-contract position",
+                symbol, original_action, qty_factor, full_qty,
+            )
+            reason = (
+                f"demoted_from_{original_action}_partial_impossible_on_qty_{int(full_qty)}: "
+                f"{reason[:120]}"
+            )
+            action = "HOLD"
+            qty_factor = 0.0
 
         decisions.append({
             "symbol": symbol,
@@ -379,9 +410,95 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
         payload={"hold": hold_count, "exit": exit_count, "decisions": decisions},
     )
 
+    # Escalation: if exit_monitor has failed N+ times in the last hour, the
+    # LLM channel is effectively dead — positions are silently HOLDing, no
+    # one is monitoring stops or regime changes. Fire a high-priority alert.
+    _maybe_escalate_exit_monitor_failures(run_id, trigger)
+
     journal_payload = dict(state.get("journal") or {})
     journal_payload["exit_decisions"] = decisions
     return {"journal": journal_payload}
+
+
+# ---------------------------------------------------------------------------
+# Escalation helper — bridge between event-level failures and ops alerts.
+# ---------------------------------------------------------------------------
+
+# A streak of LLM failures means every open position is frozen at HOLD without
+# real oversight. Threshold is intentionally tight — 3 failures in 60 min
+# matches the systemd 5-min intraday cadence: 12 ticks per hour, so 3 failures
+# is a ~25% failure rate that almost certainly means the channel is down, not
+# a transient rate-limit blip.
+_EXIT_LLM_FAIL_THRESHOLD = 3
+_EXIT_LLM_FAIL_WINDOW_MIN = 60
+# Don't spam — one alert per cooldown window even if failures keep accumulating.
+_EXIT_LLM_FAIL_ALERT_COOLDOWN_MIN = 60
+
+
+def _maybe_escalate_exit_monitor_failures(run_id: str, trigger: str) -> None:
+    """Count recent exit_monitor LLM failures; alert ops if past threshold.
+
+    Best-effort: any DB or ntfy error is swallowed so a flaky audit DB
+    can't bring down the main intraday loop.
+    """
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM agent_events
+                WHERE event_type = 'exit_monitor_llm_failed'
+                  AND ts > NOW() - (%s::text || ' minutes')::interval
+                """,
+                (str(_EXIT_LLM_FAIL_WINDOW_MIN),),
+            )
+            fail_count = int(cur.fetchone()[0] or 0)
+            if fail_count < _EXIT_LLM_FAIL_THRESHOLD:
+                return
+            # Cooldown — did we already alert in the past cooldown window?
+            cur.execute(
+                """
+                SELECT 1 FROM agent_events
+                WHERE event_type = 'exit_monitor_persistent_failure'
+                  AND ts > NOW() - (%s::text || ' minutes')::interval
+                LIMIT 1
+                """,
+                (str(_EXIT_LLM_FAIL_ALERT_COOLDOWN_MIN),),
+            )
+            if cur.fetchone() is not None:
+                return  # already alerted recently, suppress
+    except Exception as e:
+        log.warning("[detect_exit_triggers] escalation count query failed: %s", e)
+        return
+
+    emit(
+        run_id=run_id, trigger=trigger, agent="detect_exit_triggers",
+        event_type="exit_monitor_persistent_failure",
+        severity=2,
+        payload={
+            "fail_count": fail_count,
+            "window_minutes": _EXIT_LLM_FAIL_WINDOW_MIN,
+            "threshold": _EXIT_LLM_FAIL_THRESHOLD,
+        },
+    )
+    try:
+        from trading_agent.notify import send as ntfy_send
+        ntfy_send(
+            topic="ops",
+            title="exit_monitor LLM DOWN",
+            body=(
+                f"{fail_count} exit_monitor LLM failures in the last "
+                f"{_EXIT_LLM_FAIL_WINDOW_MIN} min (threshold={_EXIT_LLM_FAIL_THRESHOLD}).\n"
+                f"All open positions are HOLDing with no LLM oversight. "
+                f"Stops still fire via deterministic check, but regime/thesis "
+                f"changes are not being evaluated. Check claude_code / codex / "
+                f"deepseek channels."
+            ),
+            priority=5,
+            tags=["rotating_light", "warning"],
+        )
+    except Exception as e:
+        log.warning("[detect_exit_triggers] escalation ntfy failed: %s", e)
 
 
 # ---------------------------------------------------------------------------

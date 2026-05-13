@@ -135,9 +135,15 @@ def decide(input: RiskInput) -> RiskOutput:
         max_entry_price = 0.0
     else:
         approved_qty = max(0.0, requested_qty * final_factor)
-        # Floor to integer contracts for options
+        # Round-half-up for option contracts, NOT int() truncation.
+        # int(0.6) = 0 would convert "DOWNSIZE to 60% of 1 contract" into
+        # a forced VETO, which contradicts the Council's intent. Round-half-up
+        # keeps a single-contract proposal alive at light downsizes (factor>=0.5)
+        # while still floor-to-zero / VETO when the downsize is severe (<0.5).
+        # The fix lives identically in trade_nodes.regime_execution_gate and
+        # risk_nodes.finalize_risk_decision — keep all three in sync.
         if proposal.get("asset_type") == "OPT":
-            approved_qty = float(int(approved_qty))
+            approved_qty = float(int(approved_qty + 0.5)) if approved_qty > 0 else 0.0
             if approved_qty == 0:
                 final_decision = "VETO"  # downsize-to-zero == effectively veto
                 gc.reasons.append("downsize_to_zero_contracts")

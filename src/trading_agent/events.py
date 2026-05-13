@@ -101,6 +101,111 @@ def new_run_id(prefix: str = "run") -> str:
     return f"{prefix}_{ts}_{rand}"
 
 
+def _fallback_path():
+    from pathlib import Path
+    return Path.home() / "agent_events.fallback.jsonl"
+
+
+def replay_fallback_events(max_lines: int = 5_000) -> dict:
+    """Drain ``~/agent_events.fallback.jsonl`` back into Postgres ``agent_events``.
+
+    Why: ``emit()`` writes here when Postgres is unreachable so decisions are
+    still recorded. But without a replay step the data sits there forever —
+    a real Postgres blip silently drops audit rows.
+
+    Mechanics:
+        * Read whole file (capped at ``max_lines``).
+        * Truncate the file BEFORE attempting inserts. If we insert-first
+          then truncate, a crash mid-replay double-counts rows. If we
+          truncate-first then crash, we lose at most one batch — same
+          failure mode as a Postgres outage that started one tick later.
+        * On per-row insert failure, append the failed row back to the
+          file so the next replay tick picks it up.
+
+    Returns ``{replayed, failed, file_existed}``. Idempotent. Safe to call
+    from healthcheck every tick — if the file is missing/empty, returns in
+    one ``stat()`` call.
+    """
+    out = {"replayed": 0, "failed": 0, "file_existed": False}
+    path = _fallback_path()
+    if not path.exists() or path.stat().st_size == 0:
+        return out
+    out["file_existed"] = True
+
+    try:
+        lines = path.read_text().splitlines()
+    except Exception as e:
+        log.warning("replay_fallback_events: read failed: %s", e)
+        return out
+
+    if len(lines) > max_lines:
+        # Huge file — leave the tail for the next tick so healthcheck stays fast.
+        replay_lines, leftover = lines[:max_lines], lines[max_lines:]
+    else:
+        replay_lines, leftover = lines, []
+
+    try:
+        path.write_text("\n".join(leftover) + ("\n" if leftover else ""))
+    except Exception as e:
+        log.warning("replay_fallback_events: truncate failed: %s — bailing", e)
+        return out
+
+    requeue: list[str] = []
+    for line in replay_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            # malformed — drop (not worth requeuing forever)
+            out["failed"] += 1
+            continue
+        try:
+            with cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO agent_events
+                        (ts, run_id, trigger, agent, event_type, severity, payload, cost_usd)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    """,
+                    (
+                        rec.get("ts"),
+                        rec.get("run_id"),
+                        rec.get("trigger"),
+                        rec.get("agent"),
+                        rec.get("event_type"),
+                        rec.get("severity", 0),
+                        json.dumps(rec.get("payload") or {}, default=_json_default),
+                        rec.get("cost_usd"),
+                    ),
+                )
+            out["replayed"] += 1
+        except Exception as e:
+            log.warning(
+                "replay_fallback_events: row insert failed (will retry next tick): %s", e,
+            )
+            requeue.append(line)
+            out["failed"] += 1
+
+    if requeue:
+        try:
+            with open(path, "a") as f:
+                for line in requeue:
+                    f.write(line + "\n")
+        except Exception as e:
+            log.error(
+                "replay_fallback_events: requeue write failed — events lost: %s", e,
+            )
+
+    if out["replayed"] or out["failed"]:
+        log.info(
+            "replay_fallback_events: replayed=%d failed=%d leftover=%d",
+            out["replayed"], out["failed"], len(leftover),
+        )
+    return out
+
+
 def _json_default(o: Any) -> Any:
     """Pydantic models, datetime, decimal, etc. — keep audit JSON serializable."""
     if hasattr(o, "model_dump"):
