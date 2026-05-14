@@ -775,6 +775,21 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             "held": [d["symbol"] for d in decisions if d.get("action") == "HOLD"],
         },
     )
+
+    # Audibility watchdogs — run every intraday tick (5-min cadence) so
+    # dispatch silent-die / LLM schema-violation alerts fire within
+    # ~5 min instead of ~60 min (healthcheck cadence). Watchdogs are
+    # idempotent — they have their own per-event cooldowns, so running
+    # them twice (intraday + healthcheck) doesn't double-alert.
+    try:
+        from trading_agent.graph.nodes.health_nodes import (
+            _check_dispatch_silent_die,
+            _check_llm_schema_violations,
+        )
+        _check_dispatch_silent_die(run_id, trigger)
+        _check_llm_schema_violations(run_id, trigger)
+    except Exception as e:
+        log.warning("[route_exit_or_hold] watchdog failed: %s", e)
     return {}
 
 
