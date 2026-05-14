@@ -83,12 +83,23 @@ def run_once(
         state["candidates"] = [{"ticker": ticker, "score": 1.0, "reason": "cli"}]
         state["research"] = {"target_ticker": ticker}
 
+    # Lifecycle payload — `ticker` is the watchdog correlation key for
+    # candidate_entry runs. If a candidate_entry_dispatched event is in
+    # agent_events but no matching `run_start` for the same ticker shows up
+    # within 5 min, the watchdog in healthcheck flags it as a silent die.
+    # (This is what would have caught the 5/13 SPY systemd-cgroup kill in
+    # 5 min instead of 22 hours.)
+    lifecycle_payload = {
+        "thread_id": _thread_id(trigger, run_id, ts),
+        "ticker": ticker,  # None for non-per-ticker triggers
+    }
+
     emit(
         run_id=run_id,
         trigger=trigger,  # type: ignore[arg-type]
         agent="orchestrator",
         event_type="run_start",
-        payload={"thread_id": _thread_id(trigger, run_id, ts)},
+        payload=lifecycle_payload,
     )
 
     graph = build(trigger)
@@ -102,7 +113,7 @@ def run_once(
             trigger=trigger,  # type: ignore[arg-type]
             agent="orchestrator",
             event_type="run_failed",
-            payload={"error": str(e)},
+            payload={"error": str(e), "ticker": ticker},
             severity=2,
         )
         raise
@@ -112,7 +123,10 @@ def run_once(
             trigger=trigger,  # type: ignore[arg-type]
             agent="orchestrator",
             event_type="run_finished",
-            payload={"nodes_visited": len(final_state.get("notifications", []))},
+            payload={
+                "nodes_visited": len(final_state.get("notifications", [])),
+                "ticker": ticker,
+            },
         )
         return final_state
 

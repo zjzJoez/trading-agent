@@ -418,39 +418,52 @@ def _dispatch_candidate_entry_if_eligible(
         )
         return
 
-    # All guards passed — fork detached child to run candidate_entry.
-    import os
+    # All guards passed — dispatch via systemd unit (NOT subprocess.Popen).
+    #
+    # Why systemd unit instead of subprocess.Popen(start_new_session=True):
+    #
+    # subprocess.Popen with start_new_session=True changes the SESSION ID but
+    # does NOT leave the parent's systemd cgroup. When the parent unit
+    # (trading-agent-brain@premarket_scan.service) ExecStart returns, systemd
+    # defaults to KillMode=control-group and SIGTERMs every PID in the cgroup
+    # — including the "detached" child. We saw this happen on 5/13 12:31:
+    # SPY was dispatched, child PID 96421 silently died before LangGraph
+    # could emit `run_start`, and nothing wrote to the journal or log files
+    # because Python was killed during import.
+    #
+    # The fix is to start a SEPARATE systemd unit per ticker. systemd already
+    # provides `trading-agent-candidate-entry@.service` as a template — each
+    # instance lives in its own cgroup, has its own 15-min TimeoutStartSec,
+    # its own journalctl trace (`journalctl -u trading-agent-candidate-entry@SPY`),
+    # and its own EnvironmentFile loading. The parent unit exiting no longer
+    # touches it.
+    #
+    # Requires sudoers entry on EC2:
+    #   ubuntu ALL=(root) NOPASSWD: /bin/systemctl start trading-agent-candidate-entry@*.service, \
+    #                               /bin/systemctl reset-failed trading-agent-candidate-entry@*.service
+    # See deploy/ec2/INSTALL.md for the install snippet.
     import subprocess
-    import sys
-    venv_python = Path(sys.executable)  # /home/ubuntu/trading-agent/.venv/bin/python
-    project_root = Path(__file__).resolve().parents[3]  # /home/ubuntu/trading-agent
-    log_dir = Path("/var/log")
-    out_log = log_dir / "trading-agent-brain.log"
-    err_log = log_dir / "trading-agent-brain.err"
+    unit_name = f"trading-agent-candidate-entry@{ticker}.service"
 
     try:
-        # Open log files for the child. Fall back to /tmp if /var/log is not writable.
-        try:
-            out_fp = open(out_log, "a")
-            err_fp = open(err_log, "a")
-        except PermissionError:
-            out_fp = open("/tmp/candidate_entry_dispatch.log", "a")
-            err_fp = open("/tmp/candidate_entry_dispatch.err", "a")
-
-        child = subprocess.Popen(
-            [
-                str(venv_python),
-                "-m", "trading_agent.orchestrator",
-                "--trigger=candidate_entry",
-                "--ticker", ticker,
-            ],
-            cwd=str(project_root),
-            stdout=out_fp,
-            stderr=err_fp,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,  # detach from parent's session/process group
-            env={**os.environ},  # carry POSTGRES_DSN, SOAK_PHASE, etc.
+        # Clear any prior "failed" state of this instance — systemctl start
+        # silently no-ops if the unit is in failed state (e.g. previous run
+        # hit TimeoutStartSec). reset-failed is a noop when state is clean.
+        subprocess.run(
+            ["sudo", "-n", "/bin/systemctl", "reset-failed", unit_name],
+            check=False, capture_output=True, timeout=10,
         )
+        # Fire-and-forget start. --no-block means systemctl returns
+        # immediately; the unit runs asynchronously in its own cgroup.
+        result = subprocess.run(
+            ["sudo", "-n", "/bin/systemctl", "start", "--no-block", unit_name],
+            check=False, capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"systemctl start exit={result.returncode}: "
+                f"{result.stderr.decode('utf-8', 'replace')[:300]}"
+            )
         emit(
             run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
             event_type="candidate_entry_dispatched",
@@ -458,13 +471,15 @@ def _dispatch_candidate_entry_if_eligible(
                 "ticker": ticker,
                 "score": top_score,
                 "reason": top.get("reason", "")[:160],
-                "child_pid": child.pid,
+                "unit": unit_name,
             },
         )
-        log.info("[dispatch] candidate_entry forked for %s (score=%.2f, pid=%s)",
-                 ticker, top_score, child.pid)
+        log.info(
+            "[dispatch] candidate_entry started for %s via systemd (score=%.2f)",
+            ticker, top_score,
+        )
     except Exception as e:
-        log.error("[dispatch] subprocess fork failed for %s: %s", ticker, e)
+        log.error("[dispatch] systemctl start failed for %s: %s", ticker, e)
         emit(
             run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
             event_type="candidate_entry_dispatch_failed",

@@ -118,6 +118,139 @@ class TestPostgresHealth:
                     mock_alert.assert_called_once()
 
 
+class TestDispatchSilentDieWatchdog:
+    """Regression for the 5/13 SPY systemd-cgroup kill.
+
+    The watchdog runs from postgres_health every healthcheck tick. It finds
+    candidate_entry_dispatched events without a matching run_start within
+    the silent-die window and fires audible alerts.
+    """
+
+    def test_silent_die_emits_alert(self):
+        """Dispatched but no run_start → emit + ntfy."""
+        # Mock cursor returns: (ticker, age_seconds) row for SPY silent die.
+        fake_cur = MagicMock()
+        fake_cur.fetchall.return_value = [("SPY", 420)]  # 7 min old
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        emitted: list[dict] = []
+        alerted: list[dict] = []
+        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+            with patch("trading_agent.graph.nodes.health_nodes.emit",
+                       side_effect=lambda **kw: emitted.append(kw)):
+                with patch("trading_agent.graph.nodes.health_nodes._alert_ops",
+                           side_effect=lambda **kw: alerted.append(kw)):
+                    from trading_agent.graph.nodes.health_nodes import (
+                        _check_dispatch_silent_die,
+                    )
+                    _check_dispatch_silent_die("test_run", "healthcheck")
+        assert len(emitted) == 1
+        assert emitted[0]["event_type"] == "candidate_entry_silent_die"
+        assert emitted[0]["severity"] == 2
+        assert emitted[0]["payload"]["ticker"] == "SPY"
+        assert len(alerted) == 1
+        assert "SPY" in alerted[0]["title"]
+
+    def test_no_silent_dies_no_alert(self):
+        """Empty result set → no emit, no ntfy."""
+        fake_cur = MagicMock()
+        fake_cur.fetchall.return_value = []
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        emitted: list[dict] = []
+        alerted: list[dict] = []
+        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+            with patch("trading_agent.graph.nodes.health_nodes.emit",
+                       side_effect=lambda **kw: emitted.append(kw)):
+                with patch("trading_agent.graph.nodes.health_nodes._alert_ops",
+                           side_effect=lambda **kw: alerted.append(kw)):
+                    from trading_agent.graph.nodes.health_nodes import (
+                        _check_dispatch_silent_die,
+                    )
+                    _check_dispatch_silent_die("test_run", "healthcheck")
+        assert emitted == []
+        assert alerted == []
+
+
+class TestLLMSchemaViolationWatchdog:
+    """Watchdog fires when LLM channel produces enough garbage to be audible."""
+
+    def test_above_threshold_alerts(self):
+        """≥5 schema violations in window → emit + ntfy."""
+        fake_cur = MagicMock()
+        fake_cur.fetchall.return_value = [("trader_synthesizer", 4), ("news_analyst", 2)]
+        fake_cur.fetchone.return_value = None  # no recent alert in cooldown window
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        emitted: list[dict] = []
+        alerted: list[dict] = []
+        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+            with patch("trading_agent.graph.nodes.health_nodes.emit",
+                       side_effect=lambda **kw: emitted.append(kw)):
+                with patch("trading_agent.graph.nodes.health_nodes._alert_ops",
+                           side_effect=lambda **kw: alerted.append(kw)):
+                    from trading_agent.graph.nodes.health_nodes import (
+                        _check_llm_schema_violations,
+                    )
+                    _check_llm_schema_violations("test_run", "healthcheck")
+        assert len(emitted) == 1
+        assert emitted[0]["event_type"] == "llm_schema_violation_alert"
+        assert emitted[0]["payload"]["total"] == 6
+        assert "trader_synthesizer" in emitted[0]["payload"]["per_role"]
+        assert len(alerted) == 1
+
+    def test_below_threshold_silent(self):
+        """3 violations in window (< threshold=5) → no alert."""
+        fake_cur = MagicMock()
+        fake_cur.fetchall.return_value = [("news_analyst", 3)]
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        emitted: list[dict] = []
+        alerted: list[dict] = []
+        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+            with patch("trading_agent.graph.nodes.health_nodes.emit",
+                       side_effect=lambda **kw: emitted.append(kw)):
+                with patch("trading_agent.graph.nodes.health_nodes._alert_ops",
+                           side_effect=lambda **kw: alerted.append(kw)):
+                    from trading_agent.graph.nodes.health_nodes import (
+                        _check_llm_schema_violations,
+                    )
+                    _check_llm_schema_violations("test_run", "healthcheck")
+        assert emitted == []
+        assert alerted == []
+
+    def test_cooldown_suppresses_repeat_alert(self):
+        """Above threshold but recently alerted → suppress."""
+        fake_cur = MagicMock()
+        fake_cur.fetchall.return_value = [("trader_synthesizer", 8)]
+        fake_cur.fetchone.return_value = (1,)  # recent alert found
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        emitted: list[dict] = []
+        alerted: list[dict] = []
+        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+            with patch("trading_agent.graph.nodes.health_nodes.emit",
+                       side_effect=lambda **kw: emitted.append(kw)):
+                with patch("trading_agent.graph.nodes.health_nodes._alert_ops",
+                           side_effect=lambda **kw: alerted.append(kw)):
+                    from trading_agent.graph.nodes.health_nodes import (
+                        _check_llm_schema_violations,
+                    )
+                    _check_llm_schema_violations("test_run", "healthcheck")
+        assert emitted == []
+        assert alerted == []
+
+
 class TestNtfyHealth:
     def test_sends_heartbeat(self):
         state = _base_state()
@@ -919,7 +1052,14 @@ class TestNtfyScanDigest:
         assert kwargs.get("topic") == "trades"
 
     def test_dispatch_forks_when_eligible(self):
-        """High-score top candidate + clean state → subprocess.Popen fires."""
+        """High-score top candidate + clean state → systemctl start fires.
+
+        Dispatch is now via independent systemd unit (not subprocess.Popen
+        with start_new_session) so the child doesn't get SIGTERM'd when its
+        parent unit's cgroup is reaped. Verify the systemctl invocation is
+        correct: reset-failed first (clear any stuck failed state), then
+        start --no-block (fire-and-forget).
+        """
         state = _base_state(
             trigger="premarket_scan",
             candidates=[{"ticker": "NVDA", "score": 0.85, "reason": "momentum breakout"}],
@@ -929,18 +1069,48 @@ class TestNtfyScanDigest:
             with patch("trading_agent.notify.send"):
                 with patch("pathlib.Path.exists", return_value=False):  # halt flag absent
                     with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
-                        with patch("subprocess.Popen") as mock_popen:
-                            mock_popen.return_value.pid = 12345
+                        with patch("subprocess.run") as mock_run:
+                            # Both reset-failed and start return code 0
+                            mock_run.return_value = MagicMock(returncode=0, stderr=b"")
                             from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
                             ntfy_scan_digest(state)
-        mock_popen.assert_called_once()
-        call_args = mock_popen.call_args[0][0]
-        # Verify CLI: python -m trading_agent.orchestrator --trigger=candidate_entry --ticker NVDA
-        assert "trading_agent.orchestrator" in call_args
-        assert "--trigger=candidate_entry" in call_args
-        assert "NVDA" in call_args
-        # Detached
-        assert mock_popen.call_args[1].get("start_new_session") is True
+        # Should have been called twice: reset-failed then start
+        assert mock_run.call_count == 2
+        reset_call, start_call = mock_run.call_args_list
+        assert reset_call[0][0] == [
+            "sudo", "-n", "/bin/systemctl", "reset-failed",
+            "trading-agent-candidate-entry@NVDA.service",
+        ]
+        assert start_call[0][0] == [
+            "sudo", "-n", "/bin/systemctl", "start", "--no-block",
+            "trading-agent-candidate-entry@NVDA.service",
+        ]
+
+    def test_dispatch_failed_emits_severity_2(self):
+        """systemctl start non-zero exit → dispatch_failed event, severity=2."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "NVDA", "score": 0.85, "reason": "momentum"}],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        emitted: list[dict] = []
+        with patch("trading_agent.graph.nodes.premarket_nodes.emit",
+                   side_effect=lambda **kw: emitted.append(kw)), self._patch_clean_guards():
+            with patch("trading_agent.notify.send"):
+                with patch("pathlib.Path.exists", return_value=False):
+                    with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                        with patch("subprocess.run") as mock_run:
+                            # reset-failed OK, start fails
+                            mock_run.side_effect = [
+                                MagicMock(returncode=0, stderr=b""),
+                                MagicMock(returncode=1, stderr=b"Unit not found"),
+                            ]
+                            from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                            ntfy_scan_digest(state)
+        failure_events = [e for e in emitted if e.get("event_type") == "candidate_entry_dispatch_failed"]
+        assert len(failure_events) == 1
+        assert failure_events[0]["severity"] == 2
+        assert "Unit not found" in failure_events[0]["payload"]["error"]
 
     def test_dispatch_skipped_when_already_exposed(self):
         """Same underlying already held → no dispatch."""
@@ -958,10 +1128,10 @@ class TestNtfyScanDigest:
                                                  "detail": "US.NVDA qty=1"}):
                             with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown",
                                        return_value=None):
-                                with patch("subprocess.Popen") as mock_popen:
+                                with patch("subprocess.run") as mock_popen:  # dispatch uses systemctl now
                                     from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
                                     ntfy_scan_digest(state)
-        mock_popen.assert_not_called()
+        mock_popen.assert_not_called()  # systemctl shouldn't be invoked when skipped
 
     def test_dispatch_skipped_when_in_cooldown(self):
         """Same ticker dispatched within last 7 days → no dispatch."""
@@ -978,10 +1148,10 @@ class TestNtfyScanDigest:
                                    return_value=None):
                             with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown",
                                        return_value={"last_ts": "2026-05-10T12:30Z", "age_days": 1.2}):
-                                with patch("subprocess.Popen") as mock_popen:
+                                with patch("subprocess.run") as mock_popen:  # dispatch uses systemctl now
                                     from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
                                     ntfy_scan_digest(state)
-        mock_popen.assert_not_called()
+        mock_popen.assert_not_called()  # systemctl shouldn't be invoked when skipped
 
     def test_existing_exposure_same_underlying(self):
         """Direct unit test: _existing_exposure flags same-underlying holding."""
@@ -1042,10 +1212,10 @@ class TestNtfyScanDigest:
         )
         with _patch_all_emits():
             with patch("trading_agent.notify.send"):
-                with patch("subprocess.Popen") as mock_popen:
+                with patch("subprocess.run") as mock_popen:  # dispatch uses systemctl now
                     from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
                     ntfy_scan_digest(state)
-        mock_popen.assert_not_called()
+        mock_popen.assert_not_called()  # systemctl shouldn't be invoked when skipped
 
     def test_dispatch_skipped_when_halt_flag(self):
         """Halt flag set → no dispatch even if score is high."""
@@ -1057,10 +1227,10 @@ class TestNtfyScanDigest:
         with _patch_all_emits():
             with patch("trading_agent.notify.send"):
                 with patch("pathlib.Path.exists", return_value=True):  # halt flag PRESENT
-                    with patch("subprocess.Popen") as mock_popen:
+                    with patch("subprocess.run") as mock_popen:  # dispatch uses systemctl now
                         from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
                         ntfy_scan_digest(state)
-        mock_popen.assert_not_called()
+        mock_popen.assert_not_called()  # systemctl shouldn't be invoked when skipped
 
     def test_dispatch_skipped_when_regime_blocks(self):
         """Regime gate says no new entries → no dispatch."""
@@ -1073,10 +1243,10 @@ class TestNtfyScanDigest:
             with patch("trading_agent.notify.send"):
                 with patch("pathlib.Path.exists", return_value=False):
                     with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
-                        with patch("subprocess.Popen") as mock_popen:
+                        with patch("subprocess.run") as mock_popen:  # dispatch uses systemctl now
                             from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
                             ntfy_scan_digest(state)
-        mock_popen.assert_not_called()
+        mock_popen.assert_not_called()  # systemctl shouldn't be invoked when skipped
 
     def test_dispatch_skipped_when_soak_read_only(self):
         """Soak phase READ_ONLY → no dispatch."""
@@ -1089,10 +1259,10 @@ class TestNtfyScanDigest:
             with patch("trading_agent.notify.send"):
                 with patch("pathlib.Path.exists", return_value=False):
                     with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=False):
-                        with patch("subprocess.Popen") as mock_popen:
+                        with patch("subprocess.run") as mock_popen:  # dispatch uses systemctl now
                             from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
                             ntfy_scan_digest(state)
-        mock_popen.assert_not_called()
+        mock_popen.assert_not_called()  # systemctl shouldn't be invoked when skipped
 
 
 # ---------------------------------------------------------------------------

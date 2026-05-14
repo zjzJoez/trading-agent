@@ -404,6 +404,28 @@ class OAuthLLMRouter:
                         raw = self._invoke_codex(cfg, retry_prompt, 120)
                     continue
                 log.error("[%s] schema violation after 3 attempts: %s", role, e)
+                # Emit an audit row so the healthcheck watchdog can count
+                # these across roles and fire a single coalesced ntfy alert
+                # when the rate crosses threshold. Without this, schema
+                # violations only show up in stderr — invisible to ops.
+                # Best-effort: any DB failure here must not mask the
+                # original LLMSchemaViolation raised below.
+                try:
+                    from trading_agent.events import emit as _emit
+                    _emit(
+                        run_id="oauth_router",  # no run_id available here; tag the source
+                        trigger="llm_router",
+                        agent="oauth_router",
+                        event_type="llm_schema_violation",
+                        severity=1,
+                        payload={
+                            "role": role,
+                            "channel": ROLE_CONFIG[role].channel,
+                            "error": str(e)[:300],
+                        },
+                    )
+                except Exception:
+                    pass
                 raise LLMSchemaViolation(f"role={role}: {e}") from e
         raise LLMSchemaViolation(f"role={role}: unreachable (last_err={last_err})")
 
