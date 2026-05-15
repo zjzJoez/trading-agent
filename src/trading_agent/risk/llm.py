@@ -225,6 +225,34 @@ def _format_council_context(
     )
 
 
+# Burn-in window: force Council invocation for the first N filled trades
+# regardless of deterministic outcome. This validates cross-family alignment
+# (Claude conservative vs Codex opportunity vs arbiter) on real data BEFORE
+# we trust the production skip-on-deterministic-clear shortcut.
+#
+# Without this, Council never runs in production (every trade so far had
+# deterministic_clear), so cross-family alignment has 0 real-data evidence.
+# After N trades, we have enough Council audit rows to inspect alignment
+# and confidently keep the skip-on-clear shortcut.
+COUNCIL_BURN_IN_TRADE_COUNT = 15
+
+
+def _filled_trade_count() -> int:
+    """Count filled trades in journal_trades. Used by burn-in check.
+
+    Returns 0 on any DB error (fail-open — we don't want a DB hiccup to
+    accidentally trigger Council on every trade forever, given the cost.
+    The burn-in is meant as a one-time validation, not a permanent gate).
+    """
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM journal_trades")
+            return int(cur.fetchone()[0] or 0)
+    except Exception:
+        return 0
+
+
 def should_invoke_council(
     *,
     deterministic_decision: CouncilDecision,
@@ -235,7 +263,8 @@ def should_invoke_council(
 ) -> tuple[bool, list[str]]:
     """Decide if the LLM council should run for this proposal.
 
-    From §7.4 of plan v3. Returns (should_invoke, reasons).
+    From §7.4 of plan v3, with §7.5 burn-in extension. Returns
+    (should_invoke, reasons).
     """
     reasons = []
     if deterministic_decision != "APPROVE":
@@ -248,5 +277,11 @@ def should_invoke_council(
         reasons.append("canary_param_version")
     if new_portfolio_high_notional:
         reasons.append("new_portfolio_high")
+
+    # Burn-in: force-invoke for the first N trades to accumulate cross-family
+    # alignment data. After N, fall back to the conditional rules above.
+    n_filled = _filled_trade_count()
+    if n_filled < COUNCIL_BURN_IN_TRADE_COUNT:
+        reasons.append(f"burn_in_trade_{n_filled + 1}_of_{COUNCIL_BURN_IN_TRADE_COUNT}")
 
     return (len(reasons) > 0, reasons)

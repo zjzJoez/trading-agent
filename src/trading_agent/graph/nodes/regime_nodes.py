@@ -31,6 +31,7 @@ from trading_agent.regime.llm_review import (
 )
 from trading_agent.regime.persist import (
     get_active_model,
+    get_active_model_id,
     get_latest_regime_state,
     insert_feature_snapshot,
     insert_llm_review,
@@ -317,7 +318,10 @@ def persist_regime(state: dict) -> dict:
         pred,
         as_of=snap.as_of,
         feature_snapshot_id=feature_id,
-        model_version_id=None,  # rule-based fallback for now
+        # Resolve the ACTIVE model id at persist-time so this audit row
+        # tells us which HMM produced the label. Returns None on rule-based
+        # fallback (no active model), which matches the historical default.
+        model_version_id=get_active_model_id(),
         prior_label=prior_state["label"] if prior_state else None,
         gate=gate,
     )

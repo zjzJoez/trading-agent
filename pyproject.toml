@@ -33,6 +33,10 @@ dependencies = [
     # (trailing commas, missing delimiters, unescaped newlines) before we
     # spend another LLM round-trip on a retry.
     "json-repair>=0.30.0",
+    # Phase 2.7 — historical backfill for HMM training. yfinance is the only
+    # free source that bulk-downloads 19 tickers × 8y daily in <5s; moomoo
+    # OpenD hangs on multi-year historical kline requests.
+    "yfinance>=0.2.0",
 ]
 
 [project.optional-dependencies]

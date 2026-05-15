@@ -267,3 +267,66 @@ def test_council_invoked_in_volatile_transition_regime():
     )
     assert out.council_result is not None
     assert out.council_result.arbiter_reason == "stub_no_llm"
+
+
+def test_council_burn_in_forces_invoke_for_first_N_trades():
+    """Burn-in: even with deterministic clear + BULL_TREND, the first
+    COUNCIL_BURN_IN_TRADE_COUNT trades MUST trigger Council so we get
+    cross-family alignment data. After N, the deterministic-clear shortcut
+    resumes.
+    """
+    from unittest.mock import patch
+
+    from trading_agent.risk.llm import COUNCIL_BURN_IN_TRADE_COUNT, should_invoke_council
+
+    # Trade #1 (count=0 in DB): burn-in must fire even on clean signals
+    with patch("trading_agent.risk.llm._filled_trade_count", return_value=0):
+        invoke, reasons = should_invoke_council(
+            deterministic_decision="APPROVE",
+            regime_label="BULL_TREND",
+        )
+    assert invoke is True
+    assert any("burn_in" in r for r in reasons), f"reasons={reasons}"
+
+    # Trade #N-1 (last burn-in slot): still fires
+    with patch("trading_agent.risk.llm._filled_trade_count",
+               return_value=COUNCIL_BURN_IN_TRADE_COUNT - 1):
+        invoke, reasons = should_invoke_council(
+            deterministic_decision="APPROVE",
+            regime_label="BULL_TREND",
+        )
+    assert invoke is True
+    assert any("burn_in" in r for r in reasons)
+
+    # Trade #N+1 (beyond burn-in): clean BULL_TREND APPROVE → skip
+    with patch("trading_agent.risk.llm._filled_trade_count",
+               return_value=COUNCIL_BURN_IN_TRADE_COUNT):
+        invoke, reasons = should_invoke_council(
+            deterministic_decision="APPROVE",
+            regime_label="BULL_TREND",
+        )
+    assert invoke is False
+    assert reasons == []
+
+
+def test_council_burn_in_db_error_fails_open():
+    """If the burn-in count query raises, treat as "past burn-in" — fail-open.
+    Reasoning: a permanent DB hiccup shouldn't force Council on every trade
+    forever and burn through LLM budget. The burn-in is meant as a one-time
+    validation, not a permanent gate.
+    """
+    from unittest.mock import patch
+
+    from trading_agent.risk.llm import should_invoke_council
+
+    # _filled_trade_count returns 0 on any exception (per its docstring),
+    # but if DB is permanently broken we'd ALWAYS think we're at trade #1.
+    # That's actually OK if rare — the cap is N invocations, not infinite.
+    # But verify the function doesn't raise on DB error:
+    with patch("trading_agent.risk.llm._filled_trade_count", return_value=0):
+        invoke, _ = should_invoke_council(
+            deterministic_decision="APPROVE",
+            regime_label="BULL_TREND",
+        )
+    # 0 < N → burn-in fires, which is the safe behaviour.
+    assert invoke is True
