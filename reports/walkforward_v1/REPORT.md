@@ -1,5 +1,12 @@
 # OOS Walk-Forward Backtest v1 — Honest Findings
 
+> **Update 2026-05-16:** This v1 used a narrow 2-year test window and is
+> superseded by v2 (`../walkforward_v2/REPORT.md`, 1362-day test including
+> 2022 bear) and v3 (`../walkforward_v3_rolling/REPORT.md`, rolling
+> walk-forward over 2017-2026, 2367 OOS days). The v3 numbers are the
+> credible read; this v1 document is preserved as the first-pass record.
+
+
 **Date run:** 2026-05-16  
 **Backtest HMM:** `regime_model_versions.id=2`, status=shadow  
 **Train window:** 2015-03-31 → 2023-12-29 (2204 snapshots, cutoff 2023-12-31)  

@@ -1,0 +1,28 @@
+{
+  "hmm_id": 3,
+  "hmm_train_window": [
+    "2015-03-31",
+    "2020-12-31"
+  ],
+  "test_start": "2021-01-01",
+  "test_end": "2026-05-15",
+  "n_test_days": 1362,
+  "n_days_with_full_forward": 1360,
+  "regime_count": {
+    "BEAR_TREND": 1151,
+    "BULL_TREND": 151,
+    "CRISIS": 9,
+    "VOLATILE_TRANSITION": 51
+  },
+  "cum_strategy_ret": 0.42985,
+  "cum_spy_ret": 1.049561,
+  "strategy_sharpe_annualized": 0.8006,
+  "spy_sharpe_annualized": 0.8739,
+  "strategy_max_drawdown": -0.130401,
+  "interpretation_caveats": [
+    "Strategy = size_mult(label(d)) * SPY_next_1d_ret, compounded daily.",
+    "This is NOT a tradeable PnL \u2014 no costs, slippage, options pricing, or position sizing.",
+    "Only validates Layer 0 + Layer 1 + gate sizing. LLM trader/debate/council NOT tested.",
+    "Single-asset proxy (SPY long). Real system trades options on individual tickers."
+  ]
+}
