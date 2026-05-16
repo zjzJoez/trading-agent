@@ -1,0 +1,368 @@
+{
+  "seed": 99,
+  "first_year": 2017,
+  "last_year": 2026,
+  "n_test_days": 2369,
+  "n_with_full_forward": 2367,
+  "cum_strategy_ret": 0.748833,
+  "cum_spy_ret": 2.618353,
+  "strategy_sharpe_annualized": 0.7712,
+  "spy_sharpe_annualized": 0.8409,
+  "sharpe_se_rough": 0.326,
+  "strategy_max_drawdown": -0.130401,
+  "avg_size_mult": 0.5048,
+  "cov_type": "diag",
+  "min_covar": 0.001,
+  "audits_per_year": [
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": 0.04245646875508984,
+          "n": 85
+        },
+        "1": {
+          "mean_spy_ret_20": -0.04883293246448847,
+          "n": 60
+        },
+        "2": {
+          "mean_spy_ret_20": -0.004439317413482516,
+          "n": 137
+        },
+        "3": {
+          "mean_spy_ret_20": 0.015360457955379138,
+          "n": 162
+        }
+      },
+      "state_to_label": {
+        "1": "BEAR_TREND",
+        "2": "VOLATILE_TRANSITION",
+        "3": "VOLATILE_TRANSITION",
+        "0": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        1,
+        2,
+        3,
+        0
+      ],
+      "year": 2017,
+      "n_train": 444,
+      "seed": 99
+    },
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": 0.019629475431442136,
+          "n": 265
+        },
+        "1": {
+          "mean_spy_ret_20": -0.03290910810788096,
+          "n": 93
+        },
+        "2": {
+          "mean_spy_ret_20": 0.03256568790961325,
+          "n": 114
+        },
+        "3": {
+          "mean_spy_ret_20": 0.0023414887621187983,
+          "n": 223
+        }
+      },
+      "state_to_label": {
+        "1": "BEAR_TREND",
+        "3": "VOLATILE_TRANSITION",
+        "0": "VOLATILE_TRANSITION",
+        "2": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        1,
+        3,
+        0,
+        2
+      ],
+      "year": 2018,
+      "n_train": 695,
+      "seed": 99
+    },
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": 0.021238522383743807,
+          "n": 349
+        },
+        "1": {
+          "mean_spy_ret_20": 0.0055249709913840735,
+          "n": 305
+        },
+        "2": {
+          "mean_spy_ret_20": -0.04155808398640997,
+          "n": 170
+        },
+        "3": {
+          "mean_spy_ret_20": 0.034378707881034885,
+          "n": 122
+        }
+      },
+      "state_to_label": {
+        "2": "BEAR_TREND",
+        "1": "VOLATILE_TRANSITION",
+        "0": "VOLATILE_TRANSITION",
+        "3": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        2,
+        1,
+        0,
+        3
+      ],
+      "year": 2019,
+      "n_train": 946,
+      "seed": 99
+    },
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": -0.03773852410597702,
+          "n": 218
+        },
+        "1": {
+          "mean_spy_ret_20": 0.023230018631998167,
+          "n": 424
+        },
+        "2": {
+          "mean_spy_ret_20": 0.0032041086441659205,
+          "n": 330
+        },
+        "3": {
+          "mean_spy_ret_20": 0.036905634371225744,
+          "n": 226
+        }
+      },
+      "state_to_label": {
+        "0": "BEAR_TREND",
+        "2": "VOLATILE_TRANSITION",
+        "1": "VOLATILE_TRANSITION",
+        "3": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        0,
+        2,
+        1,
+        3
+      ],
+      "year": 2020,
+      "n_train": 1198,
+      "seed": 99
+    },
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": -0.025345907868768728,
+          "n": 372
+        },
+        "1": {
+          "mean_spy_ret_20": 0.018284623131735817,
+          "n": 784
+        },
+        "2": {
+          "mean_spy_ret_20": -0.04850562309339454,
+          "n": 42
+        },
+        "3": {
+          "mean_spy_ret_20": 0.04955570395671773,
+          "n": 253
+        }
+      },
+      "state_to_label": {
+        "2": "BEAR_TREND",
+        "0": "VOLATILE_TRANSITION",
+        "1": "VOLATILE_TRANSITION",
+        "3": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        2,
+        0,
+        1,
+        3
+      ],
+      "year": 2021,
+      "n_train": 1451,
+      "seed": 99
+    },
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": 0.03638797903697917,
+          "n": 532
+        },
+        "1": {
+          "mean_spy_ret_20": -0.02274946513762549,
+          "n": 205
+        },
+        "2": {
+          "mean_spy_ret_20": -0.009907956307053975,
+          "n": 479
+        },
+        "3": {
+          "mean_spy_ret_20": 0.021746999961471922,
+          "n": 487
+        }
+      },
+      "state_to_label": {
+        "1": "BEAR_TREND",
+        "2": "VOLATILE_TRANSITION",
+        "3": "VOLATILE_TRANSITION",
+        "0": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        1,
+        2,
+        3,
+        0
+      ],
+      "year": 2022,
+      "n_train": 1703,
+      "seed": 99
+    },
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": 0.018917095550524902,
+          "n": 865
+        },
+        "1": {
+          "mean_spy_ret_20": -0.03866925349233626,
+          "n": 466
+        },
+        "2": {
+          "mean_spy_ret_20": 0.03574612558552698,
+          "n": 537
+        },
+        "3": {
+          "mean_spy_ret_20": 0.0012451999973260672,
+          "n": 86
+        }
+      },
+      "state_to_label": {
+        "1": "BEAR_TREND",
+        "3": "VOLATILE_TRANSITION",
+        "0": "VOLATILE_TRANSITION",
+        "2": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        1,
+        3,
+        0,
+        2
+      ],
+      "year": 2023,
+      "n_train": 1954,
+      "seed": 99
+    },
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": 0.041126613039575356,
+          "n": 532
+        },
+        "1": {
+          "mean_spy_ret_20": -0.03468554199910631,
+          "n": 563
+        },
+        "2": {
+          "mean_spy_ret_20": 0.01895797822674838,
+          "n": 1021
+        },
+        "3": {
+          "mean_spy_ret_20": 0.0009875925045311838,
+          "n": 88
+        }
+      },
+      "state_to_label": {
+        "1": "BEAR_TREND",
+        "3": "VOLATILE_TRANSITION",
+        "2": "VOLATILE_TRANSITION",
+        "0": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        1,
+        3,
+        2,
+        0
+      ],
+      "year": 2024,
+      "n_train": 2204,
+      "seed": 99
+    },
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": 0.04270971751895343,
+          "n": 530
+        },
+        "1": {
+          "mean_spy_ret_20": -0.008430912534215022,
+          "n": 735
+        },
+        "2": {
+          "mean_spy_ret_20": 0.026131366107344803,
+          "n": 855
+        },
+        "3": {
+          "mean_spy_ret_20": -0.03458464800429221,
+          "n": 336
+        }
+      },
+      "state_to_label": {
+        "3": "BEAR_TREND",
+        "1": "VOLATILE_TRANSITION",
+        "2": "VOLATILE_TRANSITION",
+        "0": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        3,
+        1,
+        2,
+        0
+      ],
+      "year": 2025,
+      "n_train": 2456,
+      "seed": 99
+    },
+    {
+      "state_metrics": {
+        "0": {
+          "mean_spy_ret_20": -0.03786632025533303,
+          "n": 348
+        },
+        "1": {
+          "mean_spy_ret_20": 0.026324966545025533,
+          "n": 1096
+        },
+        "2": {
+          "mean_spy_ret_20": 0.04436965712851638,
+          "n": 495
+        },
+        "3": {
+          "mean_spy_ret_20": -0.009595150827313052,
+          "n": 767
+        }
+      },
+      "state_to_label": {
+        "0": "BEAR_TREND",
+        "3": "VOLATILE_TRANSITION",
+        "1": "VOLATILE_TRANSITION",
+        "2": "BULL_TREND"
+      },
+      "ranked_states_low_to_high_spy_ret": [
+        0,
+        3,
+        1,
+        2
+      ],
+      "year": 2026,
+      "n_train": 2706,
+      "seed": 99
+    }
+  ]
+}

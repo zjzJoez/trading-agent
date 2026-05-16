@@ -1,5 +1,12 @@
 # Walk-Forward Backtest v2 — Earlier Cutoff (Train 2015-2020, Test 2021-2026)
 
+> **Superseded 2026-05-17:** This run used the buggy feature schema
+> (binary `spy_above_*dma`) and `covariance_type='full'`, both of which
+> prevent EM convergence. The HMM aborted at iter 3 every time. See
+> `../walkforward_v4_converged/REPORT.md` for results from the
+> properly-fit model. Do not cite the per-regime numbers below.
+
+
 **Date run:** 2026-05-16  
 **Backtest HMM:** `regime_model_versions.id=3`, status=shadow  
 **Train window:** 2015-03-31 → 2020-12-31 (1451 snapshots)  

@@ -109,12 +109,24 @@ def load_features_matrix(
 
 
 def fit_hmm(features_df: pd.DataFrame, n_states: int = 4, n_iter: int = 200,
-            random_state: int = 42) -> tuple[GaussianHMM, np.ndarray, np.ndarray]:
+            random_state: int = 42, cov_type: str = "diag",
+            min_covar: float = 1e-3) -> tuple[GaussianHMM, np.ndarray, np.ndarray]:
     """Standardize features, fit HMM, return (model, feature_means, feature_stds).
 
     Standardization is critical: feature scales differ wildly (spy_ret_20 ∈
     [-0.3, 0.3], vix_level ∈ [10, 80]). Without it, vix_level dominates the
     Mahalanobis distance and the HMM collapses to vol-only states.
+
+    cov_type default: 'diag' (not 'full'). Full-covariance with 17 features
+    repeatedly broke EM convergence in v1/v2/v3 (log-likelihood would
+    decrease after iter 2-3, abort). Diagonal covariance is standard in
+    finance regime-HMM literature (Hamilton 1989, Ang & Bekaert 2002): per-
+    state feature means are the dominant signal; the inter-feature
+    covariance is hard to estimate with limited regime samples.
+
+    min_covar default: 1e-3 (hmmlearn default). Larger values regularize the
+    emission covariance, preventing collapse to a point mass; bump to 1e-2
+    or 5e-3 if EM still doesn't converge on `diag`.
     """
     X = features_df.values
     means = X.mean(axis=0)
@@ -122,15 +134,16 @@ def fit_hmm(features_df: pd.DataFrame, n_states: int = 4, n_iter: int = 200,
     stds[stds == 0] = 1.0  # avoid /0 on constant features
     Z = (X - means) / stds
 
-    log.info("Fitting GaussianHMM: n_states=%d, n_features=%d, n_obs=%d",
-             n_states, Z.shape[1], Z.shape[0])
+    log.info("Fitting GaussianHMM: n_states=%d, n_features=%d, n_obs=%d, cov=%s, min_covar=%g",
+             n_states, Z.shape[1], Z.shape[0], cov_type, min_covar)
 
     model = GaussianHMM(
         n_components=n_states,
-        covariance_type="full",
+        covariance_type=cov_type,
         n_iter=n_iter,
         random_state=random_state,
         tol=1e-4,
+        min_covar=min_covar,
         verbose=False,
     )
     model.fit(Z)
@@ -234,11 +247,28 @@ def serialize_hmm(model: GaussianHMM, feature_means: np.ndarray,
         # validates this dict isn't all-placeholder before INSERTing ACTIVE.
         state_to_label = {i: "VOLATILE_TRANSITION" for i in range(model.n_components)}
 
+    # Normalize covariance to (n_states, n_features, n_features) full-matrix
+    # form so the inference path (_gaussian_logpdf in classifier.py) doesn't
+    # need to know whether the model was fit with diag or full covariance.
+    # For 'diag', the n×d entries from covars_ become n diagonal matrices.
+    covars_array = np.asarray(model.covars_)
+    if covars_array.ndim == 2:
+        # 'diag' shape: (n_states, n_features) → build (n_states, d, d)
+        n = covars_array.shape[0]
+        d = covars_array.shape[1]
+        covars_full = np.zeros((n, d, d), dtype=float)
+        for i in range(n):
+            np.fill_diagonal(covars_full[i], covars_array[i])
+    elif covars_array.ndim == 3:
+        covars_full = covars_array
+    else:
+        raise ValueError(f"Unexpected covars_ shape: {covars_array.shape}")
+
     return HMMModel(
         n_states=int(model.n_components),
         feature_order=list(HMM_FEATURE_ORDER),
         means=model.means_.tolist(),
-        covars=model.covars_.tolist(),
+        covars=covars_full.tolist(),
         transmat=model.transmat_.tolist(),
         startprob=model.startprob_.tolist(),
         feature_means=feature_means.tolist(),
@@ -253,6 +283,12 @@ def main():
     p.add_argument("--n-states", type=int, default=4)
     p.add_argument("--n-iter", type=int, default=200)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--cov-type", default="diag", choices=["diag", "full", "spherical", "tied"],
+                   help="Emission covariance structure. 'diag' (default) is "
+                        "standard for finance regime HMMs and avoids the "
+                        "ill-conditioning that caused EM divergence in earlier runs.")
+    p.add_argument("--min-covar", type=float, default=1e-3,
+                   help="Lower bound on emission covariance diagonal (regularization).")
     p.add_argument("--out", default="/tmp/hmm_v1.json",
                    help="Output path for serialized HMM (NO DB write)")
     p.add_argument("--fingerprint-out", default="/tmp/hmm_fingerprint.json",
@@ -281,8 +317,10 @@ def main():
         log.info("Cutoff applied: train_end_date=%s (rows after this are reserved "
                  "for out-of-sample evaluation)", args.train_end_date)
 
-    model, means, stds = fit_hmm(df, n_states=args.n_states,
-                                  n_iter=args.n_iter, random_state=args.seed)
+    model, means, stds = fit_hmm(
+        df, n_states=args.n_states, n_iter=args.n_iter,
+        random_state=args.seed, cov_type=args.cov_type, min_covar=args.min_covar,
+    )
 
     fp = fingerprint(model, df, means, stds)
 
@@ -303,8 +341,11 @@ def main():
         print(f"  spy_ret_20={f['spy_ret_20']:+.3f}  "
               f"spy_rv_20={f['spy_rv_20']:.3f}  "
               f"vix_level={f['vix_level']:.1f}")
-        print(f"  spy_above_50dma={f['spy_above_50dma']:.2f}  "
-              f"spy_above_200dma={f['spy_above_200dma']:.2f}  "
+        # Print whichever of the binary/continuous MA-distance keys are present.
+        dma_50 = f.get('spy_dist_50dma', f.get('spy_above_50dma', 0.0))
+        dma_200 = f.get('spy_dist_200dma', f.get('spy_above_200dma', 0.0))
+        print(f"  spy_dist_50dma={dma_50:+.3f}  "
+              f"spy_dist_200dma={dma_200:+.3f}  "
               f"breadth={f['breadth_above_20dma_pct']:.2f}")
         print(f"  avg_pairwise_corr_20={f['avg_pairwise_corr_20']:.2f}  "
               f"vix_chg_5={f['vix_chg_5']:+.1f}  "

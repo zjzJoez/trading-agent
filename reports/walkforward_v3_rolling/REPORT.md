@@ -1,5 +1,15 @@
 # Rolling Walk-Forward Backtest v3 — Properly OOS Across 2017-2026
 
+> **Superseded 2026-05-17:** The headline "Sharpe 1.02 vs SPY 0.84 (+0.18 edge)"
+> below was a **broken-model artifact**. The HMM aborted EM at iter 3-4
+> in every annual refit (binary features × full covariance → singularity);
+> the single seed=42 + non-converged means/covars happened to produce
+> labels that on this OOS window slightly beat SPY by chance. With
+> continuous features + diag covariance + 5 seeds, Sharpe is **0.78 ± 0.015,
+> a slight DISADVANTAGE vs SPY 0.84** — see `../walkforward_v4_converged/REPORT.md`.
+> Do not cite the v3 numbers as evidence of system alpha.
+
+
 **Date run:** 2026-05-16  
 **Method:** 10 annual refits. For each year Y ∈ [2017, 2026], train a
 fresh 4-state HMM on all snapshots with as_of < Y-01-01, auto-calibrate

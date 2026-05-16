@@ -1,0 +1,5 @@
+label,n_days,mean_fwd_20d,neg_rate_fwd_20d,uncond_mean_20d,uncond_neg_rate,hit_rate_sign_match,conditional_sharpe,size_mult
+BEAR_TREND,449,0.026834,0.1871,0.01233,0.3015,0.1871,2.1051,0.5
+BULL_TREND,91,0.011136,0.3187,0.01233,0.3015,0.6813,1.1292,1.0
+CRISIS,51,0.061493,0.1569,0.01233,0.3015,,2.34,0.0
+VOLATILE_TRANSITION,1778,0.00722,0.3343,0.01233,0.3015,,0.6031,0.5

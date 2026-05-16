@@ -100,12 +100,20 @@ def load_snapshots_range(start: str | None, end: str | None) -> list[tuple[datet
 
 
 def train_hmm_for_year(training_snaps: list[tuple[datetime, FeatureSnapshot]],
-                       n_states: int, seed: int) -> tuple[HMMModel, dict]:
+                       n_states: int, seed: int,
+                       cov_type: str = "diag",
+                       min_covar: float = 1e-3) -> tuple[HMMModel, dict]:
     """Fit a fresh HMM on `training_snaps` and auto-calibrate state labels.
 
     Returns (HMMModel, calibration_audit_dict). The audit dict records
     per-state mean spy_ret_20 + assigned label so we can verify the
     calibration was sane.
+
+    cov_type: 'diag' is now the default (was 'full' in earlier runs).
+    'full' covariance + 17 features + ~250-2700 obs/year caused hmmlearn
+    to abort EM at iter 3-4 (log-likelihood decreasing) in every annual
+    refit. 'diag' is standard in finance regime-HMM literature and is
+    numerically stable.
     """
     from hmmlearn.hmm import GaussianHMM
     # Build feature matrix
@@ -119,8 +127,9 @@ def train_hmm_for_year(training_snaps: list[tuple[datetime, FeatureSnapshot]],
     Z = (X - means) / stds
 
     model = GaussianHMM(
-        n_components=n_states, covariance_type="full",
+        n_components=n_states, covariance_type=cov_type,
         n_iter=200, random_state=seed, tol=1e-4,
+        min_covar=min_covar,
     )
     model.fit(Z)
     states = model.predict(Z)
@@ -149,17 +158,29 @@ def train_hmm_for_year(training_snaps: list[tuple[datetime, FeatureSnapshot]],
         else:
             state_to_label[s] = "VOLATILE_TRANSITION"
 
+    # Normalize covars to (n_states, d, d) full-matrix form regardless of
+    # cov_type, so the inference path doesn't need to know how we fit it.
+    covars_arr = np.asarray(model.covars_)
+    if covars_arr.ndim == 2:  # diag
+        n_st = covars_arr.shape[0]
+        d_ = covars_arr.shape[1]
+        covars_full = np.zeros((n_st, d_, d_), dtype=float)
+        for i in range(n_st):
+            np.fill_diagonal(covars_full[i], covars_arr[i])
+    else:
+        covars_full = covars_arr
+
     hmm = HMMModel(
         n_states=int(model.n_components),
         feature_order=list(HMM_FEATURE_ORDER),
         means=model.means_.tolist(),
-        covars=model.covars_.tolist(),
+        covars=covars_full.tolist(),
         transmat=model.transmat_.tolist(),
         startprob=model.startprob_.tolist(),
         feature_means=means.tolist(),
         feature_stds=stds.tolist(),
         state_to_label=state_to_label,
-        train_meta={"n_obs": len(valid)},
+        train_meta={"n_obs": len(valid), "cov_type": cov_type, "seed": seed},
     )
     audit = {
         "state_metrics": state_metrics,
@@ -190,24 +211,13 @@ def fwd_return(rets: pd.Series, day, horizon: int) -> float:
     return float((1.0 + take).prod() - 1.0)
 
 
-def main():
-    p = argparse.ArgumentParser("rolling_walkforward")
-    p.add_argument("--first-year", type=int, default=2017,
-                   help="First test year (training uses everything before "
-                        "Jan 1 of this year). Earlier than 2017 means too "
-                        "few training samples (HMM convergence issues).")
-    p.add_argument("--last-year", type=int, default=2026)
-    p.add_argument("--n-states", type=int, default=4)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out-dir", required=True)
-    p.add_argument("--verbose", action="store_true")
-    args = p.parse_args()
+def run_one_seed(args, seed: int, out_dir: Path, spy_rets_cache: pd.Series | None) -> dict:
+    """Run a full rolling walk-forward for a single seed, writing artifacts
+    into `out_dir`. Returns a headline-metrics dict suitable for aggregation.
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
+    `spy_rets_cache` lets the caller pre-fetch yfinance once and reuse across
+    seeds — saves ~5s × n_seeds.
+    """
     all_preds = []
     audits = []
     prior_label_by_year_end = None
@@ -217,28 +227,28 @@ def main():
         test_start = f"{year}-01-01"
         test_end = f"{year + 1}-01-01"
 
-        log.info("--- Year %d ---", year)
-        log.info("Training on < %s", train_end)
+        log.info("[seed=%d] --- Year %d ---", seed, year)
         train_snaps = load_snapshots_range(None, train_end)
         if len(train_snaps) < 200:
             log.warning("Skipping year %d: only %d training snapshots", year, len(train_snaps))
             continue
-        log.info("Training snapshots: %d", len(train_snaps))
 
         try:
-            hmm, audit = train_hmm_for_year(train_snaps, args.n_states, args.seed)
+            hmm, audit = train_hmm_for_year(
+                train_snaps, args.n_states, seed,
+                cov_type=args.cov_type, min_covar=args.min_covar,
+            )
         except Exception as e:
-            log.error("Failed to train HMM for year %d: %s", year, e)
+            log.error("Failed to train HMM for year %d (seed=%d): %s", year, seed, e)
             continue
 
         audit["year"] = year
         audit["n_train"] = len(train_snaps)
+        audit["seed"] = seed
         audits.append(audit)
         log.info("  State→label: %s", audit["state_to_label"])
 
-        log.info("Classifying year %d [%s, %s)", year, test_start, test_end)
         test_snaps = load_snapshots_range(test_start, test_end)
-        log.info("Test snapshots: %d", len(test_snaps))
         if not test_snaps:
             continue
 
@@ -261,24 +271,30 @@ def main():
         prior_label_by_year_end = prior_label
 
     if not all_preds:
-        log.error("No predictions produced — check first_year/last_year and snapshots")
-        sys.exit(1)
+        raise RuntimeError(f"No predictions for seed={seed}")
 
     df = pd.DataFrame(all_preds)
     df["as_of"] = pd.to_datetime(df["as_of"]).dt.date
 
-    # Forward returns across the whole OOS range
-    log.info("Fetching SPY forward returns…")
-    rets = yfinance_spy_returns(df["as_of"].min(), df["as_of"].max())
+    rets = spy_rets_cache if spy_rets_cache is not None else \
+        yfinance_spy_returns(df["as_of"].min(), df["as_of"].max())
     df["fwd_1d_ret"] = df["as_of"].apply(lambda d: fwd_return(rets, d, 1))
     df["fwd_5d_ret"] = df["as_of"].apply(lambda d: fwd_return(rets, d, 5))
     df["fwd_20d_ret"] = df["as_of"].apply(lambda d: fwd_return(rets, d, 20))
 
-    out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out / "rolling_per_day.csv", index=False)
-    log.info("Wrote %s (%d rows across %d years)",
-             out / "rolling_per_day.csv", len(df), df["test_year"].nunique())
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / "rolling_per_day.csv", index=False)
+
+    return _compute_headline_metrics(df, audits, args, out_dir, seed)
+
+
+def _compute_headline_metrics(df: pd.DataFrame, audits: list[dict],
+                              args, out_dir: Path, seed: int) -> dict:
+    """Compute and write per-regime + per-year + headline JSON for one seed."""
+
+    out = out_dir  # alias for the rest of the function
+    log.info("[seed=%d] Wrote %s (%d rows across %d years)",
+             seed, out / "rolling_per_day.csv", len(df), df["test_year"].nunique())
 
     # Per-regime aggregates (across the whole OOS series)
     by_regime = []
@@ -351,6 +367,7 @@ def main():
     cum_curve = (1.0 + strat).cumprod()
     mdd = float((cum_curve / cum_curve.cummax() - 1.0).min())
     headline = {
+        "seed": seed,
         "first_year": args.first_year,
         "last_year": args.last_year,
         "n_test_days": len(df),
@@ -362,19 +379,109 @@ def main():
         "sharpe_se_rough": round(1.0 / math.sqrt(len(valid_h)) * math.sqrt(252), 3),
         "strategy_max_drawdown": round(mdd, 6),
         "avg_size_mult": round(float(df["size_mult"].mean()), 4),
+        "cov_type": args.cov_type,
+        "min_covar": args.min_covar,
         "audits_per_year": audits,
     }
     (out / "rolling_headline.json").write_text(json.dumps(headline, indent=2, default=str))
 
-    print("\n" + "=" * 72)
-    print(f"ROLLING WALK-FORWARD — {args.first_year} to {args.last_year}")
-    print(f"OOS days: {len(df)} across {df['test_year'].nunique()} year(s)")
-    print(f"Strategy cum return: {cum_strat:+.2%}  SPY: {cum_spy:+.2%}")
-    print(f"Strategy Sharpe:     {sr:.2f}          SPY: {ssr:.2f}")
-    print(f"Max DD:              {mdd:.2%}")
-    print(f"Avg size_mult:       {df['size_mult'].mean():.3f}")
-    print("=" * 72)
-    print(f"\nArtifacts in: {out}")
+    print(f"[seed={seed}] strat_cum={cum_strat:+.2%}  spy_cum={cum_spy:+.2%}  "
+          f"strat_sharpe={sr:.2f}  spy_sharpe={ssr:.2f}  mdd={mdd:.2%}")
+    return headline
+
+
+def main():
+    """Single-seed or multi-seed rolling walk-forward dispatcher."""
+    p = argparse.ArgumentParser("rolling_walkforward")
+    p.add_argument("--first-year", type=int, default=2017)
+    p.add_argument("--last-year", type=int, default=2026)
+    p.add_argument("--n-states", type=int, default=4)
+    p.add_argument("--seed", type=int, default=42,
+                   help="Single seed (used unless --seeds is given)")
+    p.add_argument("--seeds", type=str, default=None,
+                   help="Comma-separated list (e.g. '42,7,99,123,2026') for "
+                        "multi-seed stability test. Overrides --seed.")
+    p.add_argument("--cov-type", default="diag", choices=["diag", "full", "spherical", "tied"])
+    p.add_argument("--min-covar", type=float, default=1e-3)
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--verbose", action="store_true")
+    args = p.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    base_out = Path(args.out_dir)
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else [args.seed]
+
+    # Pre-fetch SPY returns ONCE across all seeds — same data, no point re-fetching
+    log.info("Pre-fetching SPY forward returns (shared across seeds)…")
+    # We don't know the exact test range until after first seed runs, so use a
+    # generous date window covering all expected test years
+    from datetime import date
+    spy_rets = yfinance_spy_returns(
+        date(args.first_year, 1, 1),
+        date(min(args.last_year + 1, 2099), 12, 31),
+    )
+
+    headlines = []
+    for seed in seeds:
+        seed_dir = base_out / f"seed_{seed}" if len(seeds) > 1 else base_out
+        hl = run_one_seed(args, seed, seed_dir, spy_rets)
+        headlines.append(hl)
+
+    if len(seeds) > 1:
+        # Multi-seed aggregate
+        summary_rows = []
+        for hl in headlines:
+            summary_rows.append({
+                "seed": hl["seed"],
+                "cum_strategy_ret": hl["cum_strategy_ret"],
+                "cum_spy_ret": hl["cum_spy_ret"],
+                "strategy_sharpe": hl["strategy_sharpe_annualized"],
+                "spy_sharpe": hl["spy_sharpe_annualized"],
+                "max_drawdown": hl["strategy_max_drawdown"],
+                "avg_size_mult": hl["avg_size_mult"],
+            })
+        summary_df = pd.DataFrame(summary_rows)
+        # mean ± std row
+        stats_row = {
+            "seed": "mean ± std",
+            "cum_strategy_ret": f"{summary_df['cum_strategy_ret'].mean():.4f} ± {summary_df['cum_strategy_ret'].std():.4f}",
+            "cum_spy_ret": f"{summary_df['cum_spy_ret'].mean():.4f}",  # same across seeds
+            "strategy_sharpe": f"{summary_df['strategy_sharpe'].mean():.4f} ± {summary_df['strategy_sharpe'].std():.4f}",
+            "spy_sharpe": f"{summary_df['spy_sharpe'].mean():.4f}",
+            "max_drawdown": f"{summary_df['max_drawdown'].mean():.4f} ± {summary_df['max_drawdown'].std():.4f}",
+            "avg_size_mult": f"{summary_df['avg_size_mult'].mean():.4f} ± {summary_df['avg_size_mult'].std():.4f}",
+        }
+        summary_df.to_csv(base_out / "rolling_seed_summary.csv", index=False)
+        with open(base_out / "rolling_seed_aggregate.json", "w") as f:
+            json.dump({
+                "seeds": seeds,
+                "n_seeds": len(seeds),
+                "cum_strategy_ret_mean": float(summary_df["cum_strategy_ret"].mean()),
+                "cum_strategy_ret_std": float(summary_df["cum_strategy_ret"].std()),
+                "strategy_sharpe_mean": float(summary_df["strategy_sharpe"].mean()),
+                "strategy_sharpe_std": float(summary_df["strategy_sharpe"].std()),
+                "spy_sharpe": float(summary_df["spy_sharpe"].mean()),
+                "max_drawdown_mean": float(summary_df["max_drawdown"].mean()),
+                "max_drawdown_std": float(summary_df["max_drawdown"].std()),
+                "avg_size_mult_mean": float(summary_df["avg_size_mult"].mean()),
+                "per_seed": summary_rows,
+            }, f, indent=2)
+        print("\n" + "=" * 72)
+        print(f"MULTI-SEED STABILITY — {len(seeds)} seeds: {seeds}")
+        print("=" * 72)
+        print(summary_df.to_string(index=False))
+        print(f"\nStrategy Sharpe across seeds: "
+              f"mean={summary_df['strategy_sharpe'].mean():.3f}  "
+              f"std={summary_df['strategy_sharpe'].std():.3f}")
+        print(f"SPY Sharpe (baseline, same for all seeds): "
+              f"{summary_df['spy_sharpe'].mean():.3f}")
+        print(f"\nArtifacts: {base_out}")
 
 
 if __name__ == "__main__":

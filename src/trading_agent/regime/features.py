@@ -86,9 +86,22 @@ class FeatureSnapshot:
 
 
 # Order matters — HMM emission means/covars are stored aligned with this.
+# IMPORTANT: As of 2026-05-17, the binary `spy_above_*dma` features were
+# replaced with continuous `spy_dist_*dma` ((price - MA) / MA). Binary
+# features made the 17×17 full-covariance emission matrix ill-conditioned,
+# causing hmmlearn to abort EM at iter 3-4 with log-likelihood decreasing.
+# Continuous versions preserve all the information (sign(dist) == above_ma)
+# and add the magnitude signal "how far above/below the MA" which is itself
+# a useful regime indicator.
+#
+# Old HMM models (regime_model_versions id=1,2,3) still embed the OLD
+# feature_order via HMMModel.feature_order; they continue to work as long
+# as snapshots also contain `spy_above_*dma` keys (which features.py still
+# writes). When loading an old model, FeatureSnapshot.as_vector() uses
+# HMM_FEATURE_ORDER from the loaded model, not this module-level constant.
 HMM_FEATURE_ORDER = [
     "spy_ret_5", "spy_ret_20", "spy_ret_60",
-    "spy_above_50dma", "spy_above_200dma",
+    "spy_dist_50dma", "spy_dist_200dma",   # was: spy_above_50dma / spy_above_200dma
     "spy_rv_20", "spy_rv_60",
     "vix_level", "vix_chg_5", "vix_pctl_252",
     "breadth_above_20dma_pct",
@@ -124,11 +137,33 @@ def _realized_vol(s: pd.Series, n: int) -> float:
 
 
 def _above_ma(s: pd.Series, n: int) -> float:
-    """1.0 if last price > simple MA(n); 0.0 otherwise. -1 if insufficient data."""
+    """1.0 if last price > simple MA(n); 0.0 otherwise. -1 if insufficient data.
+
+    Kept for backwards compat / inspection. NOT used in HMM_FEATURE_ORDER
+    anymore — see `_dist_from_ma`. The binary form causes ill-conditioning
+    in the full-covariance HMM emission (column variance is too small,
+    EM optimizer aborts at iter 3-4).
+    """
     if s is None or len(s) < n:
         return 0.0
     ma = s.iloc[-n:].mean()
     return 1.0 if s.iloc[-1] > ma else 0.0
+
+
+def _dist_from_ma(s: pd.Series, n: int) -> float:
+    """Continuous: (last_price - MA(n)) / MA(n). Sign matches `_above_ma`,
+    but with magnitude so the HMM sees a real-valued feature instead of a
+    binary one. Returns 0.0 (neutral) on insufficient data.
+    """
+    if s is None or len(s) < n:
+        return 0.0
+    ma = float(s.iloc[-n:].mean())
+    if ma == 0 or math.isnan(ma):
+        return 0.0
+    last = float(s.iloc[-1])
+    if math.isnan(last):
+        return 0.0
+    return (last - ma) / ma
 
 
 def _percentile(value: float, history: pd.Series) -> float:
@@ -211,14 +246,21 @@ def build_feature_snapshot(
         feats["spy_ret_5"] = _ret(spy_close, WIN_SHORT)
         feats["spy_ret_20"] = _ret(spy_close, WIN_MID)
         feats["spy_ret_60"] = _ret(spy_close, WIN_LONG)
+        # Binary forms kept in the JSONB for inspection / backward-compat,
+        # but the HMM consumes the *continuous* `_dist_from_ma` versions
+        # below (see HMM_FEATURE_ORDER). Binary features broke EM
+        # convergence in v1/v2/v3 backtests.
         feats["spy_above_50dma"] = _above_ma(spy_close, 50)
         feats["spy_above_200dma"] = _above_ma(spy_close, 200) if len(spy_close) >= 200 else 0.0
+        feats["spy_dist_50dma"] = _dist_from_ma(spy_close, 50)
+        feats["spy_dist_200dma"] = _dist_from_ma(spy_close, 200) if len(spy_close) >= 200 else 0.0
         feats["spy_rv_20"] = _realized_vol(spy_close, WIN_MID)
         feats["spy_rv_60"] = _realized_vol(spy_close, WIN_LONG)
     else:
         for k in (
             "spy_ret_5", "spy_ret_20", "spy_ret_60",
             "spy_above_50dma", "spy_above_200dma",
+            "spy_dist_50dma", "spy_dist_200dma",
             "spy_rv_20", "spy_rv_60",
         ):
             feats[k] = 0.0

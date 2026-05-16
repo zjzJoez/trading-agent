@@ -185,9 +185,27 @@ def hmm_predict(
     For a richer posterior over a sequence, use forward-backward via hmmlearn
     in batch mode (Phase 2.2.1 — backfill). For real-time decisions, this
     one-shot Bayes posterior is sufficient.
+
+    Feature ordering: builds the input vector from `snapshot.features` using
+    `model.feature_order` — NOT the module-level HMM_FEATURE_ORDER. This
+    matters when the codebase's feature schema has evolved since the model
+    was trained: an old model continues to work as long as the snapshot
+    still contains the keys it was trained on.
     """
     n = model.n_states
-    x = snapshot.as_vector()
+    # Build the input vector in THIS model's feature order, falling back to
+    # the module-level HMM_FEATURE_ORDER only if the model has no embedded
+    # order (shouldn't happen for serialized HMMs).
+    feature_order = model.feature_order or [
+        # late import to avoid circular dep
+        k for k in __import__(
+            "trading_agent.regime.features", fromlist=["HMM_FEATURE_ORDER"]
+        ).HMM_FEATURE_ORDER
+    ]
+    x = np.array(
+        [snapshot.features.get(k, 0.0) for k in feature_order],
+        dtype=float,
+    )
     mean = np.array(model.feature_means)
     std = np.array(model.feature_stds)
     z = _standardize(x, mean, std)
