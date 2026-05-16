@@ -129,7 +129,17 @@ def real_council_review(
         ) + "\n\nOpportunity:\n" + (
             opp_parsed.model_dump_json() if opp_parsed else "(unavailable)"
         )
-        arb = router.call("risk_arbiter", arb_ctx, schema=RiskArbiterOutput)
+        # Pass deterministic context to the audit so `_check_risk_arbiter`
+        # can detect if the LLM tried to upgrade VETO→APPROVE or exceeded
+        # the deterministic factor (hard guardrails below silently
+        # override, but we want to LOG how often the LLM tried).
+        arb_audit_ctx = {
+            "deterministic_decision": deterministic_decision,
+            "deterministic_factor": deterministic_factor,
+            "requested_qty": float(proposal.get("qty", 0)) or 1.0,
+        }
+        arb = router.call("risk_arbiter", arb_ctx, schema=RiskArbiterOutput,
+                          audit_ctx=arb_audit_ctx)
         arb_parsed: RiskArbiterOutput | None = (
             arb.parsed if isinstance(arb.parsed, RiskArbiterOutput) else None
         )

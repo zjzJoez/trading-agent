@@ -699,6 +699,18 @@ def execute_paper_order(state: TradingGraphState) -> dict:
     except Exception as e:
         log.warning("ntfy trade send failed: %s", e)
 
+    # Mark shadow_proposals row as EXECUTED, and link to journal_thesis_id
+    # if available in state.
+    sid = state.get("shadow_proposal_id")
+    if sid is not None:
+        from trading_agent.shadow.persist import finalize_shadow_proposal
+        thesis_id = (state.get("proposal") or {}).get("thesis_id") or None
+        finalize_shadow_proposal(
+            sid,
+            final_action="EXECUTED",
+            journal_thesis_id=int(thesis_id) if thesis_id else None,
+        )
+
     return {
         "order": {
             "placed": True,
@@ -1181,7 +1193,16 @@ def build_trade_proposal(state: TradingGraphState) -> dict:
             "direction": p.direction, "strategy": p.strategy_label,
         },
     )
-    return {"proposal": proposal_dict}
+
+    # Persist to shadow_proposals — captures EVERY proposal regardless of
+    # downstream gate/council decisions. Best-effort; failures don't block.
+    from trading_agent.shadow.persist import insert_shadow_proposal
+    shadow_id = insert_shadow_proposal(
+        run_id=run_id, trigger=trigger,
+        proposal=proposal_dict, regime=regime,
+    )
+
+    return {"proposal": proposal_dict, "shadow_proposal_id": shadow_id}
 
 
 def _format_trader_prompt(
@@ -1455,6 +1476,15 @@ def regime_execution_gate(state: TradingGraphState) -> dict:
             payload={"requested": qty, "size_multiplier": mult, "approved": new_qty,
                      "label": regime.get("label")},
         )
+
+    # Update shadow_proposals row with gate decision (best-effort)
+    sid = state.get("shadow_proposal_id")
+    if sid is not None:
+        from trading_agent.shadow.persist import update_shadow_gate
+        gate_decision = ("ALLOW" if new_qty == qty else
+                         ("VETO" if new_qty == 0 else "DOWNSIZE"))
+        update_shadow_gate(sid, decision=gate_decision, size_factor=mult)
+
     return {"proposal": {**proposal, "qty": new_qty}}
 
 
@@ -1484,6 +1514,20 @@ def persist_veto(state: TradingGraphState) -> dict:
             "reasons": reasons,
         },
     )
+
+    # Finalize shadow_proposals row — VETO classified by what blocked it.
+    # If gate decision was already VETO it was the gate; otherwise risk/council.
+    sid = state.get("shadow_proposal_id")
+    if sid is not None:
+        from trading_agent.shadow.persist import finalize_shadow_proposal
+        # Look at the gate decision in state to disambiguate. If unavailable,
+        # default to VETOED_BY_RISK.
+        veto_source = (
+            "VETOED_BY_COUNCIL" if risk.get("council_invoked") else
+            "VETOED_BY_RISK"
+        )
+        finalize_shadow_proposal(sid, final_action=veto_source)
+
     return {}
 
 
@@ -1539,6 +1583,12 @@ def persist_defer(state: TradingGraphState) -> dict:
             "reasons": reasons,
         },
     )
+
+    sid = state.get("shadow_proposal_id")
+    if sid is not None:
+        from trading_agent.shadow.persist import finalize_shadow_proposal
+        finalize_shadow_proposal(sid, final_action="DEFERRED")
+
     return {}
 
 

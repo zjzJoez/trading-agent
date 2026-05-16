@@ -1,5 +1,13 @@
 # Walk-Forward v4 — Properly Converged HMM + Multi-Seed Stability
 
+> **Followed up 2026-05-17 by v4.1:** The 3-regime auto-calibration used
+> here systematically under-sized RANGE_LOW_VOL days (gate at 0.50x in
+> backtest vs 0.75x in production). v4.1 fixes this — Sharpe moves
+> 0.78 → 0.80, gap narrows -0.06 → -0.04. See
+> `../walkforward_v4_1_4regime/REPORT.md`. The core conclusion
+> (no Sharpe alpha, defensive role intact) is unchanged.
+
+
 **Date run:** 2026-05-17  
 **Headline:** The previously claimed Sharpe edge (+0.18 in v3) was an
 artifact of a non-converged HMM. With a properly-fit model and multi-seed

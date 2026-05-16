@@ -149,6 +149,11 @@ class TradingGraphState(TypedDict):
     order: dict[str, Any]
     fill: dict[str, Any]
 
+    # Shadow proposal log row id (set by build_trade_proposal; downstream
+    # nodes UPDATE the same row with their decisions). NotRequired because
+    # the DB write is best-effort and may fail without blocking the run.
+    shadow_proposal_id: NotRequired[int]
+
     # Bookkeeping
     journal: dict[str, Any]
     learning: dict[str, Any]

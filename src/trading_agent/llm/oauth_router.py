@@ -132,6 +132,8 @@ class StubLLMRouter:
         schema: type[BaseModel] | None = None,
         max_tokens: int = 4000,
         timeout_s: int = 120,
+        audit_ctx: dict | None = None,
+        run_id: str | None = None,
     ) -> LLMResult:
         cfg = ROLE_CONFIG[role]
         log.info("[stub_router] role=%s channel=%s model=%s prompt_len=%d",
@@ -197,7 +199,19 @@ class OAuthLLMRouter:
         schema: type[BaseModel] | None = None,
         max_tokens: int = 4000,
         timeout_s: int = 120,
+        audit_ctx: dict | None = None,
+        run_id: str | None = None,
     ) -> LLMResult:
+        """Invoke the LLM for `role` via its configured channel.
+
+        `audit_ctx`: optional dict of role-specific context for the
+            deterministic audit pass (e.g. {"deterministic_decision": "DEFER"}
+            for risk_arbiter). Without this, role checks that depend on
+            upstream context are skipped, but parse-failure + simple
+            constraint checks still run.
+        `run_id`: ties the audit log row back to agent_events.
+        Both are kwargs; older callers continue to work.
+        """
         cfg = ROLE_CONFIG[role]
 
         # Pre-flight: budget & degrade
@@ -247,6 +261,23 @@ class OAuthLLMRouter:
 
         tokens = _estimate_tokens(user_prompt) + _estimate_tokens(raw)
         self.budget.record(role=role, channel=cfg.channel, tokens=tokens)
+
+        # Behavior audit — deterministic checks on parsed output.
+        # Best-effort; never blocks the caller.
+        try:
+            from trading_agent.llm.audit import audit_llm_output
+            audited_parsed = parsed if (schema is not None and not isinstance(parsed, dict)) else None
+            audit_llm_output(
+                role=role,
+                parsed=audited_parsed,  # None on parse failure → triggers parse_failure log
+                raw_text=raw,
+                ctx=audit_ctx,
+                run_id=run_id,
+                model_name=getattr(cfg, "model", None),
+                cost_usd=0.0,
+            )
+        except Exception as e:
+            log.warning("[llm_audit] audit invocation failed (non-fatal): %s", e)
 
         return LLMResult(
             role=role,

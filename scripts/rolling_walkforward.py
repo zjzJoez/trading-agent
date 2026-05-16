@@ -134,29 +134,60 @@ def train_hmm_for_year(training_snaps: list[tuple[datetime, FeatureSnapshot]],
     model.fit(Z)
     states = model.predict(Z)
 
-    # Auto-calibrate: rank states by mean spy_ret_20 ON TRAINING SET
+    # Auto-calibrate: rank states by mean spy_ret_20 ON TRAINING SET (no leakage).
+    # Compute mean spy_ret_20 AND mean spy_rv_20 per state — RV is used to
+    # differentiate the middle two states between RANGE_LOW_VOL (low-vol bull
+    # grind, 0.75x sizing in production) and VOLATILE_TRANSITION (high-vol
+    # transition, 0.5x).
+    #
+    # WHY THIS 4-REGIME RULE: matches the manual calibration semantics used
+    # by the production HMM (regime_model_versions.id=4). Earlier versions of
+    # this script used only 3 labels (BULL/BEAR/TRANSITION) — the two middle
+    # states were both labeled VOLATILE_TRANSITION (0.5x), which systematically
+    # under-sized the calm-bull state that production treats as RANGE_LOW_VOL.
     spy_ret_20_idx = HMM_FEATURE_ORDER.index("spy_ret_20")
+    spy_rv_20_idx = HMM_FEATURE_ORDER.index("spy_rv_20")
     state_metrics = {}
     for s in range(n_states):
         mask = (states == s)
         if mask.sum() == 0:
-            state_metrics[s] = {"mean_spy_ret_20": 0.0, "n": 0}
+            state_metrics[s] = {"mean_spy_ret_20": 0.0, "mean_spy_rv_20": 0.0, "n": 0}
         else:
             state_metrics[s] = {
                 "mean_spy_ret_20": float(X[mask, spy_ret_20_idx].mean()),
+                "mean_spy_rv_20": float(X[mask, spy_rv_20_idx].mean()),
                 "n": int(mask.sum()),
             }
 
     # Sort states by mean spy_ret_20 (ascending). Lowest = BEAR, highest = BULL.
     ranked = sorted(range(n_states), key=lambda s: state_metrics[s]["mean_spy_ret_20"])
     state_to_label = {}
-    for rank, s in enumerate(ranked):
-        if rank == 0:
-            state_to_label[s] = "BEAR_TREND"
-        elif rank == n_states - 1:
-            state_to_label[s] = "BULL_TREND"
+    if n_states == 4:
+        # 4-regime calibration matching production:
+        #   rank 0 (lowest ret)  → BEAR_TREND   (0.5x sizing)
+        #   rank 3 (highest ret) → BULL_TREND   (1.0x sizing)
+        #   middle 2: lower RV → RANGE_LOW_VOL (0.75x)
+        #             higher RV → VOLATILE_TRANSITION (0.5x)
+        state_to_label[ranked[0]] = "BEAR_TREND"
+        state_to_label[ranked[-1]] = "BULL_TREND"
+        mid_a, mid_b = ranked[1], ranked[2]
+        rv_a = state_metrics[mid_a]["mean_spy_rv_20"]
+        rv_b = state_metrics[mid_b]["mean_spy_rv_20"]
+        if rv_a <= rv_b:
+            state_to_label[mid_a] = "RANGE_LOW_VOL"
+            state_to_label[mid_b] = "VOLATILE_TRANSITION"
         else:
-            state_to_label[s] = "VOLATILE_TRANSITION"
+            state_to_label[mid_a] = "VOLATILE_TRANSITION"
+            state_to_label[mid_b] = "RANGE_LOW_VOL"
+    else:
+        # Fallback to 3-regime rule for n_states != 4 (kept for compat)
+        for rank, s in enumerate(ranked):
+            if rank == 0:
+                state_to_label[s] = "BEAR_TREND"
+            elif rank == n_states - 1:
+                state_to_label[s] = "BULL_TREND"
+            else:
+                state_to_label[s] = "VOLATILE_TRANSITION"
 
     # Normalize covars to (n_states, d, d) full-matrix form regardless of
     # cov_type, so the inference path doesn't need to know how we fit it.
