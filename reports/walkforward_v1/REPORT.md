@@ -84,6 +84,17 @@ cluster from training. But underneath, SPY itself kept rallying — the
 This is a **regime-shift in regime-detection features** — a meta-failure
 mode that no amount of in-sample fit fixes.
 
+**Caveat on the OOS model itself:** hmmlearn aborted training at iter 3 of
+200 because the log-likelihood *decreased* (`Delta is -9074.50`), driven by
+the binary feature `spy_above_50dma` causing full-covariance
+ill-conditioning. State separation in the Viterbi decode is still clean
+(occupancies 5.3% / 59.2% / 34.4% / 1.1%; feature means are clearly
+distinct), so the per-state means we reported are real. But the strict
+claim is "this non-converged model detected no signal" — not "no signal
+exists in these features." A properly-converged HMM with the binary
+features removed or replaced (e.g. with continuous "price minus
+50DMA, normalized") might separate forward returns better.
+
 ## How this connects to the LIVE production HMM
 
 Critical context: this OOS backtest used the *shadow* HMM (`id=2`, trained
