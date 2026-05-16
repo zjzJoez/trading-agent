@@ -48,18 +48,37 @@ from trading_agent.store.postgres import cursor
 log = logging.getLogger(__name__)
 
 
-def load_features_matrix() -> tuple[pd.DataFrame, list[datetime]]:
+def load_features_matrix(
+    train_end_date: str | None = None,
+) -> tuple[pd.DataFrame, list[datetime]]:
     """Return (features_df, as_of_list) — DF indexed by as_of, columns =
     HMM_FEATURE_ORDER. Skip rows with degradation_level≥2 (safe-mode).
+
+    `train_end_date` (YYYY-MM-DD inclusive) caps the training window. This
+    is the *only* way to produce an HMM whose `train_end < today` so the
+    out-of-sample backtest is honestly out-of-sample. Without this flag,
+    the function reads every snapshot up to NOW() and the resulting model
+    has been fit to the entire history.
     """
     with cursor() as cur:
-        cur.execute(
-            """
-            SELECT as_of, features, data_quality
-            FROM regime_feature_snapshots
-            ORDER BY as_of ASC
-            """
-        )
+        if train_end_date:
+            cur.execute(
+                """
+                SELECT as_of, features, data_quality
+                FROM regime_feature_snapshots
+                WHERE DATE(as_of) <= %s
+                ORDER BY as_of ASC
+                """,
+                (train_end_date,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT as_of, features, data_quality
+                FROM regime_feature_snapshots
+                ORDER BY as_of ASC
+                """
+            )
         rows = cur.fetchall()
 
     log.info("Loaded %d feature snapshots from DB", len(rows))
@@ -238,6 +257,16 @@ def main():
                    help="Output path for serialized HMM (NO DB write)")
     p.add_argument("--fingerprint-out", default="/tmp/hmm_fingerprint.json",
                    help="Output path for state fingerprint (for calibration review)")
+    p.add_argument(
+        "--train-end-date", default=None,
+        help=(
+            "Cap training data at this YYYY-MM-DD (inclusive). Use this to "
+            "produce a backtest-only HMM that leaves the post-cutoff window "
+            "for honest out-of-sample evaluation. Without this flag, the "
+            "model is fit to every available snapshot — fine for production, "
+            "useless for backtesting."
+        ),
+    )
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
@@ -246,8 +275,11 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    df, timestamps = load_features_matrix()
+    df, timestamps = load_features_matrix(train_end_date=args.train_end_date)
     log.info("Training window: %s → %s", df.index[0], df.index[-1])
+    if args.train_end_date:
+        log.info("Cutoff applied: train_end_date=%s (rows after this are reserved "
+                 "for out-of-sample evaluation)", args.train_end_date)
 
     model, means, stds = fit_hmm(df, n_states=args.n_states,
                                   n_iter=args.n_iter, random_state=args.seed)
@@ -298,6 +330,7 @@ def main():
             "trained_at": datetime.utcnow().isoformat(),
             "train_start": str(df.index[0]),
             "train_end": str(df.index[-1]),
+            "train_end_date_cutoff": args.train_end_date,  # None ↔ no cutoff
             "n_obs": int(fp["n_obs"]),
             "n_iter_done": int(getattr(model.monitor_, "iter", -1)),
             "final_log_likelihood": float(model.score((df.values - means) / stds)),

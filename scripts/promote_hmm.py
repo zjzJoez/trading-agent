@@ -67,6 +67,16 @@ def main():
                    help="Why this calibration — recorded in metrics_json for audit")
     p.add_argument("--retire-prior", action="store_true",
                    help="Mark any existing ACTIVE model as RETIRED first (recommended)")
+    p.add_argument(
+        "--status", default="active", choices=["active", "shadow", "retired"],
+        help=(
+            "Status to INSERT with. 'active' is the production path (one and "
+            "only one row should be active at a time; combine with "
+            "--retire-prior). 'shadow' is for evaluation-only models "
+            "(e.g. an OOS backtest HMM) — it is NEVER picked up by "
+            "get_active_model() so it cannot affect production trading."
+        ),
+    )
     p.add_argument("--dry-run", action="store_true",
                    help="Validate + print mapping, don't INSERT")
     p.add_argument("--verbose", action="store_true")
@@ -130,8 +140,10 @@ def main():
         print("\n--dry-run: validation passed; NOT inserting to DB.")
         return
 
-    # Retire prior active model so get_active_model() returns the new one
-    if args.retire_prior:
+    # Retire prior active model so get_active_model() returns the new one.
+    # Only meaningful when promoting status='active'; for 'shadow' (backtest
+    # use only) we leave prior active alone.
+    if args.retire_prior and args.status == "active":
         from trading_agent.store.postgres import cursor as pg_cursor
         with pg_cursor() as cur:
             cur.execute(
@@ -139,8 +151,10 @@ def main():
                 "WHERE status = 'active'"
             )
             log.info("Retired %d prior active model(s)", cur.rowcount)
+    elif args.retire_prior and args.status != "active":
+        log.info("Ignoring --retire-prior because --status=%s (shadow/retired "
+                 "promotion must not retire the production HMM)", args.status)
 
-    # Insert as ACTIVE
     metrics = {
         "calibration_rationale": args.rationale,
         "state_to_label": mapping,
@@ -151,11 +165,13 @@ def main():
         train_start=hmm.train_meta.get("train_start"),
         train_end=hmm.train_meta.get("train_end"),
         metrics=metrics,
-        status="active",
+        status=args.status,
     )
-    print(f"\n✓ Inserted as regime_model_versions id={new_id} (status=active)")
-    print(f"  Next premarket_scan tick will use this HMM instead of "
-          f"rule_based_fallback_no_hmm.")
+    print(f"\n✓ Inserted as regime_model_versions id={new_id} (status={args.status})")
+    if args.status == "active":
+        print("  Next premarket_scan tick will use this HMM.")
+    else:
+        print("  This is a NON-PRODUCTION model; only loadable explicitly by id.")
 
 
 if __name__ == "__main__":

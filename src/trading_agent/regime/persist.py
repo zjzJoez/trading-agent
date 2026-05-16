@@ -169,6 +169,33 @@ def get_active_model() -> HMMModel | None:
         return HMMModel.from_json(row[0])
 
 
+def get_model_by_id(model_id: int) -> tuple[HMMModel, dict] | None:
+    """Load a specific (possibly shadow/retired) HMM by id.
+
+    Used by `walkforward_backtest.py` to load the OOS evaluation model
+    without disturbing the active-model lookup path that production uses.
+    Returns (HMMModel, metrics_json_dict). None if id doesn't exist.
+    """
+    with cursor() as cur:
+        cur.execute(
+            "SELECT params_json, metrics_json, status, train_start, train_end "
+            "FROM regime_model_versions WHERE id=%s",
+            (int(model_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        params_json, metrics_json, status, train_start, train_end = row
+        info = {
+            "id": int(model_id),
+            "status": status,
+            "train_start": str(train_start) if train_start else None,
+            "train_end": str(train_end) if train_end else None,
+            "metrics": metrics_json or {},
+        }
+        return HMMModel.from_json(params_json), info
+
+
 def get_latest_regime_state() -> dict | None:
     """Return the most recent regime_states row as a dict (for graph nodes)."""
     with cursor() as cur:
