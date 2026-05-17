@@ -25,9 +25,18 @@ from pathlib import Path
 from trading_agent.config import CONFIG, ensure_dirs
 from trading_agent.db import connection, migrate
 
+# Keep aligned with src/trading_agent/jobs/premarket_watchlist.py
+# (see that file for rationale on watchlist expansion 2026-05-17).
+# SPY/QQQ/IWM excluded here since they don't file EDGAR docs (ETFs).
 DEFAULT_WATCHLIST = [
     "AAPL", "MSFT", "NVDA", "GOOGL", "META", "TSLA", "AMZN",
-    "SPY", "QQQ", "IWM",
+    "AVGO", "AMD", "ORCL", "ADBE", "CRM", "NFLX",
+    "PLTR", "SMCI", "RDDT",
+    "COIN", "MSTR",
+    "UBER", "ABNB", "DUOL", "HOOD", "SHOP", "SOFI",
+    "LLY", "MRNA",
+    "XOM", "OXY",
+    "MARA", "RIOT",
 ]
 
 INTERESTING_FORMS = {"8-K", "10-Q", "10-K", "4", "13F-HR", "13D", "13G"}

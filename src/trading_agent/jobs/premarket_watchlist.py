@@ -20,8 +20,37 @@ from pathlib import Path
 from trading_agent.config import CONFIG, ensure_dirs
 from trading_agent.db import connection, migrate
 
+# Watchlist composition (revised 2026-05-17 after ticker-bias diagnosis):
+# diagnostic showed scout was feeding SPY/QQQ ~80% of trader proposals when
+# the original 10-ticker watchlist was mostly mega-cap + 3 indices. The LLM
+# trader correctly declined most SPY proposals ("no discrete catalyst") but
+# the universe gave it nothing better.
+#
+# New composition (~40 tickers): keeps mag-7 + indices for macro/hedging
+# but adds three buckets of catalyst-prone single names.
+#
+# IMPORTANT: this is still a STATIC list. Dynamic premarket-mover integration
+# (Fix B) is a separate follow-up — done only if this expansion alone fails
+# to change the trader's selection behavior in 1-2 weeks.
 DEFAULT_WATCHLIST = [
+    # Mag-7 + adjacent mega-cap (kept from original)
     "AAPL", "MSFT", "NVDA", "GOOGL", "META", "TSLA", "AMZN",
+    # Other large-cap tech with frequent catalysts
+    "AVGO", "AMD", "ORCL", "ADBE", "CRM", "NFLX",
+    # AI / semis / high-attention single names
+    "PLTR", "SMCI", "RDDT",
+    # Crypto-correlated (Bitcoin proxy plays)
+    "COIN", "MSTR",
+    # Recent IPO / high-momentum consumer / fintech
+    "UBER", "ABNB", "DUOL", "HOOD", "SHOP", "SOFI",
+    # Biotech / healthcare catalyst plays
+    "LLY", "MRNA",
+    # Energy / commodities macro plays
+    "XOM", "OXY",
+    # Volatility / crypto-miner leveraged plays (small allocations only)
+    "MARA", "RIOT",
+    # Broad indices (kept for macro hedging + crisis days; scout prompt now
+    # penalizes them when no macro thesis is present)
     "SPY", "QQQ", "IWM",
 ]
 

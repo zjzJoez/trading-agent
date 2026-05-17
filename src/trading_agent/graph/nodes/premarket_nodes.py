@@ -161,12 +161,27 @@ def _build_scout_prompt(
 
     lines += [
         f"",
-        f"Rank the watchlist tickers from most to least actionable as of today's open. "
-        f"Score 0.0–1.0. Include only tickers where there is a concrete near-term setup "
-        f"(momentum, mean-reversion, event-driven, or regime-aligned). "
-        f"Skip tickers with no clear edge or that contradict the current regime. "
-        f"Return at most 5 candidates. "
-        f"Respond per your ScoutOutput schema.",
+        f"Rank the watchlist tickers from most to least actionable as of today's open. ",
+        f"Score 0.0–1.0. Include only tickers where there is a concrete near-term setup ",
+        f"(momentum, mean-reversion, event-driven, or regime-aligned).",
+        f"",
+        f"PREFERENCE ORDER (most→least preferred when ranking):",
+        f"  1. Single-name catalyst plays: recent filings (8-K, 4), earnings within ",
+        f"     2 weeks, news-driven gaps, sector rotation candidates.",
+        f"  2. High-volume single names with above-average premarket move ",
+        f"     (|chg_pct| ≥ 1.5%).",
+        f"  3. Mag-7 / large-caps with a SPECIFIC thesis tied to today (not just ",
+        f"     'good company, will go up').",
+        f"  4. Broad ETFs (SPY, QQQ, IWM) — ONLY when there is an explicit ",
+        f"     macro thesis (FOMC, CPI print, NFP, sector breadth turn). Default ",
+        f"     ETF score should be ≤ 0.5; anything > 0.7 needs explicit ",
+        f"     justification in the `reason` field naming the macro trigger.",
+        f"",
+        f"Reject silently (don't put in candidates list): tickers with no clear edge, ",
+        f"tickers that contradict the current regime, or ETFs without a macro thesis.",
+        f"",
+        f"Return at most 5 candidates. Quality over quantity — if only 1 ticker has ",
+        f"a real catalyst, return just that one. Respond per your ScoutOutput schema.",
     ]
     return "\n".join(lines)
 
