@@ -1,5 +1,13 @@
 # Walk-Forward v4.2 — Prior Fix Applied (the first credible result)
 
+> **Followed up 2026-05-19 by v5:** Same model + prior, but trained on
+> 19 years (2007-2026) instead of 11 (2015-2026). Sharpe basically
+> unchanged (0.908 ± 0.029 vs 0.905 ± 0.026), but BEAR_TREND label
+> usage drops 60% and today's classification flips BEAR → RANGE_LOW_VOL.
+> See `../walkforward_v5_longhistory/REPORT.md`. v5 is the
+> current-production reference.
+
+
 **Date run:** 2026-05-19  
 **Headline:** With `hmm_predict` switched to a stationary-distribution prior
 (commit 07e19f9), the deterministic regime gate finally has a **slight
