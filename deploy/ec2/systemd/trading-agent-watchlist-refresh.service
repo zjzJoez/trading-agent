@@ -1,0 +1,37 @@
+[Unit]
+Description=trading-agent — refresh dynamic watchlist (yfinance movers + moomoo groups)
+Documentation=https://github.com/joezz/trading-agent
+After=network-online.target postgresql.service trading-agent-opend.service
+Wants=network-online.target
+PartOf=trading-agent.target
+
+# Premarket scan reads from watchlist_members — must run before it.
+Before=trading-agent-brain@premarket_scan.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/trading-agent
+
+# Skip silently when iOS halt killswitch is engaged
+ExecCondition=/bin/bash -c '! test -f /home/ubuntu/trading-agent/data/halt.flag'
+
+EnvironmentFile=/home/ubuntu/trading-agent/.env
+EnvironmentFile=/home/ubuntu/.env.postgres
+
+# Allow override via env file; defaults match script constants.
+# WATCHLIST_MAX=40
+# WATCHLIST_MIN_MCAP=2000000000
+# WATCHLIST_MIN_AVGVOL=1000000
+
+ExecStart=/home/ubuntu/trading-agent/.venv/bin/python /home/ubuntu/trading-agent/scripts/refresh_dynamic_watchlist.py
+
+# Network + yfinance + moomoo can be slow on cold-start; cap at 5 min.
+TimeoutStartSec=300
+
+StandardOutput=append:/var/log/trading-agent-watchlist-refresh.log
+StandardError=append:/var/log/trading-agent-watchlist-refresh.err
+
+NoNewPrivileges=true
+PrivateTmp=true

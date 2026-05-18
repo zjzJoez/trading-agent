@@ -10,6 +10,8 @@ SUDO="sudo"
 units=(
   "trading-agent-brain@.service"
   "trading-agent-candidate-entry@.service"
+  "trading-agent-watchlist-refresh.service"
+  "trading-agent-watchlist-refresh.timer"
   "trading-agent-premarket.timer"
   "trading-agent-intraday.timer"
   "trading-agent-eod.timer"
@@ -24,7 +26,7 @@ done
 $SUDO systemctl daemon-reload
 
 # Enable + start the timers (NOT the @-templates; they run on demand)
-for t in trading-agent-premarket trading-agent-intraday trading-agent-eod trading-agent-healthcheck trading-agent-learning; do
+for t in trading-agent-watchlist-refresh trading-agent-premarket trading-agent-intraday trading-agent-eod trading-agent-healthcheck trading-agent-learning; do
   $SUDO systemctl enable --now "$t.timer"
 done
 
