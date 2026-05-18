@@ -210,7 +210,38 @@ def hmm_predict(
     std = np.array(model.feature_stds)
     z = _standardize(x, mean, std)
 
-    log_prior = np.log(np.array(model.startprob) + 1e-12)
+    # CRITICAL: do NOT use model.startprob as the prior for single-step
+    # inference. EM training collapses startprob onto whichever state best
+    # explained the FIRST training observation — for our HMMs that came out
+    # as [0, 0, 1, 0] or [1, 0, 0, 0] (degenerate). Using it as the prior
+    # for arbitrary-day inference hard-floors P(other_states) ≈ 0 and lets
+    # one anchor state win every classification regardless of emission.
+    #
+    # First diagnosed 2026-05-18: production HMM id=4 was labeling 94.8% of
+    # OOS test days as BEAR_TREND with confidence ~1.00 because startprob
+    # was [0, 0, 1, 0]. After switching to the stationary distribution of
+    # the transition matrix as the prior, BEAR share drops to 25.2% and
+    # RANGE_LOW_VOL emerges as the dominant calm-bull-grind state for
+    # 2024-2026 (47.4% of days), which is the empirically correct read.
+    #
+    # The stationary distribution π satisfies π T = π and represents the
+    # long-run state frequency of the Markov chain — the natural prior for
+    # a "what state are we in NOW on this stationary process?" query.
+    transmat = np.array(model.transmat)
+    try:
+        eigvals, eigvecs = np.linalg.eig(transmat.T)
+        # eigenvector for eigenvalue ~1 = stationary distribution
+        idx = int(np.argmin(np.abs(eigvals - 1.0)))
+        stationary = np.real(eigvecs[:, idx])
+        stationary = stationary / stationary.sum()
+        # Guard against numerical issues (small negatives, NaNs, etc.)
+        stationary = np.clip(stationary, 1e-9, None)
+        stationary = stationary / stationary.sum()
+    except Exception:
+        # Fallback: uniform prior. Safer than risking startprob collapse.
+        stationary = np.ones(n) / n
+    log_prior = np.log(stationary + 1e-12)
+
     log_emit = np.zeros(n)
     for s in range(n):
         mu = np.array(model.means[s])

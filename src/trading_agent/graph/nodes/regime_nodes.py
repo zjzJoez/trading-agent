@@ -93,6 +93,47 @@ def collect_macro_market_data(state: dict) -> dict:
     return {"market_data": market_data}
 
 
+def _fetch_live_vix_level(max_age_days: int = 5) -> float | None:
+    """Pull the most recent ^VIX close from yfinance.
+
+    Returns the close price (as a float), or None on any failure. Failures
+    are non-fatal: the snapshot builder falls back to the realized-vol
+    proxy formula, which is wrong but not catastrophic (RV proxy
+    underestimates VIX by ~30-40% in normal markets).
+
+    Why a 5-day max age: yfinance returns the most recent trading day's
+    close; if we're running on a Monday morning, that's Friday's close,
+    which is fine. If we're running after a weeklong outage, we'd rather
+    fail safe (None) than serve a 10-day-old VIX print as "now".
+    """
+    try:
+        import yfinance as yf
+        from datetime import timedelta as _td
+        df = yf.download("^VIX", period="10d", progress=False, auto_adjust=True)
+        if df.empty:
+            return None
+        close = df["Close"]
+        if hasattr(close, "iloc") and close.ndim == 2:
+            close = close.iloc[:, 0]
+        last_dt = close.index[-1]
+        last_val = float(close.iloc[-1])
+        # Sanity: ^VIX is typically [9, 90]. Outside that range = data error.
+        if not (5.0 <= last_val <= 150.0):
+            log.warning("[_fetch_live_vix_level] ^VIX=%.2f out of sanity range, returning None",
+                        last_val)
+            return None
+        # Freshness check
+        age_days = (datetime.now(timezone.utc).date() - last_dt.date()).days
+        if age_days > max_age_days:
+            log.warning("[_fetch_live_vix_level] last ^VIX close is %d days old, returning None",
+                        age_days)
+            return None
+        return last_val
+    except Exception as e:
+        log.warning("[_fetch_live_vix_level] yfinance ^VIX fetch failed: %s", e)
+        return None
+
+
 def compute_regime_features(state: dict) -> dict:
     """Build the standardized feature vector. Stores in state for the next node."""
     run_id = state["run_id"]
@@ -119,7 +160,25 @@ def compute_regime_features(state: dict) -> dict:
         except Exception as e:
             log.warning("Failed to reconstruct klines for %s: %s", tkr, e)
 
-    snap = build_feature_snapshot(klines=klines)
+    # Pull real ^VIX index from yfinance. WITHOUT this the live snapshot
+    # falls back to `spy_rv_20 * 100 * 1.1` (see features.py) which is
+    # systematically lower than the actual VIX (RV underestimates IV by
+    # ~30-40% in normal markets). The HMM was trained on real ^VIX
+    # (backfill_history.py uses yfinance ^VIX) — feeding it the RV proxy
+    # in production created a feature-distribution mismatch that biased
+    # classifications toward "low VIX = euphoria → BEAR_TREND" on days
+    # when real VIX was actually middling.
+    #
+    # First detected 2026-05-18: production reported vix_level=11.5
+    # (matching the RV proxy formula exactly) while real ^VIX was 18.5.
+    vix_level = _fetch_live_vix_level()
+    if vix_level is not None:
+        log.info("[compute_regime_features] real ^VIX = %.2f", vix_level)
+    else:
+        log.warning("[compute_regime_features] ^VIX fetch failed — snapshot will "
+                    "use the RV proxy formula (vix ≈ spy_rv_20 × 110), which is "
+                    "biased low. HMM was trained on real ^VIX.")
+    snap = build_feature_snapshot(klines=klines, vix_level=vix_level)
 
     feature_payload = snap.to_db_payload()
     emit(
