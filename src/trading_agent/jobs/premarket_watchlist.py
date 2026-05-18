@@ -20,37 +20,23 @@ from pathlib import Path
 from trading_agent.config import CONFIG, ensure_dirs
 from trading_agent.db import connection, migrate
 
-# Watchlist composition (revised 2026-05-17 after ticker-bias diagnosis):
-# diagnostic showed scout was feeding SPY/QQQ ~80% of trader proposals when
-# the original 10-ticker watchlist was mostly mega-cap + 3 indices. The LLM
-# trader correctly declined most SPY proposals ("no discrete catalyst") but
-# the universe gave it nothing better.
+# Watchlist composition history:
+#   2026-05-17  expanded from 10 (mag-7 + indices) → 33 static tickers after
+#               ticker-bias diagnosis (scout was feeding SPY/QQQ to trader 80%
+#               of the time because the universe gave it nothing else)
+#   2026-05-19  switched to DB-backed two-tier watchlist (migrations 010+011).
+#               Source of truth is now Postgres watchlist_members, refreshed
+#               daily by scripts/refresh_dynamic_watchlist.py from:
+#                 * moomoo CUSTOM groups (MGGA7 + 芯片 + ...)  → core / sector
+#                 * yfinance predefined screeners               → rotating
+#               Liquidity floor + 14-day staleness eviction enforced there.
 #
-# New composition (~40 tickers): keeps mag-7 + indices for macro/hedging
-# but adds three buckets of catalyst-prone single names.
-#
-# IMPORTANT: this is still a STATIC list. Dynamic premarket-mover integration
-# (Fix B) is a separate follow-up — done only if this expansion alone fails
-# to change the trader's selection behavior in 1-2 weeks.
+# DEFAULT_WATCHLIST below is now a FALLBACK only — used when the DB is
+# unreachable or the migration hasn't run. The premarket scan must never
+# silently run on an empty watchlist, so the fallback covers the core tier.
 DEFAULT_WATCHLIST = [
-    # Mag-7 + adjacent mega-cap (kept from original)
+    # Mag-7 + broad indices — same as migration 010 core seed.
     "AAPL", "MSFT", "NVDA", "GOOGL", "META", "TSLA", "AMZN",
-    # Other large-cap tech with frequent catalysts
-    "AVGO", "AMD", "ORCL", "ADBE", "CRM", "NFLX",
-    # AI / semis / high-attention single names
-    "PLTR", "SMCI", "RDDT",
-    # Crypto-correlated (Bitcoin proxy plays)
-    "COIN", "MSTR",
-    # Recent IPO / high-momentum consumer / fintech
-    "UBER", "ABNB", "DUOL", "HOOD", "SHOP", "SOFI",
-    # Biotech / healthcare catalyst plays
-    "LLY", "MRNA",
-    # Energy / commodities macro plays
-    "XOM", "OXY",
-    # Volatility / crypto-miner leveraged plays (small allocations only)
-    "MARA", "RIOT",
-    # Broad indices (kept for macro hedging + crisis days; scout prompt now
-    # penalizes them when no macro thesis is present)
     "SPY", "QQQ", "IWM",
 ]
 
@@ -60,9 +46,29 @@ def _now() -> str:
 
 
 def _get_watchlist() -> list[str]:
+    """Return today's active watchlist.
+
+    Priority order:
+      1. WATCHLIST_TICKERS env (manual override, comma-separated)
+      2. DB lookup via refresh_dynamic_watchlist.get_active_watchlist()
+      3. DEFAULT_WATCHLIST fallback (core tickers only)
+    """
     env = os.environ.get("WATCHLIST_TICKERS", "").strip()
     if env:
         return [t.strip().upper() for t in env.split(",") if t.strip()]
+    # DB-backed lookup. The refresh script lives in scripts/, not the
+    # trading_agent package — import it via path injection.
+    try:
+        scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from refresh_dynamic_watchlist import get_active_watchlist  # type: ignore
+        wl = get_active_watchlist()
+        if wl:
+            return wl
+    except Exception as e:
+        print(f"[premarket_watchlist] DB watchlist read failed: {e!r} — using DEFAULT_WATCHLIST",
+              file=sys.stderr)
     return DEFAULT_WATCHLIST
 
 

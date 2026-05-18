@@ -24,6 +24,39 @@ from trading_agent.store.postgres import cursor
 log = logging.getLogger(__name__)
 
 
+def _capture_universe_snapshot() -> str:
+    """Snapshot the active watchlist as JSON for embedding in shadow_proposals.
+
+    Critical for downstream analysis: the dynamic watchlist means the LLM's
+    selection universe varies daily. Without this column, "LLM directional
+    skill" analysis would conflate skill with universe quality. See
+    migrations/011_shadow_proposals_universe.sql.
+
+    Best-effort: if the watchlist module isn't importable (older deploys
+    without migration 010 applied), returns an empty snapshot — still
+    valid JSON so the INSERT doesn't fail.
+    """
+    try:
+        # Lazy import — refresh script lives in scripts/, not the trading_agent
+        # package, so we import via the absolute path on sys.path.
+        import sys
+        from pathlib import Path
+        scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from refresh_dynamic_watchlist import get_universe_snapshot  # type: ignore
+        return json.dumps(get_universe_snapshot(), default=str)
+    except Exception as e:
+        log.debug("[shadow] universe snapshot unavailable: %s", e)
+        from datetime import datetime, timezone
+        return json.dumps({
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "universe_size": 0,
+            "tickers": [],
+            "error": str(e),
+        })
+
+
 def insert_shadow_proposal(
     *,
     run_id: str,
@@ -36,6 +69,7 @@ def insert_shadow_proposal(
     Best-effort: any DB error is logged and swallowed; returning None
     signals callers to skip later UPDATE calls (the row doesn't exist).
     """
+    universe_json = _capture_universe_snapshot()
     try:
         with cursor() as cur:
             cur.execute(
@@ -47,7 +81,8 @@ def insert_shadow_proposal(
                     strategy_label, expected_return_pct, max_loss_pct,
                     proposal_json,
                     regime_state_id, regime_label, regime_confidence,
-                    final_action
+                    final_action,
+                    universe_snapshot
                 ) VALUES (
                     NOW(), %s, %s,
                     %s, %s, %s, %s,
@@ -55,7 +90,8 @@ def insert_shadow_proposal(
                     %s, %s, %s,
                     %s::jsonb,
                     %s, %s, %s,
-                    'pending'
+                    'pending',
+                    %s::jsonb
                 )
                 RETURNING id
                 """,
@@ -71,9 +107,25 @@ def insert_shadow_proposal(
                     (regime or {}).get("state_id"),
                     (regime or {}).get("label"),
                     (regime or {}).get("confidence"),
+                    universe_json,
                 ),
             )
-            return int(cur.fetchone()[0])
+            shadow_id = int(cur.fetchone()[0])
+        # Touch the watchlist row so eviction logic sees recent activity.
+        # Best-effort: any failure is silent (watchlist may not exist yet).
+        try:
+            with cursor() as cur2:
+                cur2.execute(
+                    """
+                    UPDATE watchlist_members
+                       SET last_proposed_at = NOW()
+                     WHERE ticker = %s
+                    """,
+                    (proposal.get("ticker"),),
+                )
+        except Exception:
+            pass
+        return shadow_id
     except Exception as e:
         log.warning("[shadow] insert failed (non-fatal): %s", e)
         return None

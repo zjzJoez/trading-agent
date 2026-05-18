@@ -96,12 +96,25 @@ def collect_watchlist_data(state: TradingGraphState) -> dict:
 
     watchlist: list[str] = list(state.get("watchlist") or [])
     if not watchlist:
-        # Default watchlist — broad coverage across sectors
-        watchlist = [
-            "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "META",
-            "GOOGL", "TSLA", "JPM", "GLD", "TLT", "XLE", "XLF",
-        ]
-        log.info("[premarket/collect_watchlist_data] using default watchlist (%d tickers)", len(watchlist))
+        # Source of truth for the dynamic watchlist lives in Postgres
+        # watchlist_members (migration 010), refreshed daily by
+        # scripts/refresh_dynamic_watchlist.py. Reads through the same
+        # helper so this graph node and standalone jobs stay aligned.
+        try:
+            import sys
+            from pathlib import Path
+            scripts_dir = Path(__file__).resolve().parents[4] / "scripts"
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+            from refresh_dynamic_watchlist import get_active_watchlist  # type: ignore
+            watchlist = get_active_watchlist()
+            log.info("[premarket/collect_watchlist_data] DB watchlist loaded (%d tickers)", len(watchlist))
+        except Exception as e:
+            log.warning("[premarket/collect_watchlist_data] DB watchlist read failed: %s — using hardcoded fallback", e)
+            watchlist = [
+                "SPY", "QQQ", "IWM",
+                "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA",
+            ]
 
     quote_data = _fetch_quotes_batch(watchlist)
 
@@ -237,6 +250,26 @@ def rank_candidates(state: TradingGraphState) -> dict:
             {"ticker": t, "score": 0.5, "reason": "fallback_by_abs_change_pct"}
             for t in ranked_tickers[:3]
         ]
+
+    # Persist per-ticker scout scores into watchlist_members so the
+    # daily refresh's eviction logic can see scout-flat tickers and
+    # rotate them out after the threshold window. Best-effort; the
+    # watchlist table may not exist on stale deployments.
+    try:
+        from trading_agent.store.postgres import cursor as _pgcur
+        with _pgcur() as cur:
+            for c in candidates:
+                cur.execute(
+                    """
+                    UPDATE watchlist_members
+                       SET last_scout_score = %s,
+                           last_scout_ts    = NOW()
+                     WHERE ticker = %s
+                    """,
+                    (float(c.get("score") or 0), c.get("ticker")),
+                )
+    except Exception as e:
+        log.debug("[rank_candidates] scout-score writeback skipped: %s", e)
 
     emit(
         run_id=run_id, trigger=trigger, agent="rank_candidates",
