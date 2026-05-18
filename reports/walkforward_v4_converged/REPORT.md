@@ -1,11 +1,10 @@
 # Walk-Forward v4 — Properly Converged HMM + Multi-Seed Stability
 
-> **Followed up 2026-05-17 by v4.1:** The 3-regime auto-calibration used
-> here systematically under-sized RANGE_LOW_VOL days (gate at 0.50x in
-> backtest vs 0.75x in production). v4.1 fixes this — Sharpe moves
-> 0.78 → 0.80, gap narrows -0.06 → -0.04. See
-> `../walkforward_v4_1_4regime/REPORT.md`. The core conclusion
-> (no Sharpe alpha, defensive role intact) is unchanged.
+> **Superseded 2026-05-19 by v4.2:** This run used 3-regime auto-cal AND
+> the broken `hmm_predict` prior. The "no Sharpe edge" conclusion below
+> is an artifact of the model rubber-stamping BEAR_TREND on 94.8% of OOS
+> days. After fixing the prior in commit 07e19f9, Sharpe is 0.905 vs
+> SPY 0.837 (+0.07 edge). See `../walkforward_v4_2_priorfix/REPORT.md`.
 
 
 **Date run:** 2026-05-17  

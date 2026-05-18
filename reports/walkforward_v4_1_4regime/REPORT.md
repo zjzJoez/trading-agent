@@ -1,5 +1,14 @@
 # Walk-Forward v4.1 — Calibration Fix (4-regime auto-cal matching production)
 
+> **Superseded 2026-05-19 by v4.2:** This run still used the broken
+> `hmm_predict` prior (collapsed `startprob`). The Sharpe -0.04
+> disadvantage reported below was an artifact of the model always
+> classifying days as BEAR_TREND. After the prior fix (commit 07e19f9),
+> Sharpe is **+0.07 vs SPY**, label distribution is correctly varied,
+> and confidence==1.0 rate dropped from 87% to 60%. See
+> `../walkforward_v4_2_priorfix/REPORT.md`.
+
+
 **Date run:** 2026-05-17  
 **Headline:** v4 used 3-regime auto-calibration (no RANGE_LOW_VOL). That
 was systematically biased against the strategy. Fixed: rolling auto-cal
