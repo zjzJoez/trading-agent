@@ -1,0 +1,31 @@
+[Unit]
+Description=trading-agent auto-deploy from origin/main
+Documentation=https://github.com/joezz/trading-agent
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/trading-agent
+
+EnvironmentFile=/home/ubuntu/trading-agent/.env
+EnvironmentFile=/home/ubuntu/.env.postgres
+
+ExecStart=/home/ubuntu/trading-agent/deploy/ec2/auto-deploy.sh
+
+# 5-min hard cap — uv sync on a fresh torch install can take ~3 min;
+# migrations should be sub-second. 5 min covers the worst realistic case.
+TimeoutStartSec=300
+
+StandardOutput=append:/var/log/trading-agent-auto-deploy.log
+StandardError=append:/var/log/trading-agent-auto-deploy.log
+
+# Needs sudo (systemctl daemon-reload, install systemd units, install
+# sudoers) — NoNewPrivileges must stay off.
+NoNewPrivileges=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

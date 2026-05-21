@@ -1,0 +1,14 @@
+[Unit]
+Description=Poll origin/main every 2 min and auto-deploy if behind
+Requires=trading-agent-auto-deploy.service
+
+[Timer]
+# 2-min poll cadence. Cheap (single git fetch on hit, exits immediately
+# on no-op). Bounded latency between push and deploy: ≤ 2 min.
+OnBootSec=120
+OnUnitInactiveSec=120
+Persistent=false
+Unit=trading-agent-auto-deploy.service
+
+[Install]
+WantedBy=timers.target

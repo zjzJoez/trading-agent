@@ -1,0 +1,12 @@
+# trading-agent auto-deploy sudo grants
+#
+# /etc/systemd/system/trading-agent-*.{service,timer} are SYMLINKS into
+# /home/ubuntu/trading-agent/deploy/ec2/systemd/ — so `git pull` alone
+# updates the unit-file content. We only need to tell systemd to re-read
+# them, which is `daemon-reload`. That's the only sudo grant required.
+#
+# Other grants (dispatching candidate_entry) live in
+# /etc/sudoers.d/trading-agent-dispatch — kept separate so each file has
+# a single, auditable purpose.
+
+ubuntu ALL=(root) NOPASSWD: /bin/systemctl daemon-reload

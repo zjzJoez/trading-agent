@@ -1,0 +1,129 @@
+#!/bin/bash
+#
+# Auto-deploy: pull origin/main and apply side-effects when needed.
+#
+# Invoked every 2 min by trading-agent-auto-deploy.timer. Idempotent —
+# exits silently when HEAD already matches origin/main.
+#
+# DESIGN NOTES:
+#
+# 1. /etc/systemd/system/trading-agent-*.{service,timer} are SYMLINKS
+#    pointing into deploy/ec2/systemd/ in this repo. That means `git pull`
+#    alone updates the unit file content — we only need
+#    `sudo systemctl daemon-reload` to make systemd notice. No copies, no
+#    `sudo install`, no fragile arg-matching sudoers entries.
+#
+# 2. Sudoers: only `/bin/systemctl daemon-reload` (see
+#    deploy/ec2/sudoers/trading-agent-deploy). Tight, single command.
+#
+# 3. RACE SAFETY: skips this tick if any brain orchestrator process is
+#    currently mid-run. Next tick (2 min) retries. This prevents
+#    `uv sync` from mutating .venv while a candidate_entry LLM chain is
+#    still importing.
+#
+# 4. RECOVERY: each step is idempotent (uv sync, daemon-reload, migration
+#    apply-if-not-applied). A failed deploy leaves a partial state; the
+#    next tick continues from there. Operator gets an ntfy on the `ops`
+#    topic for both success and failure.
+
+set -euo pipefail
+
+REPO_DIR="/home/ubuntu/trading-agent"
+LOG_TAG="[auto-deploy $(date -u +%FT%TZ)]"
+UV_BIN="/home/ubuntu/.local/bin/uv"
+
+# ntfy helper — defined first so failure paths can use it. Best-effort,
+# never raises. Reads NTFY_TOPIC_PREFIX from the systemd EnvironmentFile.
+_notify_ops() {
+    local body="$1"
+    local prio="${2:-3}"
+    if [ -z "${NTFY_TOPIC_PREFIX:-}" ]; then
+        return 0
+    fi
+    curl -s --max-time 5 \
+        -H "Title: trading-agent auto-deploy" \
+        -H "Priority: $prio" \
+        -H "Tags: rocket" \
+        -d "$body" \
+        "${NTFY_BASE_URL:-https://ntfy.sh}/${NTFY_TOPIC_PREFIX}-ops" > /dev/null 2>&1 || true
+}
+
+trap '_notify_ops "auto-deploy FAILED on EC2 (exit $?)" 5' ERR
+
+cd "$REPO_DIR"
+
+# ---- Race guard: skip if a brain run is in progress ----------------------
+if pgrep -f 'trading_agent.orchestrator' > /dev/null; then
+    echo "$LOG_TAG brain run in progress, skipping this tick"
+    exit 0
+fi
+
+# ---- Fetch + check whether anything is new -------------------------------
+git fetch --quiet origin main
+
+LOCAL=$(git rev-parse HEAD)
+REMOTE=$(git rev-parse origin/main)
+
+if [ "$LOCAL" = "$REMOTE" ]; then
+    # Silent exit on no-op — this is the common case and would spam logs.
+    exit 0
+fi
+
+echo "$LOG_TAG deploying ${LOCAL:0:7} -> ${REMOTE:0:7}"
+
+# ---- Classify changed paths ----------------------------------------------
+CHANGED_FILES=$(git diff --name-only "$LOCAL" "$REMOTE")
+HAS_DEPS=$(echo "$CHANGED_FILES" | grep -E '^(pyproject\.toml|uv\.lock)$' || true)
+HAS_SYSTEMD=$(echo "$CHANGED_FILES" | grep -E '^deploy/ec2/systemd/' || true)
+HAS_MIGRATIONS=$(echo "$CHANGED_FILES" | grep -E '^migrations/.*\.sql$' || true)
+HAS_SUDOERS=$(echo "$CHANGED_FILES" | grep -E '^deploy/ec2/sudoers/' || true)
+
+NUM_CHANGED=$(echo "$CHANGED_FILES" | wc -l)
+echo "$LOG_TAG changed=$NUM_CHANGED deps=${HAS_DEPS:+y} systemd=${HAS_SYSTEMD:+y} migrations=${HAS_MIGRATIONS:+y} sudoers=${HAS_SUDOERS:+y}"
+
+# ---- Pull ---------------------------------------------------------------
+git pull --ff-only origin main 2>&1 | tail -3
+
+# ---- Post-pull conditional steps -----------------------------------------
+
+if [ -n "$HAS_DEPS" ]; then
+    echo "$LOG_TAG uv sync"
+    "$UV_BIN" sync --quiet 2>&1 | tail -10
+fi
+
+if [ -n "$HAS_SYSTEMD" ]; then
+    echo "$LOG_TAG systemctl daemon-reload (units are symlinks; content is already current)"
+    sudo /bin/systemctl daemon-reload
+fi
+
+if [ -n "$HAS_SUDOERS" ]; then
+    # Sudoers changes need manual install — auto-deploy can't grant itself
+    # new sudo rights for safety. Alert the operator.
+    echo "$LOG_TAG SUDOERS CHANGED — manual install required: deploy/ec2/sudoers/"
+    _notify_ops "auto-deploy: sudoers file changed in ${REMOTE:0:7} — install manually: sudo install -m 440 -o root -g root deploy/ec2/sudoers/* /etc/sudoers.d/" 4
+fi
+
+if [ -n "$HAS_MIGRATIONS" ]; then
+    echo "$LOG_TAG applying pending migrations"
+    # POSTGRES_DSN comes from the EnvironmentFile (.env.postgres).
+    for sql in $(ls migrations/*.sql | sort); do
+        ver=$(basename "$sql" .sql | grep -oE '^[0-9]+' || echo "")
+        if [ -z "$ver" ]; then
+            continue
+        fi
+        # Match either '010' or '010_watchlist_members' style — early
+        # migrations used the long form, later ones use just the number.
+        applied=$(psql "$POSTGRES_DSN" -tAc \
+            "SELECT 1 FROM schema_migrations WHERE version = '$ver' OR version LIKE '${ver}_%' LIMIT 1" 2>&1)
+        if [ -z "$applied" ]; then
+            echo "$LOG_TAG  applying $(basename "$sql")"
+            psql "$POSTGRES_DSN" -q -f "$sql" 2>&1 | tail -5
+        fi
+    done
+fi
+
+# ---- ntfy success notification ------------------------------------------
+SUBJECT_LINE=$(git log -1 --pretty=format:'%s' "$REMOTE")
+_notify_ops "deployed ${REMOTE:0:7}: ${SUBJECT_LINE:0:160}" 3
+
+echo "$LOG_TAG done"
