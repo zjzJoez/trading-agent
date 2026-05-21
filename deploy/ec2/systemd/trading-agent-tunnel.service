@@ -1,0 +1,35 @@
+[Unit]
+Description=Cloudflare tunnel exposing trading-agent dashboard (port 8002)
+Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+After=network-online.target trading-agent-dashboard.service
+Wants=network-online.target trading-agent-dashboard.service
+Requires=trading-agent-dashboard.service
+
+# Why a tunnel instead of nginx + public-IP + DNS + ACME:
+#   - No firewall changes (EC2 SG can keep 22/443/etc. closed)
+#   - Auto TLS via Cloudflare edge — no certbot, no renewal cron
+#   - Built-in Cloudflare Access for auth (free for 50 users)
+#   - Survives EC2 IP rotation (the tunnel name is the stable address)
+#   - One config file vs nginx + ufw + certbot + dns scripting
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+EnvironmentFile=-/home/ubuntu/.env.tunnel
+# The tunnel CLI reads ~/.cloudflared/config.yml + cert.pem (set up by the
+# one-time `cloudflared tunnel login` + `tunnel create` flow). See the
+# install doc for the bootstrap commands.
+ExecStart=/usr/local/bin/cloudflared tunnel --config /home/ubuntu/.cloudflared/config.yml run
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=append:/var/log/trading-agent-tunnel.log
+StandardError=append:/var/log/trading-agent-tunnel.log
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

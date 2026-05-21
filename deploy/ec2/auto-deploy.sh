@@ -71,6 +71,53 @@ fi
 
 echo "$LOG_TAG deploying ${LOCAL:0:7} -> ${REMOTE:0:7}"
 
+# ---- Pre-pull test gate --------------------------------------------------
+#
+# Run pytest against the INCOMING revision before we actually move HEAD.
+# Strategy: use a throwaway worktree pinned to origin/main so the live tree
+# is never touched. If tests fail, we abort the deploy and ntfy — the live
+# system keeps running on the current (presumably good) HEAD.
+#
+# Why a worktree instead of `git stash + checkout + run + revert`:
+#   • Atomic: failure leaves zero side-effects on the live tree
+#   • Fast: shares the .git dir, no new clone
+#   • Composable with `set -e` — any failure path is auto-handled
+#
+# Why not just trust the dev's local pytest run: humans skip tests when
+# rushed. CI gates are valuable precisely because they don't.
+
+TEST_WORKTREE=$(mktemp -d -p /tmp trading-agent-deploy-test-XXXXXX)
+trap 'rm -rf "$TEST_WORKTREE"' EXIT  # cleanup on any exit path
+
+echo "$LOG_TAG pytest gate: worktree=$TEST_WORKTREE"
+git worktree add --quiet --detach "$TEST_WORKTREE" "$REMOTE"
+
+# Use the LIVE .venv (already has all deps installed from previous syncs).
+# This is fine because:
+#   • If the new commit added a dep that's not yet in .venv, the import will
+#     fail in pytest and we abort — exactly what we want.
+#   • Reusing .venv is ~30s faster than a fresh `uv sync` in the worktree.
+#   • A real `uv sync` happens later in the deploy if pytest passes.
+PYTHON_BIN="$REPO_DIR/.venv/bin/python"
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "$LOG_TAG ERROR live .venv missing $PYTHON_BIN" >&2
+    _notify_ops "deploy ABORTED: .venv missing on EC2 (${REMOTE:0:7})" 5
+    exit 1
+fi
+
+# Run with -q for terse output, -x to fail fast on first error so we don't
+# burn 30s+ on cascading failures. 5-min timeout protects against a hung test.
+if ! ( cd "$TEST_WORKTREE" && timeout 300 "$PYTHON_BIN" -m pytest tests/ -q -x --no-header 2>&1 | tail -30 ); then
+    echo "$LOG_TAG ABORT: pytest failed on ${REMOTE:0:7}"
+    _notify_ops "deploy ABORTED: pytest failed on ${REMOTE:0:7} — live HEAD ${LOCAL:0:7} kept" 5
+    git worktree remove --force "$TEST_WORKTREE" 2>/dev/null || true
+    exit 1
+fi
+
+git worktree remove --force "$TEST_WORKTREE" 2>/dev/null || true
+trap - EXIT
+echo "$LOG_TAG pytest gate PASSED"
+
 # ---- Classify changed paths ----------------------------------------------
 CHANGED_FILES=$(git diff --name-only "$LOCAL" "$REMOTE")
 HAS_DEPS=$(echo "$CHANGED_FILES" | grep -E '^(pyproject\.toml|uv\.lock)$' || true)

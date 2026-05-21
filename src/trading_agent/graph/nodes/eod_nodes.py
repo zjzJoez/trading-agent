@@ -544,6 +544,186 @@ def update_regime_accuracy_labels(state: TradingGraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 4b: compute_ops_summary
+# ---------------------------------------------------------------------------
+
+# Sister of generate_eod_digest. The LLM digest is operator-facing prose;
+# this is the cold-numbers operational rollup ("today: 6 trigger fires,
+# 1 proposal, 1 DEFER, 0 fills, 2 alerts, $0.43 LLM cost"). Sent to the
+# `ops` topic so it sits with healthchecks/deploys, not the `digest` topic
+# (which is the LLM narrative — different consumer use case).
+#
+# The 23-day-silent-trade-engine incident is what motivated this: if this
+# digest had existed earlier we'd have seen "0 candidate_entry dispatches"
+# every day for 23 days and noticed by day 2.
+
+
+def compute_ops_summary(state: TradingGraphState) -> dict:
+    """Aggregate today's agent_events into a programmatic ops digest.
+
+    Bucketing (UTC day):
+      - trigger fires by type (count)
+      - candidates dispatched + DEFER/VETO/APPROVE breakdown
+      - severity > 0 events (count + tail of details)
+      - LLM cost sum from cost_usd column
+      - burn-in counter snapshot
+      - any failed systemd units (joined to failed_units_check event)
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[eod/compute_ops_summary] run_id=%s", run_id)
+
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    summary: dict[str, Any] = {"date": today_utc}
+
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            # Trigger fires today (run_start events) — grouped by trigger
+            cur.execute(
+                """
+                SELECT trigger, COUNT(*)
+                FROM agent_events
+                WHERE event_type = 'run_start'
+                  AND ts::date = CURRENT_DATE
+                GROUP BY trigger
+                ORDER BY trigger
+                """,
+            )
+            summary["trigger_fires"] = {row[0]: int(row[1]) for row in cur.fetchall()}
+
+            # Risk-council decisions today
+            cur.execute(
+                """
+                SELECT payload->>'decision' AS decision, COUNT(*)
+                FROM agent_events
+                WHERE event_type = 'decision_finalized'
+                  AND ts::date = CURRENT_DATE
+                GROUP BY decision
+                """,
+            )
+            summary["decisions"] = {row[0] or "UNKNOWN": int(row[1]) for row in cur.fetchall()}
+
+            # Dispatches (candidate_entry_dispatched)
+            cur.execute(
+                """
+                SELECT COUNT(*) AS dispatched,
+                       COUNT(*) FILTER (WHERE event_type = 'candidate_entry_dispatch_failed') AS failed
+                FROM agent_events
+                WHERE event_type IN ('candidate_entry_dispatched',
+                                     'candidate_entry_dispatch_failed')
+                  AND ts::date = CURRENT_DATE
+                """,
+            )
+            row = cur.fetchone() or (0, 0)
+            summary["dispatches"] = {"ok": int(row[0] or 0), "failed": int(row[1] or 0)}
+
+            # Severity > 0 events — count + tail
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM agent_events
+                WHERE severity > 0 AND ts::date = CURRENT_DATE
+                """,
+            )
+            summary["alerts_total"] = int((cur.fetchone() or (0,))[0] or 0)
+
+            cur.execute(
+                """
+                SELECT ts::time, agent, event_type
+                FROM agent_events
+                WHERE severity > 0 AND ts::date = CURRENT_DATE
+                ORDER BY id DESC LIMIT 5
+                """,
+            )
+            summary["alerts_recent"] = [
+                {"t": str(row[0])[:8], "agent": row[1], "event": row[2]}
+                for row in cur.fetchall()
+            ]
+
+            # LLM cost
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(cost_usd), 0)
+                FROM agent_events
+                WHERE cost_usd IS NOT NULL AND ts::date = CURRENT_DATE
+                """,
+            )
+            summary["llm_cost_usd"] = float((cur.fetchone() or (0,))[0] or 0)
+
+            # Burn-in count
+            cur.execute("SELECT COUNT(*) FROM journal_trades")
+            summary["filled_trades_lifetime"] = int((cur.fetchone() or (0,))[0] or 0)
+
+    except Exception as e:
+        log.warning("[compute_ops_summary] postgres query failed: %s", e)
+        summary["db_error"] = str(e)[:200]
+
+    # Burn-in threshold (also defined in risk/llm.py; kept here for digest
+    # readability — if you bump it there, also bump here).
+    BURN_IN_TARGET = 15
+    filled = summary.get("filled_trades_lifetime", 0)
+    burn_in_remaining = max(0, BURN_IN_TARGET - filled)
+
+    # Compose the body
+    triggers = summary.get("trigger_fires", {})
+    decisions = summary.get("decisions", {})
+    dispatches = summary.get("dispatches", {})
+    alerts = summary.get("alerts_total", 0)
+    cost = summary.get("llm_cost_usd", 0)
+
+    body_lines = [
+        f"{today_utc} UTC",
+        "",
+        f"Trigger fires: " + (
+            ", ".join(f"{k}={v}" for k, v in sorted(triggers.items())) or "none"
+        ),
+        f"Dispatches: ok={dispatches.get('ok', 0)} failed={dispatches.get('failed', 0)}",
+        f"Decisions: " + (
+            ", ".join(f"{k}={v}" for k, v in sorted(decisions.items())) or "none"
+        ),
+        f"Alerts (sev>0): {alerts}",
+        f"LLM cost today: ${cost:.2f}",
+        f"Burn-in: {filled}/{BURN_IN_TARGET} fills ({burn_in_remaining} remaining)",
+    ]
+
+    if summary.get("alerts_recent"):
+        body_lines.append("")
+        body_lines.append("Recent alerts:")
+        for a in summary["alerts_recent"]:
+            body_lines.append(f"  {a['t']} {a['agent']} → {a['event']}")
+
+    body = "\n".join(body_lines)
+
+    # Choose priority: anything > 0 alerts gets default-priority (3); zero
+    # alerts gets quiet (1) so phone doesn't buzz nightly when nothing's wrong.
+    priority = 3 if alerts > 0 or dispatches.get("failed", 0) > 0 else 1
+
+    try:
+        from trading_agent.notify import send as ntfy_send
+        ntfy_send(
+            topic="ops",
+            title=f"Daily ops summary — {today_utc}",
+            body=body,
+            priority=priority,
+            tags=["bar_chart"],
+        )
+        ntfy_status = "sent"
+    except Exception as e:
+        log.warning("[compute_ops_summary] ntfy failed: %s", e)
+        ntfy_status = f"failed: {e}"
+
+    emit(
+        run_id=run_id, trigger=trigger, agent="compute_ops_summary",
+        event_type="ops_summary_pushed",
+        payload={"summary": summary, "ntfy_status": ntfy_status, "priority": priority},
+    )
+
+    journal_payload = dict(state.get("journal") or {})
+    journal_payload["ops_summary"] = summary
+    return {"journal": journal_payload}
+
+
+# ---------------------------------------------------------------------------
 # Node 5: generate_eod_digest
 # ---------------------------------------------------------------------------
 

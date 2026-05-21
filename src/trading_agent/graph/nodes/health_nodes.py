@@ -157,6 +157,178 @@ def postgres_health(state: TradingGraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 2b: disk_health
+# ---------------------------------------------------------------------------
+
+# Tuned for a 49G EC2 root volume. 80% = ~10G headroom remaining, still safe
+# for a typical daily polymarket backup spike. 95% = critical: Postgres has
+# died before at 100% (5/19 incident — "could not write init file"), so we
+# want a phone-buzzing alert at 95 with ~5 min of action runway before things
+# break, not a polite reminder.
+DISK_WARN_PCT = 80
+DISK_CRIT_PCT = 95
+
+
+def disk_health(state: TradingGraphState) -> dict:
+    """Check root filesystem usage. Ntfy ops if usage exceeds thresholds.
+
+    Tiers:
+      <80%  → silent OK
+      80-94 → priority=4 warning (sound, but not urgent)
+      ≥95%  → priority=5 critical (alarm), severity=error
+
+    The 5/19/2026 outage (Postgres died with disk at 100%) is what motivated
+    this node — there was no early-warning signal before PG started failing.
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[health/disk_health] run_id=%s", run_id)
+
+    import shutil
+    t0 = time.monotonic()
+    usage = shutil.disk_usage("/")
+    used_pct = int((usage.used / usage.total) * 100)
+    free_gb = round(usage.free / (1024 ** 3), 1)
+    used_gb = round(usage.used / (1024 ** 3), 1)
+    total_gb = round(usage.total / (1024 ** 3), 1)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    payload = {
+        "used_pct": used_pct,
+        "used_gb": used_gb,
+        "free_gb": free_gb,
+        "total_gb": total_gb,
+        "latency_ms": elapsed_ms,
+    }
+
+    if used_pct >= DISK_CRIT_PCT:
+        emit(
+            run_id=run_id, trigger=trigger, agent="disk_health",
+            event_type="disk_critical",
+            severity=SEV_ERROR,
+            payload=payload,
+        )
+        _alert_ops(
+            title=f"DISK CRITICAL — {used_pct}% used",
+            body=(
+                f"Root filesystem at {used_pct}% ({used_gb}G/{total_gb}G).\n"
+                f"Free: {free_gb}G. Postgres will fail to write very soon.\n"
+                f"Investigate /home/ubuntu/{{backups,polymarket-mvp/var}} and /tmp."
+            ),
+        )
+    elif used_pct >= DISK_WARN_PCT:
+        emit(
+            run_id=run_id, trigger=trigger, agent="disk_health",
+            event_type="disk_high",
+            severity=SEV_INFO,
+            payload=payload,
+        )
+        # Priority 4 (sound notification) but NOT priority 5 (alarm).
+        try:
+            from trading_agent.notify import send as ntfy_send
+            ntfy_send(
+                topic="ops",
+                title=f"Disk {used_pct}% — investigate within hours",
+                body=(
+                    f"Root filesystem at {used_pct}% ({used_gb}G/{total_gb}G).\n"
+                    f"Free: {free_gb}G. Not critical yet but trend is bad.\n"
+                    f"`df -h` + `du -sh /home/ubuntu/* /tmp/*` to investigate."
+                ),
+                priority=4,
+                tags=["warning", "floppy_disk"],
+            )
+        except Exception as e:
+            log.warning("[disk_health] ntfy send failed: %s", e)
+    else:
+        emit(
+            run_id=run_id, trigger=trigger, agent="disk_health",
+            event_type="disk_ok",
+            payload=payload,
+        )
+
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Node 2c: failed_units_check
+# ---------------------------------------------------------------------------
+
+# Unit prefixes worth alerting on. We exclude well-known noisy units (man-db
+# rebuilds, logrotate transient failures) that recover on their own. Anything
+# starting with "trading-agent" or one of these prefixes will fire an alert
+# when it lands in `systemctl --failed`.
+TRACKED_UNIT_PREFIXES = (
+    "trading-agent-",   # our own brain/dispatch/auto-deploy
+    "polymarket-",      # sibling project (shared disk; failures often correlate)
+    "alpha-lab-",       # sibling project
+    "postgresql",       # the foundation
+    "db-backup",        # daily DB backup
+)
+
+
+def failed_units_check(state: TradingGraphState) -> dict:
+    """Scan systemctl --failed for tracked units and ntfy if any are failing.
+
+    Caught the 5/19 outage post-hoc — db-backup, alpha-lab-clv, alpha-lab-odds,
+    logrotate, and man-db were all silently failed for days before anyone
+    noticed. This node flips that to a phone alert within the next healthcheck
+    tick (worst case 1 hour).
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[health/failed_units_check] run_id=%s", run_id)
+
+    import subprocess
+    t0 = time.monotonic()
+    failed_units: list[str] = []
+    try:
+        r = subprocess.run(
+            ["systemctl", "list-units", "--failed", "--no-legend", "--plain"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Format: "unit.service loaded failed failed Description..."
+            unit_name = line.split()[0] if line.split() else ""
+            if unit_name and any(unit_name.startswith(p) for p in TRACKED_UNIT_PREFIXES):
+                failed_units.append(unit_name)
+    except Exception as e:
+        log.warning("[failed_units_check] systemctl call failed: %s", e)
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    if not failed_units:
+        emit(
+            run_id=run_id, trigger=trigger, agent="failed_units_check",
+            event_type="failed_units_clean",
+            payload={"latency_ms": elapsed_ms},
+        )
+        return {}
+
+    emit(
+        run_id=run_id, trigger=trigger, agent="failed_units_check",
+        event_type="failed_units_detected",
+        severity=SEV_ERROR,
+        payload={"count": len(failed_units), "units": failed_units,
+                 "latency_ms": elapsed_ms},
+    )
+
+    _alert_ops(
+        title=f"{len(failed_units)} tracked unit(s) FAILED",
+        body=(
+            "Failed systemd units detected:\n"
+            + "\n".join(f"  • {u}" for u in failed_units[:10])
+            + (f"\n  ... and {len(failed_units)-10} more" if len(failed_units) > 10 else "")
+            + "\n\n`sudo systemctl status <unit>` to investigate, then "
+              "`sudo systemctl reset-failed <unit>` once fixed."
+        ),
+    )
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Node 3: ntfy_health
 # ---------------------------------------------------------------------------
 

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 log = logging.getLogger(__name__)
@@ -693,3 +693,191 @@ async def api_system():
         "subgraphs_count": 6,
         "channels": ["claude_code", "codex", "deepseek"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Burn-in + R5 gate visibility (Phase 4 review)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/learning/burn-in")
+async def api_burn_in():
+    """Current state of the LLM Risk Council burn-in counter.
+
+    The council force-invokes its full multi-LLM debate for the first N
+    filled trades, regardless of regime or deterministic decision. After N,
+    it falls back to the conditional rules. This endpoint exposes how far
+    along we are so the mobile dashboard can show "5/15 burn-in trades" at
+    a glance instead of having to grep the events table.
+    """
+    from trading_agent.risk.llm import COUNCIL_BURN_IN_TRADE_COUNT
+    filled = 0
+    last_council_decisions: list[dict] = []
+    try:
+        with _pg_cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM journal_trades")
+            filled = int((cur.fetchone() or (0,))[0] or 0)
+            # Recent council-touched runs for context
+            cur.execute(
+                """
+                SELECT ts, payload->>'decision' AS decision,
+                       payload->'trigger_reasons' AS reasons,
+                       run_id
+                FROM agent_events
+                WHERE agent = 'maybe_risk_llm_council'
+                  AND event_type = 'council_reviewed'
+                ORDER BY id DESC LIMIT 10
+                """,
+            )
+            for row in cur.fetchall():
+                last_council_decisions.append({
+                    "ts": row[0].isoformat() if row[0] else None,
+                    "decision": row[1],
+                    "reasons": row[2],
+                    "run_id": row[3],
+                })
+    except Exception as e:
+        return {"error": str(e)[:200], "threshold": COUNCIL_BURN_IN_TRADE_COUNT}
+
+    return {
+        "filled_count": filled,
+        "threshold": COUNCIL_BURN_IN_TRADE_COUNT,
+        "remaining": max(0, COUNCIL_BURN_IN_TRADE_COUNT - filled),
+        "active": filled < COUNCIL_BURN_IN_TRADE_COUNT,
+        "recent_council_decisions": last_council_decisions,
+    }
+
+
+@app.get("/api/risk/r5-gate")
+async def api_r5_gate():
+    """R5 (option policy) sizing-gate visibility.
+
+    R5 is a hard sizing block on option entries — long-premium only, DTE in
+    [14,60], |delta| in [0.30,0.55], single-trade notional ≤ 1% of equity.
+    Today's NVDA proposal was blocked here; this endpoint lets the operator
+    see exactly which option proposals tripped the rule recently, and which
+    of the 4 sub-checks fired most often.
+    """
+    from trading_agent.sizing import (
+        MAX_OPTION_NOTIONAL_PCT, OPTION_DTE_MIN, OPTION_DTE_MAX,
+        OPTION_DELTA_MIN, OPTION_DELTA_MAX,
+    )
+    thresholds = {
+        "side": "BUY",
+        "dte_min": OPTION_DTE_MIN,
+        "dte_max": OPTION_DTE_MAX,
+        "delta_abs_min": OPTION_DELTA_MIN,
+        "delta_abs_max": OPTION_DELTA_MAX,
+        "max_notional_pct_equity": MAX_OPTION_NOTIONAL_PCT,
+    }
+    recent_blocks: list[dict] = []
+    try:
+        with _pg_cursor() as cur:
+            cur.execute(
+                """
+                SELECT ts, run_id, payload->>'ticker' AS ticker,
+                       payload->'blockers' AS blockers,
+                       payload->'rules_breached' AS rules
+                FROM agent_events
+                WHERE event_type IN ('infeasible', 'guardrails_evaluated')
+                  AND (
+                       (payload::text LIKE '%R5_option_policy%')
+                       OR (payload::text LIKE '%R5%')
+                  )
+                  AND ts > NOW() - INTERVAL '14 days'
+                ORDER BY id DESC LIMIT 20
+                """,
+            )
+            for row in cur.fetchall():
+                recent_blocks.append({
+                    "ts": row[0].isoformat() if row[0] else None,
+                    "run_id": row[1],
+                    "ticker": row[2],
+                    "blockers": row[3],
+                    "rules_breached": row[4],
+                })
+    except Exception as e:
+        return {"thresholds": thresholds, "error": str(e)[:200]}
+
+    return {
+        "thresholds": thresholds,
+        "recent_blocks_14d": recent_blocks,
+        "block_count_14d": len(recent_blocks),
+    }
+
+
+@app.get("/api/ops/summary")
+async def api_ops_summary():
+    """Today's ops digest — same data as the EOD ntfy push.
+
+    Cheaper than running the EOD graph on demand: queries
+    `agent_events` directly. Use this from the mobile dashboard for the
+    real-time "today so far" view.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    today_utc = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+    out: dict[str, Any] = {"date": today_utc}
+    try:
+        with _pg_cursor() as cur:
+            cur.execute(
+                """
+                SELECT trigger, COUNT(*) FROM agent_events
+                WHERE event_type='run_start' AND ts::date=CURRENT_DATE
+                GROUP BY trigger
+                """,
+            )
+            out["trigger_fires"] = {r[0]: int(r[1]) for r in cur.fetchall()}
+
+            cur.execute(
+                """
+                SELECT payload->>'decision', COUNT(*) FROM agent_events
+                WHERE event_type='decision_finalized' AND ts::date=CURRENT_DATE
+                GROUP BY 1
+                """,
+            )
+            out["decisions"] = {(r[0] or "UNK"): int(r[1]) for r in cur.fetchall()}
+
+            cur.execute(
+                """
+                SELECT
+                  COUNT(*) FILTER (WHERE event_type='candidate_entry_dispatched'),
+                  COUNT(*) FILTER (WHERE event_type='candidate_entry_dispatch_failed')
+                FROM agent_events
+                WHERE event_type LIKE 'candidate_entry%'
+                  AND ts::date=CURRENT_DATE
+                """,
+            )
+            row = cur.fetchone() or (0, 0)
+            out["dispatches"] = {"ok": int(row[0] or 0), "failed": int(row[1] or 0)}
+
+            cur.execute(
+                "SELECT COUNT(*) FROM agent_events WHERE severity>0 AND ts::date=CURRENT_DATE",
+            )
+            out["alerts_today"] = int((cur.fetchone() or (0,))[0] or 0)
+
+            cur.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0) FROM agent_events WHERE ts::date=CURRENT_DATE",
+            )
+            out["llm_cost_usd"] = float((cur.fetchone() or (0,))[0] or 0)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Mobile dashboard (single-page HTML)
+# ---------------------------------------------------------------------------
+
+@app.get("/mobile", response_class=HTMLResponse)
+async def mobile_dashboard():
+    """Mobile-optimized single-page dashboard.
+
+    Self-contained HTML+CSS+JS — Tailwind via CDN, vanilla JS only, no build
+    step. Pulls from existing /api/* endpoints with 30 s auto-refresh. The
+    layout is dark-themed, stacks vertically, large touch targets — designed
+    for one-handed phone use.
+    """
+    from pathlib import Path
+    mobile_path = Path(__file__).parent / "static" / "mobile.html"
+    if not mobile_path.exists():
+        return HTMLResponse("<h1>mobile.html missing</h1>", status_code=500)
+    return HTMLResponse(mobile_path.read_text(encoding="utf-8"))

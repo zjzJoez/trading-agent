@@ -175,6 +175,7 @@ def build_eod_review_graph():
     g.add_node("update_regime_accuracy_labels", EOD.update_regime_accuracy_labels)
     g.add_node("enrich_outcomes", EL.enrich_outcomes_node)
     g.add_node("promote_or_rollback", EL.promote_or_rollback_node)
+    g.add_node("compute_ops_summary", EOD.compute_ops_summary)
     g.add_node("generate_eod_digest", EOD.generate_eod_digest)
     g.add_node("ntfy_daily_summary", EOD.ntfy_daily_summary)
 
@@ -185,7 +186,8 @@ def build_eod_review_graph():
     g.add_edge("persist_daily_marks", "update_regime_accuracy_labels")
     g.add_edge("update_regime_accuracy_labels", "enrich_outcomes")
     g.add_edge("enrich_outcomes", "promote_or_rollback")
-    g.add_edge("promote_or_rollback", "generate_eod_digest")
+    g.add_edge("promote_or_rollback", "compute_ops_summary")
+    g.add_edge("compute_ops_summary", "generate_eod_digest")
     g.add_edge("generate_eod_digest", "ntfy_daily_summary")
     g.add_edge("ntfy_daily_summary", END)
 
@@ -199,11 +201,15 @@ def build_healthcheck_graph():
     g = StateGraph(TradingGraphState)
     g.add_node("opend_health", H.opend_health)
     g.add_node("postgres_health", H.postgres_health)
+    g.add_node("disk_health", H.disk_health)
+    g.add_node("failed_units_check", H.failed_units_check)
     g.add_node("ntfy_health", H.ntfy_health)
 
     g.add_edge(START, "opend_health")
     g.add_edge("opend_health", "postgres_health")
-    g.add_edge("postgres_health", "ntfy_health")
+    g.add_edge("postgres_health", "disk_health")
+    g.add_edge("disk_health", "failed_units_check")
+    g.add_edge("failed_units_check", "ntfy_health")
     g.add_edge("ntfy_health", END)
 
     return g.compile(checkpointer=get_saver())

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#0a0a0a" />
+<title>trading-agent</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='44' fill='none' stroke='%2310b981' stroke-width='6'/></svg>" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        bg:    '#0a0a0a',
+        card:  '#171717',
+        cardb: '#262626',
+        muted: '#737373',
+        text:  '#e5e5e5',
+        ok:    '#10b981',
+        warn:  '#f59e0b',
+        err:   '#ef4444',
+        info:  '#3b82f6',
+      },
+      fontFamily: {
+        mono: ['ui-monospace','SFMono-Regular','Menlo','Consolas','monospace'],
+      },
+    },
+  },
+};
+</script>
+<style>
+  html, body { background: #0a0a0a; color: #e5e5e5; -webkit-font-smoothing: antialiased; }
+  .num { font-variant-numeric: tabular-nums; }
+  .skel { background: linear-gradient(90deg,#262626,#404040,#262626); background-size: 200% 100%; animation: shimmer 1.4s infinite linear; }
+  @keyframes shimmer { 0% {background-position:200% 0;} 100% {background-position:-200% 0;} }
+  .pill { font-size: .65rem; letter-spacing: .04em; padding: 2px 7px; border-radius: 9999px; text-transform: uppercase; font-weight: 600; }
+  /* Safe-area handling for iPhone X+ notch */
+  body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+</style>
+</head>
+<body class="font-sans">
+
+<header class="sticky top-0 z-20 bg-bg/90 backdrop-blur border-b border-cardb px-4 py-3 flex items-center justify-between">
+  <div>
+    <div class="text-base font-semibold">trading-agent</div>
+    <div id="last-refresh" class="text-xs text-muted num">—</div>
+  </div>
+  <div class="flex items-center gap-2">
+    <span id="halt-pill" class="pill bg-ok/20 text-ok hidden">HALT</span>
+    <button id="refresh-btn" class="bg-cardb active:bg-card text-text text-xs px-3 py-2 rounded-lg" onclick="loadAll(true)">↻</button>
+  </div>
+</header>
+
+<main class="p-3 space-y-3 max-w-screen-md mx-auto">
+
+  <!-- Regime card -->
+  <section class="bg-card rounded-2xl p-4 border border-cardb">
+    <div class="flex items-center justify-between mb-2">
+      <div class="text-xs uppercase tracking-wider text-muted">Market regime</div>
+      <div id="regime-model" class="text-xs text-muted">—</div>
+    </div>
+    <div class="flex items-end justify-between">
+      <div id="regime-label" class="text-2xl font-semibold tracking-tight">—</div>
+      <div class="text-right">
+        <div id="regime-conf" class="text-lg num">—</div>
+        <div class="text-xs text-muted">confidence</div>
+      </div>
+    </div>
+    <div class="mt-3 grid grid-cols-3 gap-2 text-center">
+      <div class="bg-cardb rounded-lg p-2">
+        <div id="regime-size-mult" class="text-sm num">—</div>
+        <div class="text-[10px] text-muted uppercase">size mult</div>
+      </div>
+      <div class="bg-cardb rounded-lg p-2">
+        <div id="regime-crisis" class="text-sm">—</div>
+        <div class="text-[10px] text-muted uppercase">crisis</div>
+      </div>
+      <div class="bg-cardb rounded-lg p-2">
+        <div id="regime-allowed" class="text-sm">—</div>
+        <div class="text-[10px] text-muted uppercase">entries</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Today's ops summary -->
+  <section class="bg-card rounded-2xl p-4 border border-cardb">
+    <div class="flex items-center justify-between mb-2">
+      <div class="text-xs uppercase tracking-wider text-muted">Today</div>
+      <div id="ops-date" class="text-xs text-muted num">—</div>
+    </div>
+    <div class="grid grid-cols-2 gap-2">
+      <div class="bg-cardb rounded-lg p-3">
+        <div id="ops-fires" class="text-xl font-semibold num">—</div>
+        <div class="text-xs text-muted">trigger fires</div>
+      </div>
+      <div class="bg-cardb rounded-lg p-3">
+        <div id="ops-dispatch" class="text-xl font-semibold num">—</div>
+        <div class="text-xs text-muted">dispatches</div>
+      </div>
+      <div class="bg-cardb rounded-lg p-3">
+        <div id="ops-alerts" class="text-xl font-semibold num">—</div>
+        <div class="text-xs text-muted">alerts (sev&gt;0)</div>
+      </div>
+      <div class="bg-cardb rounded-lg p-3">
+        <div id="ops-cost" class="text-xl font-semibold num">—</div>
+        <div class="text-xs text-muted">LLM cost USD</div>
+      </div>
+    </div>
+    <div id="ops-decisions" class="mt-3 text-xs text-muted">decisions: —</div>
+  </section>
+
+  <!-- Burn-in progress -->
+  <section class="bg-card rounded-2xl p-4 border border-cardb">
+    <div class="flex items-center justify-between mb-1">
+      <div class="text-xs uppercase tracking-wider text-muted">Burn-in</div>
+      <div id="burn-in-status" class="pill bg-warn/20 text-warn">—</div>
+    </div>
+    <div class="flex items-end gap-2 mt-1">
+      <div id="burn-in-count" class="text-2xl font-semibold num">—</div>
+      <div class="text-muted text-sm pb-1">/ <span id="burn-in-target">—</span> fills</div>
+    </div>
+    <div class="mt-2 h-2 bg-cardb rounded-full overflow-hidden">
+      <div id="burn-in-bar" class="h-full bg-info rounded-full" style="width:0%"></div>
+    </div>
+    <div id="burn-in-note" class="mt-2 text-xs text-muted">—</div>
+  </section>
+
+  <!-- Open positions -->
+  <section class="bg-card rounded-2xl p-4 border border-cardb">
+    <div class="flex items-center justify-between mb-2">
+      <div class="text-xs uppercase tracking-wider text-muted">Open positions</div>
+      <div id="pos-count" class="text-xs text-muted">—</div>
+    </div>
+    <div id="pos-list" class="space-y-2">
+      <div class="skel h-12 rounded-lg"></div>
+    </div>
+  </section>
+
+  <!-- Recent alerts -->
+  <section class="bg-card rounded-2xl p-4 border border-cardb">
+    <div class="text-xs uppercase tracking-wider text-muted mb-2">Recent alerts</div>
+    <div id="alerts-list" class="space-y-2">
+      <div class="skel h-10 rounded-lg"></div>
+    </div>
+  </section>
+
+  <!-- Pipeline (timer last-fire) -->
+  <section class="bg-card rounded-2xl p-4 border border-cardb">
+    <div class="text-xs uppercase tracking-wider text-muted mb-2">Pipeline</div>
+    <div id="pipeline-list" class="space-y-2">
+      <div class="skel h-10 rounded-lg"></div>
+    </div>
+  </section>
+
+  <footer class="text-center text-xs text-muted py-4">
+    <div>trading-agent · mobile</div>
+    <div class="num">auto-refresh 30s · <a href="/" class="underline">desktop</a></div>
+  </footer>
+
+</main>
+
+<script>
+// ----- helpers ---------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+async function jget(url) {
+  try {
+    const r = await fetch(url, {cache: 'no-store'});
+    if (!r.ok) throw new Error(r.status);
+    return await r.json();
+  } catch (e) {
+    console.warn('fetch', url, e);
+    return null;
+  }
+}
+function fmtNum(n, d=0) {
+  if (n === null || n === undefined || Number.isNaN(n)) return '—';
+  return Number(n).toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d});
+}
+function fmtPct(n, d=1) {
+  if (n === null || n === undefined) return '—';
+  return (Number(n)*100).toFixed(d) + '%';
+}
+function relTime(iso) {
+  if (!iso) return '';
+  const dt = new Date(iso);
+  const s = Math.floor((Date.now() - dt.getTime()) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+
+// ----- regime card -----------------------------------------------------------
+function renderRegime(status, regime) {
+  if (!status) return;
+  const label = status.regime_label || '—';
+  $('regime-label').textContent = label;
+  $('regime-conf').textContent = fmtPct(status.regime_confidence, 1);
+  $('regime-size-mult').textContent = fmtNum(status.size_multiplier, 2);
+
+  // Colour the label by regime
+  const colors = {
+    'BULL_TREND': 'text-ok',
+    'RANGE_LOW_VOL': 'text-info',
+    'BEAR_TREND': 'text-warn',
+    'VOLATILE_TRANSITION': 'text-warn',
+    'CRISIS': 'text-err',
+  };
+  $('regime-label').className = 'text-2xl font-semibold tracking-tight ' + (colors[label] || 'text-text');
+
+  if (regime) {
+    const cf = regime.crisis_flags || [];
+    $('regime-crisis').textContent = cf.length ? cf.join(',') : 'none';
+    $('regime-crisis').className = 'text-sm ' + (cf.length ? 'text-err font-semibold' : 'text-muted');
+    $('regime-allowed').textContent = regime.allow_new_entries ? 'YES' : 'NO';
+    $('regime-allowed').className = 'text-sm ' + (regime.allow_new_entries ? 'text-ok' : 'text-err');
+    if (regime.model_version_id) {
+      $('regime-model').textContent = 'HMM v' + regime.model_version_id;
+    }
+  }
+
+  // Halt pill
+  const halt = $('halt-pill');
+  if (status.halted) {
+    halt.classList.remove('hidden');
+    halt.className = 'pill bg-err/20 text-err';
+  } else {
+    halt.classList.add('hidden');
+  }
+}
+
+// ----- ops summary -----------------------------------------------------------
+function renderOps(ops) {
+  if (!ops) return;
+  $('ops-date').textContent = ops.date || '';
+  const fires = ops.trigger_fires || {};
+  const totalFires = Object.values(fires).reduce((a,b) => a+b, 0);
+  $('ops-fires').textContent = fmtNum(totalFires);
+  const disp = ops.dispatches || {};
+  const ok = disp.ok || 0, failed = disp.failed || 0;
+  $('ops-dispatch').innerHTML = failed > 0
+    ? `<span class="text-text">${ok}</span> <span class="text-err text-sm">/${failed}✗</span>`
+    : `${ok}`;
+  const alerts = ops.alerts_today || 0;
+  $('ops-alerts').textContent = fmtNum(alerts);
+  $('ops-alerts').className = 'text-xl font-semibold num ' + (alerts > 0 ? 'text-warn' : 'text-text');
+  $('ops-cost').textContent = '$' + fmtNum(ops.llm_cost_usd, 2);
+
+  const decisions = ops.decisions || {};
+  const parts = Object.entries(decisions).map(([k,v]) => `${k}=${v}`);
+  $('ops-decisions').textContent = 'decisions: ' + (parts.length ? parts.join(' · ') : 'none');
+}
+
+// ----- burn-in ---------------------------------------------------------------
+function renderBurnIn(b) {
+  if (!b) return;
+  $('burn-in-count').textContent = b.filled_count;
+  $('burn-in-target').textContent = b.threshold;
+  const pct = Math.min(100, (b.filled_count / b.threshold) * 100);
+  $('burn-in-bar').style.width = pct + '%';
+  if (b.active) {
+    $('burn-in-status').textContent = 'ACTIVE';
+    $('burn-in-status').className = 'pill bg-warn/20 text-warn';
+    $('burn-in-note').textContent =
+      b.remaining + ' more fills until council goes conditional. ' +
+      'Every approved trade currently gets LLM-council DEFER review.';
+  } else {
+    $('burn-in-status').textContent = 'CLEAR';
+    $('burn-in-status').className = 'pill bg-ok/20 text-ok';
+    $('burn-in-note').textContent = 'Council now uses conditional rules (regime/earnings/etc.).';
+  }
+}
+
+// ----- positions -------------------------------------------------------------
+function renderPositions(p) {
+  const list = $('pos-list');
+  if (!p || !p.rows) { list.innerHTML = '<div class="text-muted text-sm">—</div>'; return; }
+  $('pos-count').textContent = p.rows.length + ' pos';
+  if (p.rows.length === 0) {
+    list.innerHTML = '<div class="text-muted text-sm text-center py-2">no open positions</div>';
+    return;
+  }
+  list.innerHTML = p.rows.map(pos => {
+    const pnl = Number(pos.unrealized_pnl ?? 0);
+    const pnlClass = pnl > 0 ? 'text-ok' : (pnl < 0 ? 'text-err' : 'text-muted');
+    const pnlSign = pnl >= 0 ? '+' : '';
+    const sym = pos.label || pos.symbol || '?';
+    const dteStr = pos.dte !== null && pos.dte !== undefined ? ` · ${pos.dte}d` : '';
+    return `
+      <div class="bg-cardb rounded-lg p-3 flex items-center justify-between">
+        <div class="min-w-0 flex-1">
+          <div class="text-sm font-medium truncate">${sym}</div>
+          <div class="text-xs text-muted num">qty ${pos.qty} · mark ${fmtNum(pos.mark, 2)}${dteStr}</div>
+        </div>
+        <div class="text-right">
+          <div class="text-sm font-semibold num ${pnlClass}">${pnlSign}${fmtNum(pnl, 0)}</div>
+          <div class="text-xs text-muted num">${fmtPct(pos.pl_ratio/100, 1)}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ----- alerts ----------------------------------------------------------------
+function renderAlerts(events) {
+  const list = $('alerts-list');
+  if (!events || !events.rows) { list.innerHTML = '<div class="text-muted text-sm">—</div>'; return; }
+  const alerts = events.rows.filter(e => (e.severity || 0) > 0).slice(0, 8);
+  if (alerts.length === 0) {
+    list.innerHTML = '<div class="text-muted text-sm text-center py-2">no alerts in last 24h</div>';
+    return;
+  }
+  list.innerHTML = alerts.map(e => {
+    const sev = e.severity || 0;
+    const sevColor = sev >= 2 ? 'text-err' : 'text-warn';
+    return `
+      <div class="bg-cardb rounded-lg p-2 flex items-start justify-between gap-2">
+        <div class="min-w-0 flex-1">
+          <div class="text-sm ${sevColor} font-medium">${e.event_type}</div>
+          <div class="text-xs text-muted truncate">${e.agent}</div>
+        </div>
+        <div class="text-xs text-muted num shrink-0">${relTime(e.ts)}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ----- pipeline --------------------------------------------------------------
+function renderPipeline(pipeline) {
+  const list = $('pipeline-list');
+  const rows = pipeline?.pipeline || pipeline?.subgraphs || pipeline?.rows;
+  if (!rows) { list.innerHTML = '<div class="text-muted text-sm">—</div>'; return; }
+  list.innerHTML = rows.map(s => {
+    const stale = s.last_run_relative && s.last_run_relative.includes('h ago') && parseInt(s.last_run_relative) > 24;
+    const dotClass = stale ? 'bg-warn' : (s.last_run_at ? 'bg-ok' : 'bg-muted');
+    return `
+      <div class="bg-cardb rounded-lg p-2 flex items-center justify-between">
+        <div class="flex items-center gap-2 min-w-0">
+          <div class="w-2 h-2 rounded-full ${dotClass}"></div>
+          <div class="text-sm truncate">${s.trigger}</div>
+        </div>
+        <div class="text-xs text-muted num shrink-0">${s.last_run_relative || 'never'}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ----- master loader ---------------------------------------------------------
+async function loadAll(showSpinner=false) {
+  if (showSpinner) $('refresh-btn').textContent = '…';
+
+  const [status, regime, ops, burnIn, positions, events, pipeline] = await Promise.all([
+    jget('/api/status'),
+    jget('/api/regime'),
+    jget('/api/ops/summary'),
+    jget('/api/learning/burn-in'),
+    jget('/api/positions'),
+    jget('/api/events?limit=30'),
+    jget('/api/pipeline'),
+  ]);
+
+  renderRegime(status, regime?.current);
+  renderOps(ops);
+  renderBurnIn(burnIn);
+  renderPositions(positions);
+  renderAlerts(events);
+  renderPipeline(pipeline);
+
+  $('last-refresh').textContent = 'refreshed ' + new Date().toLocaleTimeString();
+  $('refresh-btn').textContent = '↻';
+}
+
+// initial load + 30 s auto-refresh
+loadAll();
+setInterval(loadAll, 30000);
+
+// Refresh when tab becomes visible (mobile users foregrounding the app)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') loadAll();
+});
+</script>
+
+</body>
+</html>
