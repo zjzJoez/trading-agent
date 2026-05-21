@@ -22,17 +22,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from trading_agent.config import CONFIG, ensure_dirs
 from trading_agent.db import connection, migrate
+
+log = logging.getLogger(__name__)
+
+# Network failure tolerance. Single rsync failures happen often (laptop on
+# transit, EC2 momentarily unreachable, residential ISP hiccup). Don't
+# wake the user up for those — only escalate after RSYNC_MAX_ATTEMPTS
+# consecutive failures, which represents a real outage.
+RSYNC_MAX_ATTEMPTS = 3
+RSYNC_BACKOFF_BASE = 15  # 15s, 30s, 60s (exponential)
 
 
 MERGE_TABLES = {
@@ -51,11 +62,51 @@ def _now() -> str:
 
 
 def _rsync(remote: str, remote_path: str, local_path: Path) -> None:
+    """Rsync with retry. Raises only after RSYNC_MAX_ATTEMPTS consecutive
+    failures; transient network errors get one shot at recovery.
+
+    On final failure, fires an ntfy alert on the `ops` topic so the operator
+    finds out within seconds instead of next morning. Notification is
+    best-effort — falls back to /data/notifications.log if ntfy unreachable.
+    """
     src = f"{remote}:{remote_path}"
     cmd = ["rsync", "-az", "--partial", "--timeout=60", src, str(local_path)]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    if r.returncode != 0:
-        raise RuntimeError(f"rsync failed: {r.stderr.strip()}")
+    last_err = ""
+    for attempt in range(1, RSYNC_MAX_ATTEMPTS + 1):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            if attempt > 1:
+                log.info("[db_sync] rsync recovered on attempt %d", attempt)
+            return
+        last_err = r.stderr.strip()
+        if attempt < RSYNC_MAX_ATTEMPTS:
+            wait = RSYNC_BACKOFF_BASE * (2 ** (attempt - 1))
+            log.warning(
+                "[db_sync] rsync attempt %d/%d failed (%s) — retry in %ds",
+                attempt, RSYNC_MAX_ATTEMPTS, last_err[:120], wait,
+            )
+            time.sleep(wait)
+
+    # All retries exhausted — alert + raise.
+    try:
+        from trading_agent.notify import send as ntfy_send
+        ntfy_send(
+            topic="ops",
+            title="db_sync rsync failed",
+            body=(
+                f"All {RSYNC_MAX_ATTEMPTS} rsync attempts to {remote} failed.\n"
+                f"Last error: {last_err[:240]}\n"
+                f"Check EC2 reachability / disk / OpenSSH."
+            ),
+            priority=4,
+            tags=["warning", "satellite_antenna"],
+        )
+    except Exception as e:
+        log.error("[db_sync] ntfy alert send failed: %s", e)
+
+    raise RuntimeError(
+        f"rsync failed after {RSYNC_MAX_ATTEMPTS} attempts: {last_err}"
+    )
 
 
 def _merge_table(local: sqlite3.Connection, remote: sqlite3.Connection,

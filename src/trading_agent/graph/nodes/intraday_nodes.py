@@ -552,20 +552,30 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
     # a position the journal doesn't know about (i.e. user-placed manual fills).
     # Multi-source resolver: SQLite journal MCP first (canonical), then
     # Postgres journal_trades as a fallback when SQLite is empty / out of sync.
-    # Value is (trade_id, source) where source ∈ {"sqlite", "postgres"}.
-    journal_trade_id_by_symbol: dict[str, tuple[int, str]] = {}
+    # Value is (trade_id, thesis_id, source) where source ∈ {"sqlite", "postgres"}.
+    # thesis_id is included so close_thesis can fire after a successful exit —
+    # otherwise the thesis stays status='open' forever and creates a zombie row
+    # that blocks /eod-review hygiene checks.
+    journal_trade_id_by_symbol: dict[str, tuple[int, int | None, str]] = {}
 
     # Source 1: SQLite journal MCP
+    journal_close_thesis = None  # type: ignore[assignment]
     try:
         from trading_agent.mcp_servers.journal.server import (
+            close_thesis as journal_close_thesis,  # noqa: F811 - assignment from import
             close_trade as journal_close_trade,
             get_open_positions_with_thesis,
         )
         for row in (get_open_positions_with_thesis().get("rows") or []):
             sym = row.get("symbol")
             tid = row.get("trade_id")
+            th_id = row.get("thesis_id")
             if sym and tid:
-                journal_trade_id_by_symbol[str(sym)] = (int(tid), "sqlite")
+                journal_trade_id_by_symbol[str(sym)] = (
+                    int(tid),
+                    int(th_id) if th_id is not None else None,
+                    "sqlite",
+                )
     except Exception as e:
         log.warning("[route_exit_or_hold] sqlite journal lookup failed: %s", e)
         journal_close_trade = None  # type: ignore[assignment]
@@ -578,14 +588,21 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             with cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, symbol FROM journal_trades
+                    SELECT id, symbol, thesis_id FROM journal_trades
                     WHERE outcome = 'OPEN' AND symbol = ANY(%s)
                     ORDER BY opened_at DESC
                     """,
                     (list(needed_symbols),),
                 )
-                for tid, sym in cur.fetchall():
-                    journal_trade_id_by_symbol.setdefault(str(sym), (int(tid), "postgres"))
+                for tid, sym, th_id in cur.fetchall():
+                    journal_trade_id_by_symbol.setdefault(
+                        str(sym),
+                        (
+                            int(tid),
+                            int(th_id) if th_id is not None else None,
+                            "postgres",
+                        ),
+                    )
         except Exception as e:
             log.warning("[route_exit_or_hold] postgres journal fallback failed: %s", e)
 
@@ -622,7 +639,7 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             )
             skipped_no_journal.append(symbol)
             continue
-        trade_id, trade_id_source = resolved
+        trade_id, thesis_id, trade_id_source = resolved
 
         full_qty = float(pos.get("qty") or 0)
         close_qty = max(1, round(full_qty * qty_factor)) if qty_factor < 1.0 else full_qty
@@ -730,6 +747,46 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                 log.info("[route_exit_or_hold] %s journal closed via postgres trade_id=%s", symbol, trade_id)
             except Exception as e:
                 log.warning("[route_exit_or_hold] postgres close %s failed: %s", symbol, e)
+
+        # Once the trade row is closed, also flip the parent thesis to
+        # status='triggered' so the pretool freshness gate stops treating it
+        # as a live thesis and /eod-review stops flagging it as a zombie.
+        # Without this, theses pile up status='open' forever (the May 2026
+        # AAPL/XLE/GLD/AMZN cleanup is the canonical example).
+        if closed_ok and thesis_id is not None:
+            thesis_note = f"trade {trade_id} closed via {action} ({reason})"[:280]
+            thesis_closed = False
+            if journal_close_thesis is not None:
+                try:
+                    journal_close_thesis(
+                        thesis_id=thesis_id,
+                        status="triggered",
+                        note=thesis_note,
+                    )
+                    thesis_closed = True
+                except Exception as e:
+                    log.warning(
+                        "[route_exit_or_hold] sqlite close_thesis(%s) failed: %s",
+                        thesis_id, e,
+                    )
+            if not thesis_closed:
+                try:
+                    from trading_agent.store.postgres import cursor
+                    with cursor() as cur:
+                        cur.execute(
+                            "UPDATE journal_theses SET status='triggered' "
+                            "WHERE id = %s AND status='open'",
+                            (thesis_id,),
+                        )
+                    log.info(
+                        "[route_exit_or_hold] thesis %s closed via postgres",
+                        thesis_id,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "[route_exit_or_hold] postgres close_thesis(%s) failed: %s",
+                        thesis_id, e,
+                    )
 
         emit(
             run_id=run_id, trigger=trigger, agent="route_exit_or_hold",

@@ -140,6 +140,104 @@ def reconcile_journal(state: TradingGraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 1b: auto_void_stale_theses
+# ---------------------------------------------------------------------------
+
+# Any thesis older than this with no OPEN trade linked is considered abandoned
+# and gets auto-voided. Picked to be safely longer than every typical catalyst
+# window (earnings: ~5d, FOMC: ~2d, geopolitical hedge: ~30d). 14d is long
+# enough that a real thesis-still-active scenario would have already been
+# converted into a position or refreshed.
+STALE_THESIS_AGE_DAYS = 14
+
+
+def auto_void_stale_theses(state: TradingGraphState) -> dict:
+    """Sweep open theses with no linked OPEN trade older than N days and void them.
+
+    Two zombie classes exist:
+      1. Thesis recorded but never executed (no trade row) — happens when
+         the operator records a thesis via /research then doesn't pull the
+         trigger. These linger as status='open' forever.
+      2. Thesis with closed trade but never closed itself — handled inline
+         by route_exit_or_hold (sibling fix in same change).
+
+    This node handles class 1. We void rather than 'triggered' since the
+    invalidation never actually fired — the thesis simply went stale.
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[eod/auto_void_stale_theses] run_id=%s", run_id)
+
+    voided: list[dict] = []
+    try:
+        from trading_agent.mcp_servers.journal.server import (
+            close_thesis as journal_close_thesis,
+            connection,
+        )
+    except Exception as e:
+        log.warning("[auto_void_stale_theses] journal import failed: %s", e)
+        return {}
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=STALE_THESIS_AGE_DAYS)).isoformat()
+    try:
+        with connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.id, t.ticker, t.created_at
+                FROM theses t
+                WHERE t.status = 'open'
+                  AND t.created_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trades tr
+                      WHERE tr.thesis_id = t.id
+                        AND tr.outcome = 'OPEN'
+                  )
+                """,
+                (cutoff,),
+            ).fetchall()
+    except Exception as e:
+        log.warning("[auto_void_stale_theses] sqlite scan failed: %s", e)
+        rows = []
+
+    for row in rows:
+        thesis_id = row[0]
+        ticker = row[1]
+        created_at = row[2]
+        try:
+            journal_close_thesis(
+                thesis_id=int(thesis_id),
+                status="void",
+                note=(
+                    f"auto_void_stale_theses: {STALE_THESIS_AGE_DAYS}d age cutoff, "
+                    f"no OPEN trade linked. Created {created_at}."
+                ),
+            )
+            voided.append({"thesis_id": int(thesis_id), "ticker": ticker,
+                           "created_at": created_at})
+        except Exception as e:
+            log.warning("[auto_void_stale_theses] close_thesis(%s) failed: %s",
+                        thesis_id, e)
+
+    if voided:
+        emit(
+            run_id=run_id, trigger=trigger, agent="auto_void_stale_theses",
+            event_type="stale_theses_voided",
+            payload={"count": len(voided), "items": voided[:20]},
+        )
+        log.info("[auto_void_stale_theses] voided %d stale theses", len(voided))
+    else:
+        emit(
+            run_id=run_id, trigger=trigger, agent="auto_void_stale_theses",
+            event_type="stale_theses_clean",
+            payload={},
+        )
+
+    journal_payload = dict(state.get("journal") or {})
+    journal_payload["stale_theses_voided"] = voided
+    return {"journal": journal_payload}
+
+
+# ---------------------------------------------------------------------------
 # Node 2: mark_to_market
 # ---------------------------------------------------------------------------
 

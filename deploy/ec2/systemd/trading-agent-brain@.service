@@ -25,7 +25,14 @@ TimeoutStartSec=900
 StandardOutput=append:/var/log/trading-agent-brain.log
 StandardError=append:/var/log/trading-agent-brain.err
 
-NoNewPrivileges=true
+# NoNewPrivileges must stay OFF here: this unit runs the orchestrator which
+# fans out via `sudo systemctl start trading-agent-candidate-entry@TICKER`
+# in premarket_nodes.dispatch_candidate_entry. NoNewPrivileges=true blocks
+# sudo's setuid+setgid escalation, causing every dispatch to fail with
+# `sudo: The "no new privileges" flag is set, which prevents sudo from
+# running as root`. The candidate-entry@.service template can (and does)
+# keep NoNewPrivileges=true since it never re-dispatches.
+NoNewPrivileges=false
 PrivateTmp=true
 
 [Install]

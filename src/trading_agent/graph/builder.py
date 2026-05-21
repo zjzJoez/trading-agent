@@ -169,6 +169,7 @@ def build_intraday_monitor_graph():
 def build_eod_review_graph():
     g = StateGraph(TradingGraphState)
     g.add_node("reconcile_journal", EOD.reconcile_journal)
+    g.add_node("auto_void_stale_theses", EOD.auto_void_stale_theses)
     g.add_node("mark_to_market", EOD.mark_to_market)
     g.add_node("persist_daily_marks", EOD.persist_daily_marks)
     g.add_node("update_regime_accuracy_labels", EOD.update_regime_accuracy_labels)
@@ -178,7 +179,8 @@ def build_eod_review_graph():
     g.add_node("ntfy_daily_summary", EOD.ntfy_daily_summary)
 
     g.add_edge(START, "reconcile_journal")
-    g.add_edge("reconcile_journal", "mark_to_market")
+    g.add_edge("reconcile_journal", "auto_void_stale_theses")
+    g.add_edge("auto_void_stale_theses", "mark_to_market")
     g.add_edge("mark_to_market", "persist_daily_marks")
     g.add_edge("persist_daily_marks", "update_regime_accuracy_labels")
     g.add_edge("update_regime_accuracy_labels", "enrich_outcomes")
