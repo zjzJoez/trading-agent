@@ -10,3 +10,6 @@
 # a single, auditable purpose.
 
 ubuntu ALL=(root) NOPASSWD: /bin/systemctl daemon-reload
+# Long-running services need explicit restart when source files change
+# (uvicorn dashboard loads Python modules at startup, doesn't watch files).
+ubuntu ALL=(root) NOPASSWD: /bin/systemctl restart trading-agent-dashboard.service

@@ -124,6 +124,10 @@ HAS_DEPS=$(echo "$CHANGED_FILES" | grep -E '^(pyproject\.toml|uv\.lock)$' || tru
 HAS_SYSTEMD=$(echo "$CHANGED_FILES" | grep -E '^deploy/ec2/systemd/' || true)
 HAS_MIGRATIONS=$(echo "$CHANGED_FILES" | grep -E '^migrations/.*\.sql$' || true)
 HAS_SUDOERS=$(echo "$CHANGED_FILES" | grep -E '^deploy/ec2/sudoers/' || true)
+# Long-running services that load Python modules at startup — need an explicit
+# restart when their source files change (oneshot services like brain@.service
+# don't, because they re-import on every fire).
+HAS_DASHBOARD=$(echo "$CHANGED_FILES" | grep -E '^src/trading_agent/web/' || true)
 
 NUM_CHANGED=$(echo "$CHANGED_FILES" | wc -l)
 echo "$LOG_TAG changed=$NUM_CHANGED deps=${HAS_DEPS:+y} systemd=${HAS_SYSTEMD:+y} migrations=${HAS_MIGRATIONS:+y} sudoers=${HAS_SUDOERS:+y}"
@@ -141,6 +145,18 @@ fi
 if [ -n "$HAS_SYSTEMD" ]; then
     echo "$LOG_TAG systemctl daemon-reload (units are symlinks; content is already current)"
     sudo /bin/systemctl daemon-reload
+fi
+
+if [ -n "$HAS_DASHBOARD" ]; then
+    # The dashboard is a long-running uvicorn — its source files are loaded
+    # at process start, so file changes don't take effect without a restart.
+    # `restart` is the right verb (not reload) because uvicorn doesn't watch
+    # files in production mode.
+    echo "$LOG_TAG restarting dashboard service (web source files changed)"
+    sudo /bin/systemctl restart trading-agent-dashboard.service || {
+        echo "$LOG_TAG WARN dashboard restart failed; investigate" >&2
+        _notify_ops "dashboard restart FAILED after deploy ${REMOTE:0:7}" 4
+    }
 fi
 
 if [ -n "$HAS_SUDOERS" ]; then
