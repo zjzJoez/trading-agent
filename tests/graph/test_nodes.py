@@ -827,7 +827,10 @@ class TestRouteExitOrHold:
             }],
         )
         mock_order = {"thesis_id": 42, "rows": [{"order_id": "QQQ789", "order_status": "SUBMITTED"}]}
-        pg_cursor = self._mock_pg_cursor([(42, opt_sym)])
+        # SELECT id, symbol, thesis_id FROM journal_trades ...
+        # thesis_id column added when route_exit_or_hold gained close_thesis
+        # call. Using thesis_id=None exercises the "no parent thesis" branch.
+        pg_cursor = self._mock_pg_cursor([(42, opt_sym, None)])
 
         with _patch_all_emits():
             with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",

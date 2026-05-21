@@ -138,8 +138,11 @@ git pull --ff-only origin main 2>&1 | tail -3
 # ---- Post-pull conditional steps -----------------------------------------
 
 if [ -n "$HAS_DEPS" ]; then
-    echo "$LOG_TAG uv sync"
-    "$UV_BIN" sync --quiet 2>&1 | tail -10
+    # --extra dev keeps pytest + ruff + pytest-asyncio in the venv on EC2,
+    # so the pre-deploy pytest gate (above) works. Without this, the first
+    # deploy after a fresh setup aborts with "No module named pytest".
+    echo "$LOG_TAG uv sync --extra dev"
+    "$UV_BIN" sync --extra dev --quiet 2>&1 | tail -10
 fi
 
 if [ -n "$HAS_SYSTEMD" ]; then
