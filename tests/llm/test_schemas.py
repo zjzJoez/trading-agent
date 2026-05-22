@@ -218,6 +218,80 @@ def test_proposal_exit_plan_field_optional():
     assert obj.exit_plan is None
 
 
+# ---------------------------------------------------------------------------
+# SHORT direction — geometry inversion + R7 exemption
+# ---------------------------------------------------------------------------
+
+
+def _short_payload(direction: str, stop: float, target: float,
+                   entry: float = 3.0) -> dict:
+    """SHORT premium: entry is premium collected; stop > entry > target."""
+    return {
+        "ticker": "SPY", "symbol": f"US.SPY260817{direction[6:7]}00500000",
+        "asset_type": "OPT", "direction": direction,
+        "strategy_label": "csp" if direction == "SHORT_PUT" else "naked_call",
+        "entry_price": entry, "stop": stop, "target": target,
+        "expected_return_pct": 100.0, "max_loss_pct": 50.0,
+        "qty_request": 1,
+    }
+
+
+def test_short_put_geometry_required():
+    """SHORT_PUT: stop > entry > target."""
+    from trading_agent.llm.schemas import TraderProposal
+
+    obj = TraderProposal.model_validate(
+        _short_payload("SHORT_PUT", stop=6.0, target=1.0)
+    )
+    assert obj.is_short
+    assert obj.direction == "SHORT_PUT"
+
+
+def test_short_put_geometry_violation_target_above_entry():
+    from pydantic import ValidationError
+    from trading_agent.llm.schemas import TraderProposal
+
+    with pytest.raises(ValidationError, match="target.*entry"):
+        TraderProposal.model_validate(
+            _short_payload("SHORT_PUT", stop=6.0, target=4.0)  # target > entry=3
+        )
+
+
+def test_short_put_geometry_violation_stop_below_entry():
+    from pydantic import ValidationError
+    from trading_agent.llm.schemas import TraderProposal
+
+    with pytest.raises(ValidationError, match="stop.*entry"):
+        TraderProposal.model_validate(
+            _short_payload("SHORT_PUT", stop=2.0, target=1.0)  # stop < entry=3
+        )
+
+
+def test_short_skips_r7():
+    """Even a 0.2:1 R:R on a SHORT is allowed (R:R structurally capped)."""
+    from trading_agent.llm.schemas import TraderProposal
+
+    # entry=3, stop=6 → risk=3; target=2.4 → reward=0.6; R:R=0.2 — far below 1.3
+    obj = TraderProposal.model_validate(
+        _short_payload("SHORT_PUT", stop=6.0, target=2.4)
+    )
+    assert obj is not None
+
+
+def test_short_plan_direction_must_match():
+    from pydantic import ValidationError
+    from trading_agent.llm.schemas import TraderProposal
+
+    payload = _short_payload("SHORT_PUT", stop=6.0, target=1.0)
+    payload["exit_plan"] = {
+        "direction": "LONG",  # ← mismatched
+        "hard_stop": 6.0,
+        "hard_target": 1.0,
+    }
+    with pytest.raises(ValidationError, match="exit_plan.direction"):
+        TraderProposal.model_validate(payload)
+
+
 def test_risk_arbiter_happy_path():
     obj = RiskArbiterOutput.model_validate(
         {

@@ -244,7 +244,7 @@ def _format_council_context(
 # deterministic_clear), so cross-family alignment has 0 real-data evidence.
 # After N trades, we have enough Council audit rows to inspect alignment
 # and confidently keep the skip-on-clear shortcut.
-COUNCIL_BURN_IN_TRADE_COUNT = 15
+COUNCIL_BURN_IN_TRADE_COUNT = 12
 
 
 def _filled_trade_count() -> int:

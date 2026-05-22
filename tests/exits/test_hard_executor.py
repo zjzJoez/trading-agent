@@ -470,3 +470,133 @@ class TestPriorityOrder:
             now_utc=_NOW, mfe_so_far=None,
         )
         assert d is not None and d.action == "EXIT_STOP"
+
+
+# ---------------------------------------------------------------------------
+# SHORT direction — inverted comparisons (price up = bad, price down = good)
+# ---------------------------------------------------------------------------
+
+
+def _short_plan(hard_stop=6.0, hard_target=1.0, scale=None, max_days=30):
+    """Short option: collected $3 premium, stop at $6 (200% loss), target at $1
+    (33% premium retained = 67% captured). Geometry: stop > entry > target."""
+    return ExitPlan(
+        direction="SHORT",
+        hard_stop=hard_stop,
+        hard_target=hard_target,
+        scale_out_ladder=scale or [],
+        time_in_trade_max_days=max_days,
+    )
+
+
+def _short_pos(symbol="US.SPY260817P00500000",
+               entry=3.0, mark=3.0, qty=1, delta=-0.35):
+    """SHORT put: entered at $3.00 premium. ~3 months to expiry."""
+    return {
+        "symbol": symbol,
+        "asset_type": "OPT",
+        "entry_price": entry,
+        "mark": mark,
+        "qty": qty,
+        "delta": delta,
+        "opened_at": _NOW,
+    }
+
+
+class TestShortDirection:
+    def test_short_stop_fires_when_mark_rises_above(self):
+        # entry=3, stop=6. mark=6.1 means option price rose against us.
+        pos = _short_pos(mark=6.1)
+        d = hard_exit_decision(
+            pos=pos, plan=_short_plan(), regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is not None and d.action == "EXIT_STOP"
+        assert ">=" in d.reason  # short stop uses >=
+
+    def test_short_stop_holds_when_mark_below(self):
+        pos = _short_pos(mark=5.99)
+        d = hard_exit_decision(
+            pos=pos, plan=_short_plan(), regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is None  # not breached yet
+
+    def test_short_target_fires_when_mark_falls_below(self):
+        # entry=3, target=1. mark=0.9 = premium has decayed past target.
+        pos = _short_pos(mark=0.9)
+        d = hard_exit_decision(
+            pos=pos, plan=_short_plan(), regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is not None and d.action == "EXIT_TARGET"
+        assert "<=" in d.reason
+
+    def test_short_target_holds_when_mark_above(self):
+        pos = _short_pos(mark=1.5)
+        d = hard_exit_decision(
+            pos=pos, plan=_short_plan(), regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is None
+
+    def test_short_scale_out_fires_when_mark_falls_to_rung(self):
+        # Rung at $1.50 (premium decayed to 50% of entry $3.00). qty=2 → factor 0.5 ok.
+        plan = _short_plan(scale=[ScaleOutRung(at_mark=1.5, exit_factor=0.5)])
+        pos = _short_pos(mark=1.5, qty=2)
+        d = hard_exit_decision(
+            pos=pos, plan=plan, regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is not None and d.action == "EXIT_TARGET"
+        assert d.exit_qty_factor == 0.5
+
+    def test_short_no_otm_theta_exit(self):
+        """OTM near expiry is FAVORABLE for a short — should NOT force exit."""
+        # SHORT put 500 strike, DTE=4, delta=-0.20 (far OTM = good for us)
+        pos = _short_pos(symbol="US.SPY260526P00500000", mark=2.0, delta=-0.20)
+        d = hard_exit_decision(
+            pos=pos, plan=_short_plan(), regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None,
+        )
+        # DTE=4, not at force_exit_at_dte=2 yet → HOLD
+        assert d is None
+
+    def test_short_force_exit_at_dte_2(self):
+        # DTE=2 → assignment risk regardless of direction
+        pos = _short_pos(symbol="US.SPY260524P00500000", mark=2.0, delta=-0.30)
+        d = hard_exit_decision(
+            pos=pos, plan=_short_plan(), regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is not None and d.action == "EXIT_DTE_HARD"
+        assert "assignment risk" in d.reason
+
+    def test_short_regime_crisis_still_exits(self):
+        pos = _short_pos(mark=3.0)  # nowhere near stop or target
+        d = hard_exit_decision(
+            pos=pos, plan=_short_plan(), regime_label="CRISIS",
+            now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is not None and d.action == "EXIT_REGIME"
+
+
+class TestDefaultExitPlanShort:
+    def test_short_plan_geometry(self):
+        # Short: stop > entry > target
+        plan = default_exit_plan(
+            entry=3.0, stop=6.0, target=1.0,
+            asset_type="OPT", direction="SHORT",
+        )
+        assert plan.direction == "SHORT"
+        assert plan.hard_stop == 6.0
+        assert plan.hard_target == 1.0
+        # Scale rung at entry - 0.5×(entry-target) = 3.0 - 1.0 = 2.0
+        assert len(plan.scale_out_ladder) == 1
+        assert plan.scale_out_ladder[0].at_mark == pytest.approx(2.0)
+        # Default LONG-direction stays unchanged
+        long_plan = default_exit_plan(
+            entry=10.0, stop=5.0, target=20.0,
+            asset_type="OPT", direction="LONG",
+        )
+        assert long_plan.direction == "LONG"

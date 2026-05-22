@@ -131,17 +131,14 @@ def _bare_ticker(symbol: str) -> str | None:
     return s
 
 
-def _parse_option_symbol(option_symbol: str) -> tuple[str, int] | None:
-    """Moomoo option code → ("AAPL", dte_from_today). Returns None on bad input.
+def _parse_option_symbol(option_symbol: str) -> tuple[str, int, str, float] | None:
+    """Moomoo option code → (ticker, dte_from_today, right, strike).
+
+    Returns None on bad input. ``right`` ∈ {"C","P"}; ``strike`` is in
+    dollars (the OCC integer is divided by 1000).
 
     Moomoo format: US.<TICKER><YYMMDD><C|P><strike*1000> where the strike
-    is unpadded (e.g., US.AAPL260515C267500 = $267.500 strike). The regex
-    accepts 4-8 strike digits to handle common US equity option strikes
-    (penny stocks → mega-caps).
-
-    Ticker-with-dot names (BRK.B, BF.B) aren't in moomoo's option universe
-    the same way; MVP doesn't trade those, and the regex here won't match
-    them. Flagged as a known limitation.
+    is unpadded (e.g., US.AAPL260515C267500 = $267.500 strike).
     """
     s = option_symbol.strip().upper()
     if s.startswith("US."):
@@ -151,13 +148,16 @@ def _parse_option_symbol(option_symbol: str) -> tuple[str, int] | None:
         return None
     ticker = m.group(1)
     yymmdd = m.group(2)
+    right = m.group(3)
+    strike_int = m.group(4)
     try:
         expiry = datetime.strptime(yymmdd, "%y%m%d").date()
+        strike = int(strike_int) / 1000.0
     except ValueError:
         return None
     today = datetime.now(timezone.utc).date()
     dte = (expiry - today).days
-    return ticker, dte
+    return ticker, dte, right, strike
 
 
 # ---- data sources ----
@@ -176,10 +176,13 @@ def _load_sector_map() -> dict[str, str]:
     return out
 
 
-def _fetch_equity_from_sdk() -> float:
-    """Query Moomoo paper account for total_assets. Fail-closed: raise on any
-    error. Called inside try/except at the call site — the hook upgrades
-    the error into an exit-2 block."""
+def _fetch_equity_from_sdk() -> tuple[float, float | None]:
+    """Query Moomoo paper account for (total_assets, cash). Fail-closed:
+    raises on any error. Cash component is best-effort — returns None if
+    the field isn't on the response.
+
+    Cash is needed by R5b to validate cash-secured-put collateral.
+    """
     # Lazy import to keep cold start fast when the tool isn't an order.
     from moomoo import OpenSecTradeContext, SecurityFirm, TrdEnv, TrdMarket
 
@@ -201,12 +204,23 @@ def _fetch_equity_from_sdk() -> float:
     if df is None or df.empty:
         raise RuntimeError("accinfo_query returned no rows")
     # total_assets is USD market value + cash; use as equity denominator.
-    # Some plans return only `total_assets` as string — coerce defensively.
     val = df.iloc[0].get("total_assets")
     try:
-        return float(val)
+        equity = float(val)
     except (TypeError, ValueError):
         raise RuntimeError(f"unparseable total_assets from accinfo_query: {val!r}")
+    # Cash field naming varies by plan tier — try a couple of likely names.
+    cash: float | None = None
+    for key in ("cash", "available_funds", "available_cash"):
+        v = df.iloc[0].get(key)
+        if v is None:
+            continue
+        try:
+            cash = float(v)
+            break
+        except (TypeError, ValueError):
+            continue
+    return equity, cash
 
 
 def _load_open_positions(sector_map: dict[str, str]) -> list[OpenPosition]:
@@ -292,6 +306,29 @@ def _has_fresh_open_thesis(ticker: str) -> tuple[bool, int | None]:
 
 # ---- main flow ----
 
+
+def _has_existing_open_for(broker_symbol: str) -> bool:
+    """True iff the local journal already has an OPEN trade for the
+    given broker symbol. Used to compute ``intent`` on the ProposedTrade:
+    SELL of an option we don't already hold = opening a SHORT; SELL of
+    one we do hold = closing the LONG.
+    """
+    if not broker_symbol:
+        return False
+    try:
+        with connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM trades WHERE symbol = ? AND outcome = 'OPEN' "
+                "LIMIT 1",
+                (broker_symbol,),
+            ).fetchone()
+            return row is not None
+    except Exception:
+        # Fail-open on lookup error: assume close (more conservative —
+        # SHORT-specific R5b/R5c won't fire spuriously on a real close).
+        return True
+
+
 def _build_proposed(
     tool_name: str,
     tool_input: dict,
@@ -313,7 +350,7 @@ def _build_proposed(
                 f"unparseable option_symbol {opt_sym!r}; expected "
                 "'US.<TICKER><YYMMDD><C|P><strike*1000 8d>'"
             )
-        ticker, dte_from_symbol = parsed
+        ticker, dte_from_symbol, right, strike = parsed
         # Caller-provided dte wins (lets the skill pass explicit values);
         # fall back to date-derived DTE otherwise.
         dte = tool_input.get("dte")
@@ -322,18 +359,30 @@ def _build_proposed(
         delta = tool_input.get("delta")
         contracts = float(tool_input.get("contracts", 0))
         price = float(tool_input.get("price", 0))
+        # Intent: SELL is OPEN (new short) iff no existing OPEN position
+        # has matching option_symbol; otherwise it's CLOSE of a long.
+        # BUY is OPEN (new long) iff no existing position; otherwise it's
+        # CLOSE of a short (buying back).
+        opens_for_symbol = _has_existing_open_for(opt_sym)
+        intent = "close" if opens_for_symbol else "open"
+        stop = tool_input.get("stop")  # callers MAY pass stop; R5c needs it
+        target = tool_input.get("target")  # CSP / strategy code may pass it
         return ProposedTrade(
             ticker=ticker,
             asset_type="OPT",
             side=side,  # type: ignore[arg-type]
             qty=contracts,
             entry_price=price,
-            stop=None,
+            stop=(float(stop) if stop is not None else None),
+            target=(float(target) if target is not None else None),
             strategy_label=strategy_label,
             sector=sector_map.get(ticker.upper()),
             delta=(float(delta) if delta is not None else None),
             dte=(int(dte) if dte is not None else None),
             earnings_dte=tool_input.get("earnings_dte"),
+            right=right,  # type: ignore[arg-type]
+            strike=strike,
+            intent=intent,  # type: ignore[arg-type]
         )
 
     # stock branch
@@ -381,10 +430,10 @@ def main() -> int:
     side = proposed.side
 
     # ---- thesis freshness (opening trades only) ----
-    # SELLs that close existing positions don't need a fresh thesis; the
-    # original thesis was recorded when the position was opened. But we
-    # still require that the position's thesis exists on file.
-    if side == "BUY":
+    # Any OPEN (long buy OR short sell) needs a fresh thesis. CLOSE
+    # orders (selling a long / buying back a short) don't, because the
+    # original thesis was recorded when the position was opened.
+    if proposed.intent == "open":
         ok, thesis_id = _has_fresh_open_thesis(ticker)
         if not ok:
             return _block(
@@ -394,12 +443,13 @@ def main() -> int:
                 detail={"ticker": ticker},
             )
     else:
-        thesis_id = None  # SELL path; skip gate
+        thesis_id = None  # closing — skip thesis-freshness gate
 
     # ---- sizing ----
-    # Equity from live SDK (paper account). Fail-closed on any SDK issue.
+    # Equity + cash from live SDK (paper account). Fail-closed on any SDK
+    # issue. Cash is best-effort (None falls back to equity in R5b).
     try:
-        equity = _fetch_equity_from_sdk()
+        equity, cash = _fetch_equity_from_sdk()
     except Exception as e:
         return _block(
             "cannot verify sizing — moomoo equity lookup failed",
@@ -410,6 +460,7 @@ def main() -> int:
     opens = _load_open_positions(sector_map)
     ctx = SizingContext(
         equity=equity,
+        cash=cash,
         opens=tuple(opens),
         sector_lookup_available=bool(sector_map),
     )

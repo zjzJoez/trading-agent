@@ -4,7 +4,7 @@ Source of truth for every numeric threshold, where it's enforced, and why.
 This document is canonical: if the code disagrees with what's written here,
 either fix the code or open a PR to update both together.
 
-Last updated: 2026-05-22 (Phase 3 — deterministic exit executor)
+Last updated: 2026-05-22 (Phase 4 — CSP + naked call support; aggressive-mode thresholds)
 
 ---
 
@@ -46,30 +46,73 @@ Last updated: 2026-05-22 (Phase 3 — deterministic exit executor)
 
 | Rule | Threshold | Severity | Source |
 |------|-----------|----------|--------|
-| **R1** Single-trade max loss | ≤ 2% equity | block | `sizing.MAX_SINGLE_RISK_PCT` |
-| **R2** Concurrent open positions | ≤ 5 | block | `sizing.MAX_CONCURRENT_OPENS` |
-| **R3** Per-ticker exposure | ≤ 10% equity (stock+options combined) | block | `sizing.MAX_TICKER_EXPOSURE_PCT` |
+| **R1** Single-trade max loss | ≤ **2.5%** equity (raised from 2%) | block | `sizing.MAX_SINGLE_RISK_PCT` |
+| **R2** Concurrent open positions | ≤ **6** (raised from 5) | block | `sizing.MAX_CONCURRENT_OPENS` |
+| **R3** Per-ticker exposure | ≤ **12%** equity (raised from 10%) | block | `sizing.MAX_TICKER_EXPOSURE_PCT` |
 | **R4** Sector concentration | ≤ 2 open positions in same GICS sector | block | `sizing.MAX_SAME_SECTOR_OPENS` |
-| **R5** Options policy: BUY-only | side must be BUY (no naked shorts) | block | `sizing.check` |
+| **R5** Options policy | side ∈ {BUY, SELL} — long + short both allowed | block | `sizing.check` |
 | **R5** Options DTE window | 14 ≤ DTE ≤ 60 | block | `sizing.OPTION_DTE_MIN/MAX` |
-| **R5** Options delta band | 0.30 ≤ |Δ| ≤ 0.55 | block | `sizing.OPTION_DELTA_MIN/MAX` |
-| **R5** Options notional | ≤ 1% equity per trade | block | `sizing.MAX_OPTION_NOTIONAL_PCT` |
+| **R5** Options delta band | **0.25 ≤ |Δ| ≤ 0.65** (widened from 0.30-0.55) | block | `sizing.OPTION_DELTA_MIN/MAX` |
+| **R5** Options notional | ≤ **1.5%** equity per trade (raised from 1%) | block | `sizing.MAX_OPTION_NOTIONAL_PCT` |
+| **R5b** Cash-secured put | `cash ≥ strike × 100 × qty − premium` for short puts | block | `sizing.R5B` |
+| **R5c** Naked call requires stop | short call must have explicit `stop > entry` (R1 uses 1.5× stress buffer) | block | `sizing.R5C` + `sizing.NAKED_CALL_STRESS_MULT` |
 | **R6** Earnings lock | within 2 trading days of earnings, only `earnings_*` strategies | block | `sizing.EARNINGS_LOCK_DAYS` |
-| **R7** Risk:reward floor | reward / risk ≥ 1.5 | block | `sizing.MIN_RISK_REWARD` + `TraderProposal._validate_risk_reward` |
+| **R7** Risk:reward floor (LONG only) | reward / risk ≥ **1.3** (lowered from 1.5) — SHORT premium exempt | block | `sizing.MIN_RISK_REWARD` + `TraderProposal._validate_geometry` |
 
-> **Why 1.5?** At our ~55% baseline win rate, R:R 1.5:1 gives expected
-> value `0.55 × 1.5 − 0.45 × 1 = +0.375 R` per trade. Anything below 1.5
-> requires a win rate above 67% just to break even — implausible for
-> directional trading. The SPY 742C 0.6:1 R:R was the trigger for R7.
+> **Max heat:** R1 × R2 = 2.5% × 6 = **15%** of equity at full max-position
+> drawdown (up from 10%). Combined with R3's 12% per-ticker cap and the
+> tighter delta band, this is the "moderately aggressive" mode the
+> 2026-05-22 audit explicitly enabled.
 
-R7 is enforced **twice**:
-1. **`TraderProposal._validate_risk_reward`** (pydantic) — raises before
-   the proposal ever leaves the synthesizer. Router retries the LLM with
-   the validation error so it can either tighten stop, widen target, or
-   decline the trade.
+> **Why 1.3 for R7?** At our ~55% baseline win rate, 1.3:1 R:R gives EV
+> `0.55 × 1.3 − 0.45 = +0.27 R/trade` — still positive-EV but accepts
+> more setups than 1.5:1. Anything below 1.3 needs >60% win rate to
+> break even (implausible).
+
+> **Why no R7 for shorts?** Premium-selling trades have R:R structurally
+> capped (reward = premium ≤ strike, risk = up to strike × 100). A CSP
+> at strike $100 selling for $2 has R:R ≈ 0.02:1 even when EV is
+> clearly positive. R1 with proper max-loss math + R5b cash collateral
+> bound the practical risk instead.
+
+R7 is enforced **twice** (LONG only):
+1. **`TraderProposal._validate_geometry`** (pydantic) — raises before
+   the proposal ever leaves the synthesizer.
 2. **`sizing.check` R7** — runs at the pretool hook, catches manual
-   rescue orders that bypass the synthesizer. Warns if `target` is
-   missing (hook layer may not know it), blocks otherwise.
+   rescue orders that bypass the synthesizer.
+
+---
+
+## 1a. Direction-aware geometry
+
+| direction | geometry constraint | who profits when mark... |
+|---|---|---|
+| LONG / LONG_CALL / LONG_PUT | target > entry > stop | rises (mark > entry) |
+| SHORT_PUT (cash-secured) | stop > entry > target | falls (premium decays) |
+| SHORT_CALL (naked) | stop > entry > target | falls (premium decays) |
+
+The pydantic validator enforces both:
+- LONG: `target > entry > stop` AND R:R ≥ 1.3
+- SHORT: `stop > entry > target`, R7 exempt
+
+---
+
+## 1b. R1 max-loss math (varies by direction)
+
+| Position type | max_loss formula |
+|---|---|
+| STK LONG (with stop) | `|entry − stop| × qty` |
+| STK LONG (no stop) | `IMPLICIT_STOP_FRAC × entry × qty` (= 5%) — warn-only fallback |
+| OPT LONG (buy premium) | `qty × 100 × entry_price` (capped at debit paid) |
+| OPT SHORT_PUT (CSP) | `strike × 100 × qty − premium_collected` (assignment exposure) |
+| OPT SHORT_CALL (naked) | `NAKED_CALL_STRESS_MULT × |stop − entry| × qty × 100` (= 1.5×, gap-risk buffer) |
+| OPT SHORT_CALL (no stop) | `inf` — R1 blocks even if R5c missed it |
+
+> **Naked-call stress buffer rationale:** unbounded theoretical risk
+> can't be bounded by stop discipline alone — overnight gap-ups blow
+> through stops. The 1.5× multiplier pretends the gap cost 50% more
+> than the stop distance, which is generous protection at the
+> portfolio level while still allowing the trade.
 
 ---
 
@@ -132,17 +175,20 @@ skipped that tick.
 |---|---|
 | `regime_label in plan.regime_rules.exit_on_labels` (default: `["CRISIS"]`) | **EXIT_REGIME** full close |
 
-### P1 — Hard stop
+### P1 — Hard stop (direction-aware)
 
-| Condition | Action |
-|---|---|
-| `mark ≤ plan.hard_stop` | **EXIT_STOP** full close |
+| direction | Condition | Action |
+|---|---|---|
+| LONG | `mark ≤ plan.hard_stop` | **EXIT_STOP** full close |
+| SHORT | `mark ≥ plan.hard_stop` | **EXIT_STOP** full close |
 
 > Uses **mark** (best mid or last_price from moomoo), not intra-bar wick.
 > This is intentionally permissive — a single fast trade through the
-> stop won't trigger; the price has to actually settle below.
+> stop won't trigger; the price has to actually settle there.
 
-### P2 — DTE rules (options only)
+### P2 — DTE rules (options only, direction-aware)
+
+**LONG options**:
 
 | Condition | Action | Default threshold |
 |---|---|---|
@@ -150,18 +196,33 @@ skipped that tick.
 | `DTE ≤ 5` AND `|Δ| < force_exit_at_dte_5_if_delta_below` | **EXIT_DTE_OTM** full close | 0.40 |
 | `DTE ≤ switch_to_intrinsic_floor_at_dte` AND `|Δ| ≥ 0.40` AND `mark ≤ intrinsic − buffer` | **EXIT_INTRINSIC_FLOOR** full close | 5 days, $0.10 buffer |
 
-> **Why this split?** Theta decay near expiry kills OTM options
-> (negative EV), but ITM/ATM options retain intrinsic value worth
-> capturing. The intrinsic floor locks in intrinsic value − $0.10 of
-> remaining premium, never letting the stop drop below the entry-time
-> `hard_stop`.
+**SHORT options**:
 
-### P3 — Hard target + scale-out ladder
+| Condition | Action |
+|---|---|
+| `DTE ≤ force_exit_at_dte` (assignment risk) | **EXIT_DTE_HARD** full close |
+
+> **Why different?** For LONG options, time decay is your enemy near
+> expiry, especially OTM (theta vampire) → force exit. For SHORT
+> options, time decay is your FRIEND — let it cook. Only assignment
+> risk on the final day(s) demands a forced exit. The intrinsic-floor
+> rule is also LONG-only (different math for shorts; skipped).
+
+### P3 — Hard target + scale-out ladder (direction-aware)
+
+**LONG**:
 
 | Condition | Action |
 |---|---|
 | `mark ≥ plan.hard_target` | **EXIT_TARGET** full close |
 | `mark ≥ rung.at_mark` (for the next un-fired rung) | **EXIT_TARGET** partial close at `rung.exit_factor` |
+
+**SHORT**:
+
+| Condition | Action |
+|---|---|
+| `mark ≤ plan.hard_target` | **EXIT_TARGET** full close (buy back cheap) |
+| `mark ≤ rung.at_mark` (for the next un-fired rung) | **EXIT_TARGET** partial close at `rung.exit_factor` |
 
 Scale rungs are evaluated in declaration order. The first rung whose
 `at_mark` is satisfied AND that hasn't already fired wins. "Already
@@ -183,22 +244,31 @@ incremented by `route_exit_or_hold` after each successful partial close.
 > a full close anyway. The next tick re-evaluates from scratch (likely
 > hits the hard target if mark stays up).
 
-### P4 — Trailing stop
+### P4 — Trailing stop (direction-aware)
+
+**LONG** trails the HIGH-water mark; exit when mark falls back:
 
 | Condition | Action |
 |---|---|
-| `high_water ≥ plan.trail_stop.engage_at_mark` AND `mark ≤ high_water × (1 − distance_pct)` AND `trailed_stop ≥ never_below_floor` | **EXIT_TRAIL** full close |
+| `high_water ≥ engage_at_mark` AND `mark ≤ high_water × (1 − distance_pct)` AND `trailed_stop ≥ floor` | **EXIT_TRAIL** full close |
 
 `high_water` is derived from `journal_trades.mfe_so_far` (MFE in
 R-multiples, updated every tick by `excursion.update_excursions_once`):
 ```
 R_unit     = |entry − hard_stop|
-high_water = entry + mfe_so_far × R_unit
+high_water = entry + mfe_so_far × R_unit  (LONG)
+low_water  = entry + mae_so_far × R_unit  (SHORT — note mae is negative)
 ```
 
+**SHORT** trails the LOW-water mark; exit when mark rises back:
+
+| Condition | Action |
+|---|---|
+| `low_water ≤ engage_at_mark` AND `mark ≥ low_water × (1 + distance_pct)` AND `trailed_stop ≤ floor` | **EXIT_TRAIL** full close |
+
 `never_below` enforces a floor:
-- `"break_even"` / `"entry"` → trailed_stop ≥ `entry_price`
-- `"original_stop"` → trailed_stop ≥ `hard_stop` (never gives back below entry stop)
+- `"break_even"` / `"entry"` → LONG: trailed_stop ≥ `entry_price`; SHORT: trailed_stop ≤ `entry_price`
+- `"original_stop"` → never gives back beyond entry stop
 
 ### P5 — Max age
 

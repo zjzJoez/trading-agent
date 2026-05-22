@@ -192,6 +192,7 @@ def hard_exit_decision(
     entry = float(pos.get("entry_price") or 0.0)
     asset_type = pos.get("asset_type") or "STK"
     symbol = pos.get("symbol") or ""
+    is_short = plan.direction == "SHORT"
 
     # ---- P0 — Regime kill switch ----
     if regime_label in plan.regime_rules.exit_on_labels:
@@ -201,13 +202,18 @@ def hard_exit_decision(
             reason=f"regime={regime_label}",
         )
 
-    # ---- P1 — Hard stop (use mark as close-basis proxy) ----
-    if mark > 0 and mark <= plan.hard_stop:
-        return ExitDecision(
-            action="EXIT_STOP",
-            exit_qty_factor=1.0,
-            reason=f"mark={mark:.2f} <= hard_stop={plan.hard_stop:.2f}",
-        )
+    # ---- P1 — Hard stop ----
+    # LONG:  mark <= stop triggers (option price falling against us)
+    # SHORT: mark >= stop triggers (option price rising against us)
+    if mark > 0:
+        stop_hit = (mark >= plan.hard_stop) if is_short else (mark <= plan.hard_stop)
+        if stop_hit:
+            cmp = ">=" if is_short else "<="
+            return ExitDecision(
+                action="EXIT_STOP",
+                exit_qty_factor=1.0,
+                reason=f"mark={mark:.2f} {cmp} hard_stop={plan.hard_stop:.2f}",
+            )
 
     # ---- P2 — DTE rules (options only) ----
     if asset_type == "OPT":
@@ -216,92 +222,148 @@ def hard_exit_decision(
             delta_abs = abs(float(pos.get("delta") or 0.0))
             rules = plan.dte_rules
 
-            # P2a — hard DTE floor (assignment risk)
-            if dte <= rules.force_exit_at_dte:
-                return ExitDecision(
-                    action="EXIT_DTE_HARD",
-                    exit_qty_factor=1.0,
-                    reason=f"DTE={dte} <= force_exit_at_dte={rules.force_exit_at_dte}",
-                )
-
-            # P2b — OTM near expiry → theta vampire, force exit
-            if (dte <= 5
-                    and delta_abs < rules.force_exit_at_dte_5_if_delta_below):
-                return ExitDecision(
-                    action="EXIT_DTE_OTM",
-                    exit_qty_factor=1.0,
-                    reason=(
-                        f"DTE={dte}, |Δ|={delta_abs:.2f} < "
-                        f"{rules.force_exit_at_dte_5_if_delta_below:.2f} "
-                        f"(theta vampire window)"
-                    ),
-                )
-
-            # P2c — ITM/ATM near expiry → intrinsic floor stop instead of exit
-            if dte <= rules.switch_to_intrinsic_floor_at_dte and delta_abs >= 0.40:
-                intrinsic = compute_intrinsic(symbol, underlying_mark)
-                if intrinsic is not None and intrinsic > 0:
-                    floor = max(
-                        plan.hard_stop,
-                        intrinsic - rules.intrinsic_floor_buffer,
+            if is_short:
+                # Short premium near expiry: theta decay is YOUR friend.
+                # Only hard rule is to avoid assignment / pin risk on the
+                # final day. force_exit_at_dte is still respected (default
+                # 2) — bump down to 1 in the plan if you want to ride it
+                # closer to the wire.
+                if dte <= rules.force_exit_at_dte:
+                    return ExitDecision(
+                        action="EXIT_DTE_HARD",
+                        exit_qty_factor=1.0,
+                        reason=(
+                            f"DTE={dte} <= force_exit_at_dte="
+                            f"{rules.force_exit_at_dte} (short assignment risk)"
+                        ),
                     )
-                    if mark <= floor:
-                        return ExitDecision(
-                            action="EXIT_INTRINSIC_FLOOR",
-                            exit_qty_factor=1.0,
-                            reason=(
-                                f"mark={mark:.2f} <= intrinsic_floor={floor:.2f} "
-                                f"(intrinsic={intrinsic:.2f}, DTE={dte}, |Δ|={delta_abs:.2f})"
-                            ),
+                # No OTM theta rule and no intrinsic floor for shorts —
+                # the same conditions that hurt longs benefit shorts.
+            else:
+                # LONG option DTE ladder.
+                # P2a — hard DTE floor (assignment risk)
+                if dte <= rules.force_exit_at_dte:
+                    return ExitDecision(
+                        action="EXIT_DTE_HARD",
+                        exit_qty_factor=1.0,
+                        reason=f"DTE={dte} <= force_exit_at_dte={rules.force_exit_at_dte}",
+                    )
+
+                # P2b — OTM near expiry → theta vampire, force exit
+                if (dte <= 5
+                        and delta_abs < rules.force_exit_at_dte_5_if_delta_below):
+                    return ExitDecision(
+                        action="EXIT_DTE_OTM",
+                        exit_qty_factor=1.0,
+                        reason=(
+                            f"DTE={dte}, |Δ|={delta_abs:.2f} < "
+                            f"{rules.force_exit_at_dte_5_if_delta_below:.2f} "
+                            f"(theta vampire window)"
+                        ),
+                    )
+
+                # P2c — ITM/ATM near expiry → intrinsic floor stop instead of exit
+                if dte <= rules.switch_to_intrinsic_floor_at_dte and delta_abs >= 0.40:
+                    intrinsic = compute_intrinsic(symbol, underlying_mark)
+                    if intrinsic is not None and intrinsic > 0:
+                        floor = max(
+                            plan.hard_stop,
+                            intrinsic - rules.intrinsic_floor_buffer,
                         )
+                        if mark <= floor:
+                            return ExitDecision(
+                                action="EXIT_INTRINSIC_FLOOR",
+                                exit_qty_factor=1.0,
+                                reason=(
+                                    f"mark={mark:.2f} <= intrinsic_floor={floor:.2f} "
+                                    f"(intrinsic={intrinsic:.2f}, DTE={dte}, |Δ|={delta_abs:.2f})"
+                                ),
+                            )
 
     # ---- P3 — Hard target ----
-    if mark >= plan.hard_target:
+    # LONG:  mark >= target (price rose to take-profit)
+    # SHORT: mark <= target (premium decayed to buyback level)
+    target_hit = (mark <= plan.hard_target) if is_short else (mark >= plan.hard_target)
+    if target_hit:
+        cmp = "<=" if is_short else ">="
         return ExitDecision(
             action="EXIT_TARGET",
             exit_qty_factor=1.0,
-            reason=f"mark={mark:.2f} >= hard_target={plan.hard_target:.2f}",
+            reason=f"mark={mark:.2f} {cmp} hard_target={plan.hard_target:.2f}",
         )
 
     # ---- P3b — Scale-out ladder ----
+    # LONG: rung fires when mark RISES to at_mark
+    # SHORT: rung fires when mark FALLS to at_mark
     for idx, rung in enumerate(plan.scale_out_ladder):
         if idx < scale_rungs_taken:
             continue
-        if mark >= rung.at_mark:
+        rung_hit = (mark <= rung.at_mark) if is_short else (mark >= rung.at_mark)
+        if rung_hit:
+            cmp = "<=" if is_short else ">="
             return ExitDecision(
                 action="EXIT_TARGET",
                 exit_qty_factor=float(rung.exit_factor),
                 reason=(
-                    f"scale-out rung#{idx + 1}: mark={mark:.2f} >= {rung.at_mark:.2f}, "
+                    f"scale-out rung#{idx + 1}: mark={mark:.2f} {cmp} {rung.at_mark:.2f}, "
                     f"close {int(rung.exit_factor * 100)}%"
                 ),
             )
 
     # ---- P4 — Trailing stop ----
-    # Only engaged once mark has touched engage_at_mark. We derive whether
-    # the trail engaged from the high-water mark (which mfe_so_far gives us
-    # via the trade's R-unit, computed below).
-    if plan.trail_stop is not None and entry > 0 and mfe_so_far is not None:
+    # LONG: trail tracks the HIGH-water mark; exit when mark falls back
+    #       to high_water × (1 − distance_pct).
+    # SHORT: trail tracks the LOW-water mark; exit when mark rises back
+    #        to low_water × (1 + distance_pct). For shorts we use MAE
+    #        instead of MFE (most-negative R = price moving in our favor).
+    if plan.trail_stop is not None and entry > 0:
         r_unit = abs(entry - plan.hard_stop)
         if r_unit > 0:
-            high_water = entry + float(mfe_so_far) * r_unit
-            if high_water >= plan.trail_stop.engage_at_mark:
-                trail_dist = high_water * plan.trail_stop.distance_pct
-                trailed_stop = max(
-                    high_water - trail_dist,
-                    _trail_floor(plan, entry),
-                )
-                if mark <= trailed_stop:
-                    return ExitDecision(
-                        action="EXIT_TRAIL",
-                        exit_qty_factor=1.0,
-                        reason=(
-                            f"trail: mark={mark:.2f} <= "
-                            f"trailed_stop={trailed_stop:.2f} "
-                            f"(high_water={high_water:.2f}, "
-                            f"dist={plan.trail_stop.distance_pct:.0%})"
-                        ),
+            if is_short:
+                # mae_so_far is most-negative R from entry's perspective —
+                # but for a short, "negative R" means LONG-style loss = mark > entry.
+                # The price moving FAVORABLY for a short = mark < entry, which
+                # appears as MAE (most-adverse from a long's POV).
+                # So: low_water = entry + mae × r_unit (mae is negative ≤ 0)
+                low_water_R = pos.get("mae_so_far")
+                if low_water_R is not None:
+                    low_water = entry + float(low_water_R) * r_unit
+                    # Engaged when mark has DROPPED to engage_at_mark
+                    if low_water <= plan.trail_stop.engage_at_mark:
+                        trail_dist = low_water * plan.trail_stop.distance_pct
+                        # never_below for shorts means "never_ABOVE" the floor
+                        floor = _trail_floor(plan, entry)
+                        trailed_stop = min(low_water + trail_dist, floor)
+                        if mark >= trailed_stop:
+                            return ExitDecision(
+                                action="EXIT_TRAIL",
+                                exit_qty_factor=1.0,
+                                reason=(
+                                    f"trail: mark={mark:.2f} >= "
+                                    f"trailed_stop={trailed_stop:.2f} "
+                                    f"(low_water={low_water:.2f}, "
+                                    f"dist={plan.trail_stop.distance_pct:.0%})"
+                                ),
+                            )
+            elif mfe_so_far is not None:
+                high_water = entry + float(mfe_so_far) * r_unit
+                if high_water >= plan.trail_stop.engage_at_mark:
+                    trail_dist = high_water * plan.trail_stop.distance_pct
+                    trailed_stop = max(
+                        high_water - trail_dist,
+                        _trail_floor(plan, entry),
                     )
+                    if mark <= trailed_stop:
+                        return ExitDecision(
+                            action="EXIT_TRAIL",
+                            exit_qty_factor=1.0,
+                            reason=(
+                                f"trail: mark={mark:.2f} <= "
+                                f"trailed_stop={trailed_stop:.2f} "
+                                f"(high_water={high_water:.2f}, "
+                                f"dist={plan.trail_stop.distance_pct:.0%})"
+                            ),
+                        )
 
     # ---- P5 — Max age ----
     opened_at = pos.get("opened_at")

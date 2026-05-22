@@ -541,7 +541,14 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             continue
 
         asset_type = pos.get("asset_type", "STK")
-        side_close = "SELL"  # we only hold long positions
+        # Close direction depends on what we're long/short. A SHORT option
+        # position is closed by BUYING it back; a LONG position is closed
+        # by SELLING. Plan direction lives in the enrichment.
+        plan_dir = "LONG"
+        ep = pos.get("exit_plan")
+        if isinstance(ep, dict):
+            plan_dir = ep.get("direction") or "LONG"
+        side_close = "BUY" if plan_dir == "SHORT" else "SELL"
         placed_order_id: str | None = None
         exit_price = float(pos.get("mark") or pos.get("entry_price") or 0)
 
@@ -647,7 +654,12 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             # Full close — journal close (trade row + thesis row).
             entry_price_j = float(pos.get("entry_price") or 0)
             mult_j = 100 if asset_type == "OPT" else 1
-            pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
+            # SHORT positions invert PnL sign: you collect premium on entry
+            # (cash IN), pay to close (cash OUT). So profit = entry - exit.
+            if plan_dir == "SHORT":
+                pnl_j = round((entry_price_j - exit_price) * close_qty * mult_j, 2)
+            else:
+                pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
             outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
 
             if trade_id_source == "sqlite" and journal_close_trade is not None:
@@ -745,7 +757,11 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
         if ntfy_available:
             try:
                 entry = float(pos.get("entry_price") or 0)
-                pnl_pct = ((exit_price - entry) / entry * 100) if entry else 0.0
+                # SHORT inverts sign — see PnL note above.
+                if plan_dir == "SHORT":
+                    pnl_pct = ((entry - exit_price) / entry * 100) if entry else 0.0
+                else:
+                    pnl_pct = ((exit_price - entry) / entry * 100) if entry else 0.0
                 ntfy_send(
                     topic="trades",
                     title=f"EXIT {action.replace('EXIT_', '')} — {_bare_ticker(symbol)}",

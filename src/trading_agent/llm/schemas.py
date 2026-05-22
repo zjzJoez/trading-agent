@@ -90,9 +90,16 @@ class ExitPlan(_Strict):
 
     All price-denominated fields are in the position's quote unit (dollars
     per share for stock, dollars per contract for option premiums).
+
+    ``direction`` controls the executor's comparison polarity:
+      * LONG:  mark <= stop triggers, mark >= target triggers
+      * SHORT: mark >= stop triggers, mark <= target triggers
+        (you're short the option → price rising is bad)
+    Defaults to LONG so legacy plans (no direction field) keep working.
     """
 
     version: int = 1
+    direction: Literal["LONG", "SHORT"] = "LONG"
     hard_stop: float = Field(gt=0)
     hard_target: float = Field(gt=0)
     scale_out_ladder: list[ScaleOutRung] = Field(default_factory=list)
@@ -102,25 +109,57 @@ class ExitPlan(_Strict):
     time_in_trade_max_days: int = Field(ge=1, default=30)
 
 
-# Minimum risk-reward floor for any opening trade. 1.5:1 means we must
-# stand to make 1.5x what we risk on every entry. 5/22 audit: previous
-# LLM-emitted trades had 0.6:1 (SPY 742C: stop -55%, target +33%); that's
-# negative-EV at any win rate < 62%, far below our actual ~55% baseline.
-MIN_RISK_REWARD = 1.5
+# Minimum risk-reward floor for LONG opening trades. 1.3:1 means we must
+# stand to make 1.3x what we risk on every entry. 5/22 raised from 1.5
+# after the SPY 742C 0.6:1 audit; 1.3 is still positive-EV at our ~55%
+# baseline win rate (0.55 × 1.3 − 0.45 = +0.27 R/trade), and accepts
+# more setups than 1.5 would.
+#
+# SHORT premium positions are not gated by R7 — see _validate_risk_reward.
+# R:R is structurally capped (reward = premium collected ≤ strike), so a
+# CSP at strike 100 selling for $2 would always fail R7 1.3:1 even when
+# the EV is clearly positive.
+MIN_RISK_REWARD = 1.3
 
 
 def default_exit_plan(
-    entry: float, stop: float, target: float, asset_type: str
+    entry: float, stop: float, target: float, asset_type: str,
+    direction: str = "LONG",
 ) -> ExitPlan:
     """Generate a sensible default exit plan from (entry, stop, target).
 
     Used when the trader synthesizer emits only the legacy stop/target
-    fields without a full ExitPlan. Designed so behaviour is reasonable
-    even without explicit caller-supplied rungs.
+    fields without a full ExitPlan.
+
+    For LONG positions: target > entry > stop.
+    For SHORT positions: stop > entry > target (you want premium to decay).
     """
+    if direction == "SHORT":
+        # Short option: collect premium, want it to decay to ~$0.
+        # scale_at: capture ~50% of max profit (entry - 0.5×(entry-target))
+        scale_at = entry - (entry - target) * 0.50
+        return ExitPlan(
+            direction="SHORT",
+            hard_stop=stop,
+            hard_target=target,
+            scale_out_ladder=[
+                ScaleOutRung(
+                    at_mark=scale_at, exit_factor=0.5, then_engage_trail=True
+                ),
+            ],
+            trail_stop=TrailStopConfig(
+                engage_at_mark=scale_at,
+                distance_pct=0.25,           # wider trail for short premium
+                never_below="break_even",
+            ),
+            time_in_trade_max_days=30,
+        )
+
+    # LONG (stk or opt)
     if asset_type == "OPT":
         scale_at = entry + (target - entry) * 0.70
         return ExitPlan(
+            direction="LONG",
             hard_stop=stop,
             hard_target=target,
             scale_out_ladder=[
@@ -135,9 +174,10 @@ def default_exit_plan(
             ),
             time_in_trade_max_days=30,
         )
-    # STK
+    # STK long
     scale_at = entry + (target - entry) * 0.70
     return ExitPlan(
+        direction="LONG",
         hard_stop=stop,
         hard_target=target,
         scale_out_ladder=[],  # whole-share atomicity, no partials
@@ -270,7 +310,13 @@ class TraderProposal(_Strict):
     ticker: str
     symbol: str
     asset_type: Literal["STK", "OPT"]
-    direction: Literal["LONG", "LONG_CALL", "LONG_PUT"]
+    # LONG_PUT/CALL = buy premium; SHORT_PUT/CALL = sell premium (collect).
+    # SHORT_PUT is the cash-secured-put case (CSP); SHORT_CALL is naked
+    # (sizing enforces stress-buffered max_loss to bound the unbounded
+    # theoretical risk).
+    direction: Literal[
+        "LONG", "LONG_CALL", "LONG_PUT", "SHORT_CALL", "SHORT_PUT"
+    ]
     strategy_label: str
     entry_price: float
     stop: float
@@ -286,14 +332,20 @@ class TraderProposal(_Strict):
     # in persist_trade_event.
     exit_plan: ExitPlan | None = None
 
-    @model_validator(mode="after")
-    def _validate_risk_reward(self) -> "TraderProposal":
-        """R7 — minimum risk:reward floor enforced at LLM-output time.
+    @property
+    def is_short(self) -> bool:
+        return self.direction in ("SHORT_CALL", "SHORT_PUT")
 
-        Forces synthesizer to either tighten stop or widen target so the
-        portfolio's per-trade EV is at least neutral at our baseline win
-        rate. SPY 742C-style 0.6:1 R:R proposals raise here and the LLM
-        either retries with better numbers or declines the trade.
+    @model_validator(mode="after")
+    def _validate_geometry(self) -> "TraderProposal":
+        """R7 R:R floor + plan/proposal consistency.
+
+        LONG positions: target > entry > stop, R:R >= MIN_RISK_REWARD.
+        SHORT positions: stop > entry > target (premium decays toward
+            zero = profit); R7 is SKIPPED because R:R is structurally
+            capped on premium-collecting trades (reward = premium ≤
+            strike, risk = up to strike × 100). Sizing R5b/R1 stress
+            buffer handles the real risk bound for shorts.
         """
         risk = abs(self.entry_price - self.stop)
         reward = abs(self.target - self.entry_price)
@@ -307,16 +359,45 @@ class TraderProposal(_Strict):
                 f"target ({self.target}) too close to entry ({self.entry_price}); "
                 f"reward=${reward:.4f}. Move target further from entry."
             )
-        rr = reward / risk
-        if rr < MIN_RISK_REWARD:
-            raise ValueError(
-                f"R:R {rr:.2f} below floor {MIN_RISK_REWARD} "
-                f"(risk=${risk:.2f}, reward=${reward:.2f}). "
-                f"Tighten stop OR widen target until reward/risk >= "
-                f"{MIN_RISK_REWARD}."
-            )
+
+        # Direction-specific geometry: LONG wants target above entry;
+        # SHORT wants target BELOW entry (premium decay).
+        if self.is_short:
+            if self.target >= self.entry_price:
+                raise ValueError(
+                    f"SHORT direction requires target ({self.target}) < "
+                    f"entry ({self.entry_price}) — you profit from premium "
+                    f"decaying toward zero."
+                )
+            if self.stop <= self.entry_price:
+                raise ValueError(
+                    f"SHORT direction requires stop ({self.stop}) > "
+                    f"entry ({self.entry_price}) — you lose when the "
+                    f"option price rises against you."
+                )
+        else:
+            # LONG geometry + R7 R:R floor.
+            if self.target <= self.entry_price:
+                raise ValueError(
+                    f"LONG direction requires target ({self.target}) > "
+                    f"entry ({self.entry_price})."
+                )
+            if self.stop >= self.entry_price:
+                raise ValueError(
+                    f"LONG direction requires stop ({self.stop}) < "
+                    f"entry ({self.entry_price})."
+                )
+            rr = reward / risk
+            if rr < MIN_RISK_REWARD:
+                raise ValueError(
+                    f"R:R {rr:.2f} below floor {MIN_RISK_REWARD} "
+                    f"(risk=${risk:.2f}, reward=${reward:.2f}). "
+                    f"Tighten stop OR widen target until reward/risk >= "
+                    f"{MIN_RISK_REWARD}."
+                )
+
         # If exit_plan is supplied, its hard_stop/hard_target should match
-        # the top-level stop/target. Catches divergence early.
+        # the top-level stop/target, AND its direction must match.
         if self.exit_plan is not None:
             if abs(self.exit_plan.hard_stop - self.stop) > 0.01:
                 raise ValueError(
@@ -327,6 +408,12 @@ class TraderProposal(_Strict):
                 raise ValueError(
                     f"exit_plan.hard_target ({self.exit_plan.hard_target}) "
                     f"!= proposal.target ({self.target})"
+                )
+            expected_dir = "SHORT" if self.is_short else "LONG"
+            if self.exit_plan.direction != expected_dir:
+                raise ValueError(
+                    f"exit_plan.direction ({self.exit_plan.direction}) "
+                    f"!= proposal direction ({expected_dir})"
                 )
         return self
 

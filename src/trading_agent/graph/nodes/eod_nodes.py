@@ -862,7 +862,7 @@ def compute_ops_summary(state: TradingGraphState) -> dict:
 
     # Burn-in threshold (also defined in risk/llm.py; kept here for digest
     # readability — if you bump it there, also bump here).
-    BURN_IN_TARGET = 15
+    BURN_IN_TARGET = 12
     filled = summary.get("filled_trades_lifetime", 0)
     burn_in_remaining = max(0, BURN_IN_TARGET - filled)
 
