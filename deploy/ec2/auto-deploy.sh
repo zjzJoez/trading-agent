@@ -48,7 +48,43 @@ _notify_ops() {
         "${NTFY_BASE_URL:-https://ntfy.sh}/${NTFY_TOPIC_PREFIX}-ops" > /dev/null 2>&1 || true
 }
 
-trap '_notify_ops "auto-deploy FAILED on EC2 (exit $?)" 5' ERR
+# Failure de-bouncer. Without this, a stuck-bad commit causes auto-deploy
+# to retry every 2 min for 12 hours, sending 360+ ntfy "FAILED" pings —
+# what happened on 5/22. Now: first failure pings priority=5 immediately;
+# subsequent failures within the same SHA only ping once per hour at most.
+# After 3 consecutive failures on the same SHA, the retry cadence stops
+# being important — operator already knows it's broken.
+FAILURE_STATE_DIR="/var/lib/trading-agent-auto-deploy"
+_ntfy_failure_with_backoff() {
+    local body="$1"
+    mkdir -p "$FAILURE_STATE_DIR" 2>/dev/null || true
+    local marker="$FAILURE_STATE_DIR/last_failure_sha_${REMOTE:0:7}"
+    local count_marker="$FAILURE_STATE_DIR/failure_count_${REMOTE:0:7}"
+    local now=$(date +%s)
+    local last_ts=0
+    local count=0
+    if [ -f "$marker" ]; then
+        last_ts=$(stat -c '%Y' "$marker" 2>/dev/null || echo 0)
+    fi
+    if [ -f "$count_marker" ]; then
+        count=$(cat "$count_marker" 2>/dev/null || echo 0)
+    fi
+    count=$((count + 1))
+    echo "$count" > "$count_marker"
+    touch "$marker"
+    local elapsed=$((now - last_ts))
+    # First failure → priority 5. Subsequent failures on the same SHA within
+    # 1 hour → silent. After 1 hour → priority 4 reminder.
+    if [ "$last_ts" -eq 0 ]; then
+        _notify_ops "$body (first occurrence)" 5
+    elif [ "$elapsed" -gt 3600 ]; then
+        _notify_ops "$body (still failing, attempt #$count)" 4
+    fi
+    # Otherwise: silent. Log it for audit.
+    echo "$LOG_TAG failure #$count on ${REMOTE:0:7}; elapsed=${elapsed}s" >&2
+}
+
+trap '_notify_ops "auto-deploy unexpected exit on EC2 (exit $?)" 4' ERR
 
 cd "$REPO_DIR"
 
@@ -105,11 +141,16 @@ if [ ! -x "$PYTHON_BIN" ]; then
     exit 1
 fi
 
-# Run with -q for terse output, -x to fail fast on first error so we don't
-# burn 30s+ on cascading failures. 5-min timeout protects against a hung test.
-if ! ( cd "$TEST_WORKTREE" && timeout 300 "$PYTHON_BIN" -m pytest tests/ -q -x --no-header 2>&1 | tail -30 ); then
+# `-m 'not integration'` skips tests that touch live infrastructure
+# (real Postgres writes, real ntfy pushes, real LLM calls). Critical:
+# without this, every retry of a failing deploy spam-fires EOD digests
+# and heartbeats to production (5/22 incident — 40+ EOD LLM calls billed
+# while the deploy retried itself to death).
+# 4-min timeout (240s) inside systemd's 5-min TimeoutStartSec — give it
+# slack to clean up before systemd SIGTERMs the whole tree.
+if ! ( cd "$TEST_WORKTREE" && timeout 240 "$PYTHON_BIN" -m pytest tests/ -q -x --no-header -m 'not integration' 2>&1 | tail -30 ); then
     echo "$LOG_TAG ABORT: pytest failed on ${REMOTE:0:7}"
-    _notify_ops "deploy ABORTED: pytest failed on ${REMOTE:0:7} — live HEAD ${LOCAL:0:7} kept" 5
+    _ntfy_failure_with_backoff "deploy ABORTED: pytest failed on ${REMOTE:0:7} — live HEAD ${LOCAL:0:7} kept"
     git worktree remove --force "$TEST_WORKTREE" 2>/dev/null || true
     exit 1
 fi

@@ -65,3 +65,12 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+# Custom markers — surface them so pytest doesn't warn "unknown mark".
+# `integration` = touches live infrastructure (Postgres, ntfy, LLM); the
+# pre-deploy pytest gate runs `-m 'not integration'` to skip these,
+# otherwise every deploy retry spams the prod environment.
+markers = [
+    "integration: requires live Postgres + ntfy + LLM; do NOT run in deploy gate",
+]

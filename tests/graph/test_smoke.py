@@ -65,6 +65,12 @@ pytestmark_pg = pytest.mark.skipif(
 )
 
 
+# These tests touch LIVE infrastructure: real Postgres writes, real ntfy
+# pushes, real LLM calls (eod_review runs generate_eod_digest which is an
+# LLM-backed node). Marked `integration` so the pre-deploy pytest gate can
+# skip them via `-m 'not integration'`. Otherwise every deploy retry
+# spam-fires EOD digests + heartbeats to production (5/22 incident).
+@pytest.mark.integration
 @pytest.mark.skipif(not _POSTGRES_AVAILABLE, reason="requires Postgres")
 def test_healthcheck_graph_completes():
     from trading_agent.orchestrator import run_once
@@ -73,6 +79,7 @@ def test_healthcheck_graph_completes():
     assert final["trigger"] == "healthcheck"
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(not _POSTGRES_AVAILABLE, reason="requires Postgres")
 def test_eod_review_graph_completes():
     from trading_agent.orchestrator import run_once

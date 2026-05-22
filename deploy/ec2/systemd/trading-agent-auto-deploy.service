@@ -15,9 +15,13 @@ EnvironmentFile=/home/ubuntu/.env.postgres
 
 ExecStart=/home/ubuntu/trading-agent/deploy/ec2/auto-deploy.sh
 
-# 5-min hard cap — uv sync on a fresh torch install can take ~3 min;
-# migrations should be sub-second. 5 min covers the worst realistic case.
-TimeoutStartSec=300
+# 10-min hard cap. Original 5 min was too tight: when pytest gate ran the
+# integration tests by accident (5/22 incident), the eod_review LLM call
+# alone took ~30s, plus full unit suite ~10s, plus uv sync up to ~3min →
+# we'd routinely cross 5min and get SIGTERM'd mid-test. 10min gives slack
+# for uv sync + unit tests + migrations together; the gate's own `timeout`
+# is still 240s (4min) so it fails cleanly inside that.
+TimeoutStartSec=600
 
 StandardOutput=append:/var/log/trading-agent-auto-deploy.log
 StandardError=append:/var/log/trading-agent-auto-deploy.log
