@@ -1474,7 +1474,44 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
 
     new_proposal = {**proposal, "qty": final_qty}
     if final_qty == 0:
-        infeasible_rules = [b.rule for b in blockers(final_violations)]
+        blocker_list = blockers(final_violations)
+        infeasible_rules = [b.rule for b in blocker_list]
+
+        # Full violation detail in the event payload — the umbrella rule
+        # code (e.g. "R5_option_policy") doesn't tell us WHICH sub-rule
+        # fired (DTE? delta? notional? BUY-only?). The detailed messages
+        # make Postgres self-debuggable; without this we'd have to dump
+        # the proposal and replay sizing.check() by hand (5/22 audit
+        # exactly this pain point — couldn't tell why NVDA failed at
+        # qty=1 without re-running locally).
+        violation_detail = [
+            {
+                "rule": b.rule,
+                "severity": b.severity,
+                "message": b.message[:240],
+            }
+            for b in blocker_list
+        ]
+        # Also include warn-level violations for context (they don't
+        # block but they explain WHY blockers fired — e.g. R7 warn that
+        # target is missing, leading to a downstream DEFER).
+        warn_detail = [
+            {
+                "rule": v.rule,
+                "severity": v.severity,
+                "message": v.message[:240],
+            }
+            for v in final_violations if v.severity == "warn"
+        ]
+
+        # Compact, human-readable summary for the brain log (no need to
+        # SSH into Postgres for routine debugging).
+        log.warning(
+            "[deterministic_sizing] infeasible ticker=%s blockers=%s | %s",
+            proposal.get("ticker"),
+            infeasible_rules,
+            " ; ".join(f"[{b.rule}] {b.message[:120]}" for b in blocker_list),
+        )
 
         # Mark thesis 'rejected' — sizing said "can't fit this trade under
         # any qty". Risk council still runs downstream (the graph topology
@@ -1491,10 +1528,27 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
         emit(
             run_id=run_id, trigger=trigger, agent="deterministic_sizing",
             event_type="infeasible",
+            severity=1,  # warn so it surfaces in /alerts and EOD digest
             payload={
                 "ticker": proposal.get("ticker", "?"),
                 "thesis_id": thesis_id,
                 "blockers": infeasible_rules,
+                # NEW: the human-readable details that tell you WHICH
+                # sub-rule of an umbrella code (e.g. R5) actually fired
+                "violations": violation_detail,
+                "warnings": warn_detail,
+                # Echo the proposal shape so we can re-derive the failure
+                # without joining other tables. Compact subset only.
+                "proposal_shape": {
+                    "asset_type": proposal.get("asset_type"),
+                    "side": "BUY",  # opening trades are BUY at this stage
+                    "qty_requested": float(requested_qty),
+                    "qty_after_cap": float(final_qty),
+                    "entry_price": float(proposal.get("entry_price") or 0),
+                    "option_delta": proposal.get("option_delta"),
+                    "option_dte": proposal.get("option_dte"),
+                    "strategy_label": proposal.get("strategy_label"),
+                },
             },
         )
         return {

@@ -354,9 +354,19 @@ def ntfy_scan_digest(state: TradingGraphState) -> dict:
 
 # Score threshold below which we do NOT dispatch. Above this, scout has at
 # least moderate conviction and the full pipeline (Bull/Bear debate + Risk
-# Council) is worth the LLM spend. Tuned conservatively — bump up to 0.7 if
-# false-positive rate of full-pipeline-then-decline is too high.
-DISPATCH_MIN_SCORE = 0.6
+# Council) is worth the LLM spend.
+#
+# Tuning history:
+#   0.7  → too tight; daily-best frequently sat at 0.60-0.65, system never
+#          dispatched
+#   0.6  → still too tight in aggressive mode. 5/22 audit: NVDA scored 0.56
+#          ("203M premarket vol vs 40M baseline; AI sector momentum") —
+#          legitimate setup but missed cutoff by 0.04
+#   0.55 → catches real setups while still excluding fallback-mode scores
+#          (LLM-failure fallback hard-codes 0.50). At 0.55 we accept the
+#          full-pipeline LLM cost (~$0.20) on moderate-conviction candidates;
+#          if false-positive rate gets high we'll bump back to 0.6
+DISPATCH_MIN_SCORE = 0.55
 
 # Don't dispatch the same ticker more than once in this many days. Prevents
 # the scout's daily "top pick" from collapsing onto a handful of names if the
