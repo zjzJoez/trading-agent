@@ -385,12 +385,32 @@ def auto_void_stale_theses(state: TradingGraphState) -> dict:
     # The 5/22 AAPL/XLE/GLD/AMZN zombie cleanup proved that all real theses
     # on EC2 live in Postgres — sqlite is empty there. Without this sweep,
     # auto_void_stale_theses does nothing on prod.
+    #
+    # Status routing distinguishes two outcomes:
+    #   * If the thesis has ANY linked trade rows (even already-closed),
+    #     archive as 'triggered' — the idea was actually tested in market.
+    #     Marking it 'void' would lose the win/loss history.
+    #   * Pure orphans (no trade row ever) → 'void' — the operator never
+    #     pulled the trigger, idea went stale.
+    # (5/22 audit: QQQ #1 and SPY #2 were both 24d stale opens BUT both
+    # had WIN trades — they should be 'triggered', not 'void'.)
     try:
         from trading_agent.store.postgres import cursor as pg_cursor
         with pg_cursor() as cur:
             cur.execute(
                 """
-                SELECT th.id, th.ticker, th.created_at
+                SELECT th.id, th.ticker, th.created_at,
+                       EXISTS (
+                           SELECT 1 FROM journal_trades tr
+                           WHERE tr.thesis_id = th.id
+                       ) AS has_any_trade,
+                       (
+                           SELECT outcome FROM journal_trades tr
+                           WHERE tr.thesis_id = th.id
+                             AND tr.outcome != 'OPEN'
+                           ORDER BY closed_at DESC NULLS LAST
+                           LIMIT 1
+                       ) AS latest_outcome
                 FROM journal_theses th
                 WHERE th.status = 'open'
                   AND th.created_at < %s
@@ -403,17 +423,23 @@ def auto_void_stale_theses(state: TradingGraphState) -> dict:
                 (cutoff_dt,),
             )
             pg_rows = cur.fetchall()
-        for thesis_id, ticker, created_at in pg_rows:
+        for thesis_id, ticker, created_at, has_any_trade, latest_outcome in pg_rows:
+            new_status = "triggered" if has_any_trade else "void"
             try:
                 with pg_cursor() as cur:
                     cur.execute(
-                        "UPDATE journal_theses SET status='void' "
+                        "UPDATE journal_theses SET status=%s "
                         "WHERE id=%s AND status='open'",
-                        (int(thesis_id),),
+                        (new_status, int(thesis_id)),
                     )
-                voided.append({"thesis_id": int(thesis_id), "ticker": ticker,
-                               "created_at": created_at.isoformat() if created_at else None,
-                               "source": "postgres"})
+                voided.append({
+                    "thesis_id": int(thesis_id),
+                    "ticker": ticker,
+                    "created_at": created_at.isoformat() if created_at else None,
+                    "source": "postgres",
+                    "new_status": new_status,
+                    "latest_outcome": latest_outcome,
+                })
             except Exception as e:
                 log.warning("[auto_void_stale_theses] postgres update(%s) failed: %s",
                             thesis_id, e)

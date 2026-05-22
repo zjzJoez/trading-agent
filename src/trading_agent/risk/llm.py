@@ -244,7 +244,14 @@ def _format_council_context(
 # deterministic_clear), so cross-family alignment has 0 real-data evidence.
 # After N trades, we have enough Council audit rows to inspect alignment
 # and confidently keep the skip-on-clear shortcut.
-COUNCIL_BURN_IN_TRADE_COUNT = 12
+#
+# Threshold journey: 15 → 12 → 5. Original 15 was based on "trustworthy
+# stats" intuition; in practice the system needed real fills to make
+# burn-in progress, but burn-in itself was forcing DEFER on every
+# candidate, which created the trade-engine dormancy the operator
+# complained about. 5 fills is enough to surface obvious cross-family
+# misalignment without trapping the system at 0 trades forever.
+COUNCIL_BURN_IN_TRADE_COUNT = 5
 
 
 def _filled_trade_count() -> int:

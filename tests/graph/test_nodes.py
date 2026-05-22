@@ -1279,6 +1279,69 @@ class TestVetoDefer:
         payload = mock_emit.call_args[1]["payload"]
         assert "R1_exceed" in payload["hard_violations"]
 
+    def test_persist_veto_marks_thesis_rejected(self):
+        """A VETO must flip the linked thesis to 'rejected' so it doesn't
+        sit at 'open' forever. Regression for the 5/22 zombie pattern."""
+        state = _base_state(
+            trigger="candidate_entry",
+            proposal={"ticker": "AAPL", "proposal_id": "prop-001", "thesis_id": 99},
+            risk={"hard_violations": ["R1_exceed"], "reasons": ["too large"]},
+        )
+        captured_updates: list[tuple] = []
+        fake_cur = MagicMock()
+        fake_cur.execute = MagicMock(
+            side_effect=lambda q, params=None: captured_updates.append((q, params))
+        )
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        with patch("trading_agent.graph.nodes.trade_nodes.emit", return_value=1):
+            with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+                from trading_agent.graph.nodes.trade_nodes import persist_veto
+                persist_veto(state)
+        # Expect at least one UPDATE journal_theses set status='rejected'
+        assert any(
+            "UPDATE journal_theses" in q and "rejected" in q
+            for q, _ in captured_updates
+        ), f"expected rejection UPDATE in {captured_updates!r}"
+
+    def test_persist_defer_marks_thesis_rejected(self):
+        state = _base_state(
+            trigger="candidate_entry",
+            proposal={"ticker": "META", "proposal_id": "prop-003", "thesis_id": 77},
+            risk={"reasons": ["burn_in_trade_5_of_15"]},
+        )
+        captured_updates: list[tuple] = []
+        fake_cur = MagicMock()
+        fake_cur.execute = MagicMock(
+            side_effect=lambda q, params=None: captured_updates.append((q, params))
+        )
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        with patch("trading_agent.graph.nodes.trade_nodes.emit", return_value=1):
+            with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+                from trading_agent.graph.nodes.trade_nodes import persist_defer
+                persist_defer(state)
+        assert any(
+            "UPDATE journal_theses" in q and "rejected" in q
+            for q, _ in captured_updates
+        ), f"expected rejection UPDATE in {captured_updates!r}"
+
+    def test_persist_veto_without_thesis_id_does_not_crash(self):
+        """Old proposals without thesis_id shouldn't break the VETO path."""
+        state = _base_state(
+            trigger="candidate_entry",
+            proposal={"ticker": "AAPL", "proposal_id": "prop-001"},  # no thesis_id
+            risk={"hard_violations": ["R1_exceed"], "reasons": ["too large"]},
+        )
+        with patch("trading_agent.graph.nodes.trade_nodes.emit", return_value=1):
+            from trading_agent.graph.nodes.trade_nodes import persist_veto
+            result = persist_veto(state)
+        assert result == {}  # graceful pass-through
+
     def test_ntfy_risk_block_sends(self):
         state = _base_state(
             trigger="candidate_entry",

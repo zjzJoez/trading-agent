@@ -84,6 +84,63 @@ def _moomoo_row_to_open_position(row: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Thesis lifecycle — mark blocked theses 'rejected' immediately
+# ---------------------------------------------------------------------------
+#
+# Background: create_or_refresh_thesis writes a journal_theses row with
+# status='open' BEFORE risk council / sizing / pretool checks run. If any
+# of those blocks the trade, the thesis would otherwise sit at 'open'
+# forever, polluting the dashboard and creating ambiguity around "what's
+# currently live." This helper provides the explicit cleanup hook.
+#
+# Status semantics:
+#   open      — thesis active; trade in progress or about to be placed
+#   triggered — trade was placed AND closed (win/loss/scratch recorded)
+#   rejected  — thesis was proposed but BLOCKED before any trade ran
+#               (VETO / DEFER / sizing-infeasible / pretool-block)
+#   void      — thesis went stale (never traded, no recent rejection,
+#               aged past STALE_THESIS_AGE_DAYS in auto_void_stale_theses)
+
+
+def _mark_thesis_rejected(thesis_id: int, reason: str) -> bool:
+    """Flip thesis status='rejected' with audit reason. Best-effort.
+
+    Used by persist_veto / persist_defer / deterministic_sizing infeasible
+    so a thesis row doesn't stay 'open' just because the trade got blocked.
+
+    Returns True on success, False on any failure (caller doesn't unwind —
+    a stuck 'open' will get swept by auto_void_stale_theses eventually).
+    """
+    if not thesis_id:
+        return False
+    try:
+        from trading_agent.store.postgres import cursor
+        truncated_reason = str(reason or "rejected")[:280]
+        with cursor() as cur:
+            cur.execute(
+                """
+                UPDATE journal_theses
+                SET status = 'rejected'
+                WHERE id = %s AND status = 'open'
+                """,
+                (int(thesis_id),),
+            )
+        # Note: we don't write close_reason because the column doesn't
+        # exist on journal_theses (only journal_trades has it). The reason
+        # is captured in the emit event payload by callers.
+        log.info("[mark_thesis_rejected] thesis=%s reason=%s",
+                 thesis_id, truncated_reason)
+        return True
+    except Exception as e:
+        log.warning(
+            "[mark_thesis_rejected] thesis=%s failed: %s — will be swept "
+            "by auto_void_stale_theses at next EOD",
+            thesis_id, e,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
 # load_latest_regime — read the most recent regime_states row from Postgres.
 # Falls back to safe-mode VOLATILE_TRANSITION when no row exists yet.
 # ---------------------------------------------------------------------------
@@ -1417,12 +1474,27 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
 
     new_proposal = {**proposal, "qty": final_qty}
     if final_qty == 0:
+        infeasible_rules = [b.rule for b in blockers(final_violations)]
+
+        # Mark thesis 'rejected' — sizing said "can't fit this trade under
+        # any qty". Risk council still runs downstream (the graph topology
+        # doesn't short-circuit on infeasible sizing) and will also DEFER,
+        # but the thesis should already be marked rejected by sizing as the
+        # root cause; persist_defer's later call is a no-op idempotent.
+        thesis_id = proposal.get("thesis_id")
+        if thesis_id:
+            _mark_thesis_rejected(
+                int(thesis_id),
+                reason=f"sizing_infeasible: {infeasible_rules}",
+            )
+
         emit(
             run_id=run_id, trigger=trigger, agent="deterministic_sizing",
             event_type="infeasible",
             payload={
                 "ticker": proposal.get("ticker", "?"),
-                "blockers": [b.rule for b in blockers(final_violations)],
+                "thesis_id": thesis_id,
+                "blockers": infeasible_rules,
             },
         )
         return {
@@ -1532,7 +1604,11 @@ def regime_execution_gate(state: TradingGraphState) -> dict:
 # ---------------------------------------------------------------------------
 
 def persist_veto(state: TradingGraphState) -> dict:
-    """Persist a VETO outcome to agent_events + risk_decisions audit trail."""
+    """Persist a VETO outcome to agent_events + risk_decisions audit trail.
+
+    Also flips the linked journal_theses row to status='rejected' so the
+    thesis doesn't sit at 'open' polluting hygiene checks.
+    """
     run_id = state["run_id"]
     trigger = state["trigger"]
     log.info("[trade/persist_veto] run_id=%s", run_id)
@@ -1542,6 +1618,17 @@ def persist_veto(state: TradingGraphState) -> dict:
     hard_violations = risk.get("hard_violations") or []
     reasons = risk.get("reasons") or []
 
+    # Roll the thesis status back: it's no longer 'open' / live, it was
+    # actively REJECTED by the risk council. Without this, every VETO
+    # would leave the thesis row at 'open' forever (the 5/22 zombie
+    # pattern — the operator complained about exactly this).
+    thesis_id = proposal.get("thesis_id")
+    if thesis_id:
+        _mark_thesis_rejected(
+            int(thesis_id),
+            reason=f"VETO: hard_violations={hard_violations}, reasons={reasons}",
+        )
+
     emit(
         run_id=run_id, trigger=trigger, agent="persist_veto",
         event_type="veto_persisted",
@@ -1549,6 +1636,7 @@ def persist_veto(state: TradingGraphState) -> dict:
         payload={
             "ticker": proposal.get("ticker", "?"),
             "proposal_id": proposal.get("proposal_id"),
+            "thesis_id": thesis_id,
             "hard_violations": hard_violations,
             "reasons": reasons,
         },
@@ -1604,7 +1692,13 @@ def ntfy_risk_block(state: TradingGraphState) -> dict:
 
 
 def persist_defer(state: TradingGraphState) -> dict:
-    """Persist a DEFER outcome — market conditions not suitable right now."""
+    """Persist a DEFER outcome — market conditions not suitable right now.
+
+    Also flips the linked journal_theses row to status='rejected'. A DEFER
+    is "we declined this trade specifically" — even if burn-in might
+    flip APPROVE on a future tick, a NEW thesis would be written then;
+    leaving this one as 'open' just creates dashboard ambiguity.
+    """
     run_id = state["run_id"]
     trigger = state["trigger"]
     log.info("[trade/persist_defer] run_id=%s", run_id)
@@ -1613,12 +1707,20 @@ def persist_defer(state: TradingGraphState) -> dict:
     proposal = state.get("proposal") or {}
     reasons = risk.get("reasons") or []
 
+    thesis_id = proposal.get("thesis_id")
+    if thesis_id:
+        _mark_thesis_rejected(
+            int(thesis_id),
+            reason=f"DEFER: {reasons}",
+        )
+
     emit(
         run_id=run_id, trigger=trigger, agent="persist_defer",
         event_type="defer_persisted",
         payload={
             "ticker": proposal.get("ticker", "?"),
             "proposal_id": proposal.get("proposal_id"),
+            "thesis_id": thesis_id,
             "reasons": reasons,
         },
     )

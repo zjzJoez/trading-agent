@@ -313,6 +313,74 @@ is voided. Emits sev-1 `phantom_trades_voided` event for ops visibility.
 
 ---
 
+## 5a. Thesis lifecycle (journal_theses.status)
+
+Every entry is gated by a recorded thesis. `journal_theses.status`
+moves through this state machine:
+
+```
+         create_or_refresh_thesis (INSERT status='open')
+                  │
+   ┌──────────────┴──────────────┐
+   ▼                             ▼
+ BLOCKED before trade        TRADE PLACED
+ (immediate transition)      (deferred transition)
+   │                             │
+   │  trade_nodes.persist_veto:  │
+   │  trade_nodes.persist_defer: │
+   │  deterministic_sizing       │
+   │  infeasible:                │
+   │                             │
+   │  → _mark_thesis_rejected()  │  (executes through order +
+   │  → status='rejected'        │   place_paper_order + fill +
+   │                             │   route_exit_or_hold cycle)
+   │                             │
+   │                             ▼
+   │                       close_trade succeeds
+   │                       → UPDATE status='triggered'
+   │
+   │
+   ▼
+ status='rejected'  ←  THESIS NEVER MADE IT TO MARKET
+                        (operator-visible immediately,
+                         not deferred to EOD cleanup)
+```
+
+**Four terminal statuses** with crisp meaning:
+
+| status | meaning | example |
+|---|---|---|
+| `open` | thesis active, trade in progress | just-written, pre-risk |
+| `triggered` | trade executed AND closed | SPY 742C WIN |
+| `rejected` | proposed but blocked before any trade | sizing infeasible / VETO / DEFER |
+| `void` | stale orphan, no trade ever, aged past 14d | recorded then forgotten |
+
+The 5/22 incident (operator complained "why are 5 stale theses still
+'open'?") was caused by the absence of the `rejected` status:
+
+- Pre-5/22: VETO/DEFER/sizing-infeasible didn't write back. Theses sat
+  at `open` forever until EOD's auto_void swept them as `void` after
+  14 days — losing the distinction between "actively rejected" and
+  "passively forgotten".
+- Post-5/22: every block path calls `_mark_thesis_rejected()`. The
+  thesis becomes `rejected` within the same graph run. Dashboard +
+  `/api/health` show the real shape: pending → rejected, never stuck.
+
+### EOD `auto_void_stale_theses` — refined routing
+
+The EOD sweep at 21:30 UTC handles edge cases the immediate path misses:
+
+- **Has any trade row (even closed)** → mark `triggered` (preserves
+  win/loss record). Catches the historical pattern where pre-5/22
+  trade closes didn't propagate to the thesis row.
+- **Zero trade rows ever** → mark `void`. Pure orphan: recorded then
+  abandoned without trading.
+
+`triggered` is correct because the trade was placed and resolved;
+`void` is correct because no real-money attempt was made.
+
+---
+
 ## 6. What's intentionally NOT here
 
 - **No LLM exit_monitor.** Removed 2026-05-22 after audit. The schema
