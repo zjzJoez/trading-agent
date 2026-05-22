@@ -140,6 +140,158 @@ def reconcile_journal(state: TradingGraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 1a: reconcile_phantom_trades
+# ---------------------------------------------------------------------------
+
+# A "phantom" trade row is one where:
+#   * journal_trades.outcome = 'OPEN'
+#   * the broker_fill_json shows fill_qty / dealt_qty = 0
+#     (order was SUBMITTED but never executed — broker rejected, cancelled,
+#     or the order timed out)
+#   * the row has been open longer than PHANTOM_AGE_HOURS
+#
+# Without this sweep, phantom rows show up as "live positions" in the
+# enrichment query inside intraday_nodes — the hard executor evaluates
+# rules against an imaginary mark and the dashboard misreports portfolio
+# state. The May 2026 SPY 742C trade (#4) is the canonical example: order
+# 3074924 was SUBMITTING then orphaned; the journal still says OPEN
+# 8 days later.
+PHANTOM_AGE_HOURS = 24
+
+
+def reconcile_phantom_trades(state: TradingGraphState) -> dict:
+    """Close out journal_trades rows for orders the broker never filled.
+
+    Looks at broker_fill_json for fill_qty / dealt_qty / dealt_avg_price
+    fields; if any one of them is zero AND the trade is older than
+    PHANTOM_AGE_HOURS, mark outcome='UNFILLED' and close the parent thesis.
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[eod/reconcile_phantom_trades] run_id=%s", run_id)
+
+    voided: list[dict] = []
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=PHANTOM_AGE_HOURS)
+
+    try:
+        from trading_agent.store.postgres import cursor
+    except Exception as e:
+        log.warning("[reconcile_phantom_trades] postgres import failed: %s", e)
+        return {}
+
+    try:
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, symbol, thesis_id, opened_at,
+                       broker_fill_json, broker_order_id
+                FROM journal_trades
+                WHERE outcome = 'OPEN'
+                  AND opened_at < %s
+                """,
+                (cutoff_dt,),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        log.warning("[reconcile_phantom_trades] scan failed: %s", e)
+        return {}
+
+    for (trade_id, symbol, thesis_id, opened_at, broker_fill_json,
+         broker_order_id) in rows:
+        fill = broker_fill_json if isinstance(broker_fill_json, dict) else {}
+        # Three independent signals — any one missing fill is enough.
+        fill_qty = _safe_float(fill.get("fill_qty"))
+        dealt_qty: float | None = None
+        avg_price: float | None = None
+        raw = fill.get("raw_response")
+        if isinstance(raw, list) and raw:
+            r0 = raw[0] if isinstance(raw[0], dict) else {}
+            dealt_qty = _safe_float(r0.get("dealt_qty"))
+            avg_price = _safe_float(r0.get("dealt_avg_price"))
+        avg_fill = _safe_float(fill.get("avg_fill_price"))
+
+        # "phantom" = every available fill-signal reads zero
+        signals = [s for s in (fill_qty, dealt_qty, avg_price, avg_fill)
+                   if s is not None]
+        if not signals or any(s > 0 for s in signals):
+            continue
+
+        try:
+            with cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE journal_trades
+                    SET outcome = 'UNFILLED',
+                        closed_at = NOW(),
+                        close_reason = COALESCE(close_reason,
+                            'reconcile_phantom_trades: broker never filled')
+                    WHERE id = %s AND outcome = 'OPEN'
+                    """,
+                    (int(trade_id),),
+                )
+        except Exception as e:
+            log.warning(
+                "[reconcile_phantom_trades] UPDATE journal_trades(%s) failed: %s",
+                trade_id, e,
+            )
+            continue
+
+        # Close parent thesis too — without a fill, the thesis is moot.
+        if thesis_id is not None:
+            try:
+                with cursor() as cur:
+                    cur.execute(
+                        "UPDATE journal_theses SET status='void' "
+                        "WHERE id=%s AND status='open'",
+                        (int(thesis_id),),
+                    )
+            except Exception as e:
+                log.warning(
+                    "[reconcile_phantom_trades] thesis(%s) update failed: %s",
+                    thesis_id, e,
+                )
+
+        voided.append({
+            "trade_id": int(trade_id),
+            "symbol": symbol,
+            "thesis_id": int(thesis_id) if thesis_id is not None else None,
+            "opened_at": opened_at.isoformat() if opened_at else None,
+            "broker_order_id": broker_order_id,
+        })
+
+    if voided:
+        emit(
+            run_id=run_id, trigger=trigger, agent="reconcile_phantom_trades",
+            event_type="phantom_trades_voided",
+            severity=1,  # this is a real ops signal — broker rejected something
+            payload={"count": len(voided), "items": voided[:20]},
+        )
+        log.warning(
+            "[reconcile_phantom_trades] voided %d phantom trade(s)",
+            len(voided),
+        )
+    else:
+        emit(
+            run_id=run_id, trigger=trigger, agent="reconcile_phantom_trades",
+            event_type="phantom_trades_clean",
+            payload={},
+        )
+
+    journal_payload = dict(state.get("journal") or {})
+    journal_payload["phantom_trades_voided"] = voided
+    return {"journal": journal_payload}
+
+
+def _safe_float(x: Any) -> float | None:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Node 1b: auto_void_stale_theses
 # ---------------------------------------------------------------------------
 

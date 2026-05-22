@@ -10,13 +10,144 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _Strict(BaseModel):
     """Reject extra fields; coerce nothing."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+# -----------------------------------------------------------------------------
+# Exit plan — deterministic exit rules baked at entry time
+#
+# The intraday hard executor (trading_agent.exits.hard_executor) consumes
+# this plan and produces deterministic EXIT_* decisions every 15-min tick.
+# No LLM call in the exit path. The plan is built once at entry; never
+# re-derived. See docs/position_management.md for the full rule table.
+# -----------------------------------------------------------------------------
+
+
+class ScaleOutRung(_Strict):
+    """One rung in the scale-out ladder.
+
+    When mark >= ``at_mark`` and this rung hasn't fired yet, close
+    ``exit_factor`` of the *remaining* position. If ``then_engage_trail``
+    is True, subsequent ticks start checking the trailing-stop rule for
+    the residual quantity.
+    """
+
+    at_mark: float = Field(gt=0)
+    exit_factor: float = Field(gt=0.0, le=1.0)
+    then_engage_trail: bool = False
+
+
+class TrailStopConfig(_Strict):
+    """Trailing stop. Engaged when mark first touches ``engage_at_mark``.
+
+    Once engaged, the trail tracks the highest mark seen on this position
+    (sourced from ``journal_trades.mfe_so_far``, converted back to dollars
+    via the trade's R-unit). Exit fires when mark falls below
+    ``high_water * (1 - distance_pct)``. ``never_below`` floors the trail
+    so it can never give back below break-even / entry / the original stop.
+    """
+
+    engage_at_mark: float = Field(gt=0)
+    distance_pct: float = Field(gt=0, lt=1.0)
+    never_below: Literal["break_even", "entry", "original_stop"] = "break_even"
+
+
+class DteRulesConfig(_Strict):
+    """DTE-aware exit rules for options.
+
+    * ``force_exit_at_dte``: always exit when DTE <= this. Default 2 covers
+      assignment risk + the gamma cliff near expiry.
+    * ``force_exit_at_dte_5_if_delta_below``: at DTE <= 5, force exit when
+      |delta| is below this threshold. OTM options near expiry are pure
+      theta-decay traps; expected EV is negative.
+    * ``switch_to_intrinsic_floor_at_dte``: at DTE <= this AND |delta|
+      >= the threshold above, raise the effective stop to
+      ``intrinsic - intrinsic_floor_buffer``. ITM/ATM options near expiry
+      retain real intrinsic value; we lock that in instead of force-exiting.
+    """
+
+    force_exit_at_dte: int = Field(ge=0, default=2)
+    force_exit_at_dte_5_if_delta_below: float = Field(ge=0.0, le=1.0, default=0.40)
+    switch_to_intrinsic_floor_at_dte: int = Field(ge=0, default=5)
+    intrinsic_floor_buffer: float = Field(ge=0.0, default=0.10)
+
+
+class RegimeRulesConfig(_Strict):
+    """Regime-driven kill switches."""
+
+    exit_on_labels: list[str] = Field(default_factory=lambda: ["CRISIS"])
+    downsize_50_on_labels: list[str] = Field(default_factory=list)
+
+
+class ExitPlan(_Strict):
+    """Full deterministic exit plan baked at entry time.
+
+    All price-denominated fields are in the position's quote unit (dollars
+    per share for stock, dollars per contract for option premiums).
+    """
+
+    version: int = 1
+    hard_stop: float = Field(gt=0)
+    hard_target: float = Field(gt=0)
+    scale_out_ladder: list[ScaleOutRung] = Field(default_factory=list)
+    trail_stop: TrailStopConfig | None = None
+    dte_rules: DteRulesConfig = Field(default_factory=DteRulesConfig)
+    regime_rules: RegimeRulesConfig = Field(default_factory=RegimeRulesConfig)
+    time_in_trade_max_days: int = Field(ge=1, default=30)
+
+
+# Minimum risk-reward floor for any opening trade. 1.5:1 means we must
+# stand to make 1.5x what we risk on every entry. 5/22 audit: previous
+# LLM-emitted trades had 0.6:1 (SPY 742C: stop -55%, target +33%); that's
+# negative-EV at any win rate < 62%, far below our actual ~55% baseline.
+MIN_RISK_REWARD = 1.5
+
+
+def default_exit_plan(
+    entry: float, stop: float, target: float, asset_type: str
+) -> ExitPlan:
+    """Generate a sensible default exit plan from (entry, stop, target).
+
+    Used when the trader synthesizer emits only the legacy stop/target
+    fields without a full ExitPlan. Designed so behaviour is reasonable
+    even without explicit caller-supplied rungs.
+    """
+    if asset_type == "OPT":
+        scale_at = entry + (target - entry) * 0.70
+        return ExitPlan(
+            hard_stop=stop,
+            hard_target=target,
+            scale_out_ladder=[
+                ScaleOutRung(
+                    at_mark=scale_at, exit_factor=0.5, then_engage_trail=True
+                ),
+            ],
+            trail_stop=TrailStopConfig(
+                engage_at_mark=scale_at,
+                distance_pct=0.15,
+                never_below="break_even",
+            ),
+            time_in_trade_max_days=30,
+        )
+    # STK
+    scale_at = entry + (target - entry) * 0.70
+    return ExitPlan(
+        hard_stop=stop,
+        hard_target=target,
+        scale_out_ladder=[],  # whole-share atomicity, no partials
+        trail_stop=TrailStopConfig(
+            engage_at_mark=scale_at,
+            distance_pct=0.10,
+            never_below="break_even",
+        ),
+        time_in_trade_max_days=60,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -150,6 +281,54 @@ class TraderProposal(_Strict):
     option_dte: int | None = None
     option_iv: float | None = None
     qty_request: int = Field(ge=0)
+    # Optional — synthesizer may emit a fully-specified plan; otherwise
+    # default_exit_plan() builds one from (entry, stop, target, asset_type)
+    # in persist_trade_event.
+    exit_plan: ExitPlan | None = None
+
+    @model_validator(mode="after")
+    def _validate_risk_reward(self) -> "TraderProposal":
+        """R7 — minimum risk:reward floor enforced at LLM-output time.
+
+        Forces synthesizer to either tighten stop or widen target so the
+        portfolio's per-trade EV is at least neutral at our baseline win
+        rate. SPY 742C-style 0.6:1 R:R proposals raise here and the LLM
+        either retries with better numbers or declines the trade.
+        """
+        risk = abs(self.entry_price - self.stop)
+        reward = abs(self.target - self.entry_price)
+        if risk < 0.01:
+            raise ValueError(
+                f"stop ({self.stop}) too close to entry ({self.entry_price}); "
+                f"risk=${risk:.4f}. Move stop further from entry."
+            )
+        if reward < 0.01:
+            raise ValueError(
+                f"target ({self.target}) too close to entry ({self.entry_price}); "
+                f"reward=${reward:.4f}. Move target further from entry."
+            )
+        rr = reward / risk
+        if rr < MIN_RISK_REWARD:
+            raise ValueError(
+                f"R:R {rr:.2f} below floor {MIN_RISK_REWARD} "
+                f"(risk=${risk:.2f}, reward=${reward:.2f}). "
+                f"Tighten stop OR widen target until reward/risk >= "
+                f"{MIN_RISK_REWARD}."
+            )
+        # If exit_plan is supplied, its hard_stop/hard_target should match
+        # the top-level stop/target. Catches divergence early.
+        if self.exit_plan is not None:
+            if abs(self.exit_plan.hard_stop - self.stop) > 0.01:
+                raise ValueError(
+                    f"exit_plan.hard_stop ({self.exit_plan.hard_stop}) "
+                    f"!= proposal.stop ({self.stop})"
+                )
+            if abs(self.exit_plan.hard_target - self.target) > 0.01:
+                raise ValueError(
+                    f"exit_plan.hard_target ({self.exit_plan.hard_target}) "
+                    f"!= proposal.target ({self.target})"
+                )
+        return self
 
 
 class TraderSynthesizerOutput(_Strict):

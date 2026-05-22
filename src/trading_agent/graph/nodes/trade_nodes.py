@@ -753,6 +753,44 @@ def persist_trade_event(state: TradingGraphState) -> dict:
     qty = float(order.get("qty") or risk.get("approved_qty") or 0)
     entry_price = float(fill.get("avg_fill_price") or order.get("limit_price") or 0)
 
+    # Build the deterministic exit plan that the intraday hard executor
+    # will consume every tick. If the synthesizer emitted a fully-specified
+    # plan, use it verbatim; otherwise generate a sensible default from
+    # (entry, stop, target, asset_type). The plan is stored as JSONB in
+    # journal_trades.exit_plan and read by hard_executor.hard_exit_decision.
+    exit_plan_json: str | None = None
+    try:
+        from trading_agent.llm.schemas import ExitPlan, default_exit_plan
+
+        prop_plan = proposal.get("exit_plan")
+        stop_v = proposal.get("stop")
+        target_v = proposal.get("target")
+        plan: ExitPlan | None = None
+        if isinstance(prop_plan, dict):
+            plan = ExitPlan.model_validate(prop_plan)
+        elif isinstance(prop_plan, ExitPlan):
+            plan = prop_plan
+        elif (
+            stop_v is not None
+            and target_v is not None
+            and entry_price > 0
+        ):
+            plan = default_exit_plan(
+                entry=float(entry_price),
+                stop=float(stop_v),
+                target=float(target_v),
+                asset_type=str(asset_type),
+            )
+        if plan is not None:
+            import json as _json2
+            exit_plan_json = _json2.dumps(plan.model_dump(), default=str)
+    except Exception as e:
+        # Never block trade recording on plan-construction failure — the
+        # hard executor falls back to journal_trades.stop / .target when
+        # exit_plan is NULL.
+        log.warning("[persist_trade_event] exit_plan build failed: %s", e)
+        exit_plan_json = None
+
     import json as _json
 
     try:
@@ -765,9 +803,9 @@ def persist_trade_event(state: TradingGraphState) -> dict:
                     (thesis_id, symbol, asset_type, side, qty, entry_price,
                      stop, target, outcome, broker_order_id, is_paper, opened_at,
                      proposal_id, risk_decision_id, params_version_id,
-                     entry_regime_state_id, broker_fill_json)
+                     entry_regime_state_id, broker_fill_json, exit_plan)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', %s, TRUE, NOW(),
-                        %s, %s, %s, %s, %s::jsonb)
+                        %s, %s, %s, %s, %s::jsonb, %s::jsonb)
                 RETURNING id
                 """,
                 (
@@ -790,6 +828,7 @@ def persist_trade_event(state: TradingGraphState) -> dict:
                         },
                         default=str,
                     ),
+                    exit_plan_json,
                 ),
             )
             trade_id = int(cur.fetchone()[0])

@@ -15,9 +15,7 @@ Pipeline (intraday_monitor_graph):
 """
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any
 
 from trading_agent.events import emit
 from trading_agent.graph.state import TradingGraphState
@@ -175,7 +173,9 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
             cur.execute(
                 """
                 SELECT t.symbol, t.id AS trade_id, t.thesis_id,
-                       t.stop, t.target,
+                       t.stop, t.target, t.exit_plan,
+                       t.mfe_so_far, t.opened_at,
+                       COALESCE(t.scale_rungs_taken, 0) AS scale_rungs_taken,
                        th.direction, th.thesis_text, th.invalidation
                 FROM journal_trades t
                 LEFT JOIN journal_theses th ON th.id = t.thesis_id
@@ -183,7 +183,9 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
                 """,
             )
             for row in cur.fetchall():
-                symbol, trade_id, thesis_id, stop, target, direction, thesis_text, invalidation = row
+                (symbol, trade_id, thesis_id, stop, target, exit_plan,
+                 mfe_so_far, opened_at, scale_rungs_taken,
+                 direction, thesis_text, invalidation) = row
                 if not symbol:
                     continue
                 out[str(symbol)] = {
@@ -191,6 +193,11 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
                     "thesis_id": int(thesis_id) if thesis_id is not None else None,
                     "stop": float(stop) if stop is not None else None,
                     "target": float(target) if target is not None else None,
+                    # exit_plan is JSONB; psycopg returns a dict directly.
+                    "exit_plan": exit_plan if isinstance(exit_plan, dict) else None,
+                    "mfe_so_far": float(mfe_so_far) if mfe_so_far is not None else None,
+                    "opened_at": opened_at,
+                    "scale_rungs_taken": int(scale_rungs_taken or 0),
                     "direction": direction,
                     "thesis_text": thesis_text,
                     "invalidation": invalidation,
@@ -200,90 +207,31 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
     return out
 
 
-def _thesis_summary_for(pos: dict) -> str:
-    """Format a thesis summary string for the exit-monitor LLM prompt.
-
-    Prefers fields already on ``pos`` (populated by
-    ``_load_journal_enrichment_by_symbol`` upstream). Falls back to a
-    direct ``journal_theses`` query if ``thesis_id`` is present but the
-    rich fields aren't — kept for backwards-compat with any future caller
-    that doesn't run the enrichment step.
-    """
-    # Preferred path: enrichment already attached the JOIN result.
-    if pos.get("thesis_text") or pos.get("direction"):
-        direction = pos.get("direction") or "?"
-        text = str(pos.get("thesis_text") or "")[:200]
-        inval = pos.get("invalidation") or "n/a"
-        return f"direction={direction} | thesis={text} | invalidation={inval}"
-
-    thesis_id = pos.get("thesis_id")
-    if not thesis_id:
-        return "(no thesis linked)"
-    try:
-        from trading_agent.store.postgres import cursor
-        with cursor() as cur:
-            cur.execute(
-                "SELECT direction, thesis_text, invalidation FROM journal_theses WHERE id = %s",
-                (int(thesis_id),),
-            )
-            row = cur.fetchone()
-        if row:
-            return f"direction={row[0]} | thesis={str(row[1])[:200]} | invalidation={row[2] or 'n/a'}"
-    except Exception as e:
-        log.warning("thesis_summary_for(%s): %s", thesis_id, e)
-    return "(thesis not found)"
-
-
-def _format_exit_prompt(pos: dict, regime: dict, prior_regime_label: str) -> str:
-    mark = float(pos.get("mark") or pos.get("entry_price") or 0)
-    entry = float(pos.get("entry_price") or 0)
-    stop = pos.get("stop")
-    target = pos.get("target")
-    dte = pos.get("dte")
-
-    prompt_parts = [
-        f"position:",
-        f"  symbol: {pos.get('symbol')}",
-        f"  underlying: {pos.get('underlying')}",
-        f"  asset_type: {pos.get('asset_type')}",
-        f"  side: {pos.get('side')}",
-        f"  qty: {pos.get('qty')}",
-        f"  entry_price: {entry}",
-        f"  mark: {mark}",
-        f"  stop: {stop}",
-        f"  target: {target}",
-        f"  age_minutes: {pos.get('age_minutes', 0)}",
-        f"  delta: {pos.get('delta')}",
-        f"  iv: {pos.get('iv')}",
-        f"  dte: {dte}",
-        f"  unrealized_pnl: {pos.get('unrealized_pnl', 0)}",
-        f"  thesis_summary: {_thesis_summary_for(pos)}",
-        f"",
-        f"current_quote:",
-        f"  last: {mark}",
-        f"",
-        f"regime_state:",
-        f"  label: {regime.get('label', 'VOLATILE_TRANSITION')}",
-        f"  confidence: {regime.get('confidence', 0):.2f}",
-        f"  gate: {json.dumps(regime.get('gate') or {})}",
-        f"",
-        f"prior_regime_label: {prior_regime_label}",
-        f"",
-        f"flagged_news_today: []",
-        f"",
-        f"Respond per your output schema.",
-    ]
-    return "\n".join(prompt_parts)
-
-
 def detect_exit_triggers(state: TradingGraphState) -> dict:
-    """Call the exit-monitor LLM for each open position.
+    """Deterministic exit-rule executor — no LLM in the hot path.
+
+    For each open position, loads the ExitPlan stored at entry time (or
+    falls back to journal_trades.stop / .target for legacy rows) and
+    consults trading_agent.exits.hard_executor.hard_exit_decision. The
+    decision is pure code:
+
+      P0 regime kill switch (CRISIS) → exit
+      P1 hard_stop                   → exit
+      P2 DTE rules (options)         → exit / upgrade-to-intrinsic-floor
+      P3 hard_target + scale-out     → full / partial exit
+      P4 trailing stop (post-engage) → exit
+      P5 max age                     → exit
+
+    See docs/position_management.md for the full rule table + thresholds.
 
     Writes decisions into state["journal"]["exit_decisions"] as a list of
     dicts: {symbol, action, exit_qty_factor, reason}.
 
-    Best-effort per position: a failed LLM call defaults to HOLD so the
-    position isn't silently abandoned.
+    History: this node previously called the exit_monitor LLM (Haiku) per
+    position. We replaced it on 2026-05-22 after audit of a SPY 742C trade
+    that had R:R 0.6:1 and an LLM-set stop only 55% below entry — the
+    LLM was making subjective calls without a deterministic safety net.
+    Hard rules + R7 R:R floor at entry close that gap.
     """
     run_id = state["run_id"]
     trigger = state["trigger"]
@@ -294,14 +242,11 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
         return {}
 
     regime = state.get("regime") or {}
-    # Simple approximation for prior label: not in state yet, use same label
-    prior_regime_label = regime.get("label", "VOLATILE_TRANSITION")
+    regime_label = str(regime.get("label") or "")
 
-    # Enrich each broker position with its journal_trades + journal_theses row
-    # (thesis_id, thesis_text, direction, invalidation, stop, target). Without
-    # this, _thesis_summary_for sees pos.thesis_id=None and the LLM concludes
-    # "no thesis = unvetted exposure → EXIT_CAUTIOUS" — closing the same
-    # position we just opened. Empty map ⇒ legacy per-position fallback.
+    # Enrich each broker position with its journal_trades + journal_theses row.
+    # The hard executor needs: stop, target, exit_plan (JSONB), mfe_so_far,
+    # opened_at. Without enrichment we'd HOLD everything (no plan = safe path).
     enrichment_by_symbol = _load_journal_enrichment_by_symbol()
     enriched_count = 0
     if enrichment_by_symbol:
@@ -310,12 +255,6 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
             enrichment = enrichment_by_symbol.get(symbol)
             if not enrichment:
                 continue
-            # Don't clobber broker-provided fields (qty, mark, etc.) — only
-            # fill in keys that aren't already populated. The enrichment
-            # keys (trade_id, thesis_id, stop, target, direction, thesis_text,
-            # invalidation) don't overlap with broker fields today; the
-            # ``k not in pos`` guard makes that invariant explicit so a
-            # future field-name collision fails-safe (broker wins).
             for k, v in enrichment.items():
                 if v is not None and k not in pos:
                     pos[k] = v
@@ -325,68 +264,104 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
         enriched_count, len(positions),
     )
 
+    # Underlying spot prices for option intrinsic-floor checks. Best effort:
+    # if moomoo is down we still run with intrinsic=None and the executor
+    # will skip the intrinsic-floor branch (it'll just not upgrade the stop).
+    underlying_marks: dict[str, float] = {}
+    underlying_syms = {
+        _bare_ticker(p.get("symbol") or "")
+        for p in positions
+        if (p.get("asset_type") == "OPT" or _is_option_code(p.get("symbol") or ""))
+    }
+    underlying_syms.discard("")
+    if underlying_syms:
+        try:
+            from trading_agent.mcp_servers.moomoo.server import get_quote
+            q = get_quote([f"US.{t}" for t in underlying_syms])
+            for r in (q.get("rows") or []):
+                code = r.get("code") or ""
+                bare = _bare_ticker(code)
+                last = r.get("last_price") or r.get("cur_price")
+                if bare and last:
+                    underlying_marks[bare] = float(last)
+        except Exception as e:
+            log.warning("[detect_exit_triggers] underlying quote fetch failed: %s", e)
+
     try:
-        from trading_agent.llm import get_router
-        from trading_agent.llm.schemas import ExitMonitorOutput
-        router = get_router()
+        from datetime import datetime, timezone
+        from trading_agent.exits import hard_exit_decision
+        from trading_agent.exits.hard_executor import load_exit_plan
     except Exception as e:
-        log.error("[detect_exit_triggers] LLM router unavailable: %s", e)
+        log.error("[detect_exit_triggers] hard_executor import failed: %s", e)
         return {}
 
+    now_utc = datetime.now(timezone.utc)
     decisions: list[dict] = []
     hold_count = 0
     exit_count = 0
+    no_plan_count = 0
 
     for pos in positions:
         symbol = pos.get("symbol") or ""
         if not symbol:
             continue
-        prompt = _format_exit_prompt(pos, regime, prior_regime_label)
-        try:
-            res = router.call("exit_monitor", prompt, schema=ExitMonitorOutput, timeout_s=60)
-            parsed: ExitMonitorOutput | None = (
-                res.parsed if isinstance(res.parsed, ExitMonitorOutput) else None
-            )
-            if parsed is None:
-                action = "HOLD"
-                reason = "no_parsed_output"
-                qty_factor = 0.0
-            else:
-                action = parsed.action
-                reason = parsed.reason
-                qty_factor = parsed.exit_qty_factor
-        except Exception as e:
-            log.warning("[detect_exit_triggers] symbol=%s LLM failed: %s — defaulting HOLD", symbol, e)
-            action = "HOLD"
-            reason = f"llm_error: {e}"
-            qty_factor = 0.0
-            # Tracking event for escalation. One failure is fine (default HOLD
-            # is safe), but a *streak* of failures means every position is
-            # frozen at HOLD with no LLM oversight — stops won't fire, regime
-            # changes will be ignored. Audit row enables a window query below.
+        plan = load_exit_plan(
+            raw=pos.get("exit_plan"),
+            fallback_stop=pos.get("stop"),
+            fallback_target=pos.get("target"),
+        )
+        if plan is None:
+            # No plan, no stop, no target — we cannot evaluate. Default HOLD,
+            # but emit a sev-1 event because this position is unmonitored.
+            no_plan_count += 1
+            decisions.append({
+                "symbol": symbol,
+                "action": "HOLD",
+                "exit_qty_factor": 0.0,
+                "reason": "no_exit_plan_and_no_legacy_stop_target",
+            })
             emit(
                 run_id=run_id, trigger=trigger, agent="detect_exit_triggers",
-                event_type="exit_monitor_llm_failed",
+                event_type="position_no_exit_plan",
                 severity=1,
-                payload={"symbol": symbol, "error": str(e)[:300]},
+                payload={"symbol": symbol},
             )
+            hold_count += 1
+            continue
+
+        underlying = _bare_ticker(symbol)
+        decision = hard_exit_decision(
+            pos=pos,
+            plan=plan,
+            regime_label=regime_label,
+            now_utc=now_utc,
+            mfe_so_far=pos.get("mfe_so_far"),
+            underlying_mark=underlying_marks.get(underlying),
+            scale_rungs_taken=int(pos.get("scale_rungs_taken") or 0),
+        )
+
+        if decision is None:
+            action = "HOLD"
+            qty_factor = 0.0
+            reason = "no_rule_triggered"
+        else:
+            action = decision.action
+            qty_factor = decision.exit_qty_factor
+            reason = decision.reason
 
         # Sanity guard: a partial-exit signal on a 1-contract option position
         # is physically impossible (options don't fractionate). The downstream
         # route_exit_or_hold would `max(1, round(1 * 0.5)) = 1` and force a
-        # FULL close, contradicting the LLM's "let some run" signal. Demote
-        # the action to HOLD so the LLM's intent is preserved. (5/12 NVDA
-        # EXIT_CAUTIOUS @ factor 0.5 actually closed 100% — that's the bug.)
+        # FULL close, contradicting the partial signal. Demote to HOLD so
+        # the next tick re-evaluates (likely hits target if mark stays up).
         full_qty = float(pos.get("qty") or 0)
         if action != "HOLD" and 0.0 < qty_factor < 1.0 and full_qty <= 1:
-            original_action = action
             log.info(
-                "[detect_exit_triggers] %s demoting %s (factor=%.2f, qty=%.0f) → HOLD: "
-                "partial exit physically impossible on 1-contract position",
-                symbol, original_action, qty_factor, full_qty,
+                "[detect_exit_triggers] %s demoting %s (factor=%.2f, qty=%.0f) → HOLD",
+                symbol, action, qty_factor, full_qty,
             )
             reason = (
-                f"demoted_from_{original_action}_partial_impossible_on_qty_{int(full_qty)}: "
+                f"demoted_from_{action}_partial_impossible_on_qty_{int(full_qty)}: "
                 f"{reason[:120]}"
             )
             action = "HOLD"
@@ -407,98 +382,16 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
     emit(
         run_id=run_id, trigger=trigger, agent="detect_exit_triggers",
         event_type="exit_decisions",
-        payload={"hold": hold_count, "exit": exit_count, "decisions": decisions},
+        payload={
+            "hold": hold_count, "exit": exit_count,
+            "no_plan": no_plan_count,
+            "decisions": decisions,
+        },
     )
-
-    # Escalation: if exit_monitor has failed N+ times in the last hour, the
-    # LLM channel is effectively dead — positions are silently HOLDing, no
-    # one is monitoring stops or regime changes. Fire a high-priority alert.
-    _maybe_escalate_exit_monitor_failures(run_id, trigger)
 
     journal_payload = dict(state.get("journal") or {})
     journal_payload["exit_decisions"] = decisions
     return {"journal": journal_payload}
-
-
-# ---------------------------------------------------------------------------
-# Escalation helper — bridge between event-level failures and ops alerts.
-# ---------------------------------------------------------------------------
-
-# A streak of LLM failures means every open position is frozen at HOLD without
-# real oversight. Threshold is intentionally tight — 3 failures in 60 min
-# matches the systemd 5-min intraday cadence: 12 ticks per hour, so 3 failures
-# is a ~25% failure rate that almost certainly means the channel is down, not
-# a transient rate-limit blip.
-_EXIT_LLM_FAIL_THRESHOLD = 3
-_EXIT_LLM_FAIL_WINDOW_MIN = 60
-# Don't spam — one alert per cooldown window even if failures keep accumulating.
-_EXIT_LLM_FAIL_ALERT_COOLDOWN_MIN = 60
-
-
-def _maybe_escalate_exit_monitor_failures(run_id: str, trigger: str) -> None:
-    """Count recent exit_monitor LLM failures; alert ops if past threshold.
-
-    Best-effort: any DB or ntfy error is swallowed so a flaky audit DB
-    can't bring down the main intraday loop.
-    """
-    try:
-        from trading_agent.store.postgres import cursor
-        with cursor() as cur:
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM agent_events
-                WHERE event_type = 'exit_monitor_llm_failed'
-                  AND ts > NOW() - (%s::text || ' minutes')::interval
-                """,
-                (str(_EXIT_LLM_FAIL_WINDOW_MIN),),
-            )
-            fail_count = int(cur.fetchone()[0] or 0)
-            if fail_count < _EXIT_LLM_FAIL_THRESHOLD:
-                return
-            # Cooldown — did we already alert in the past cooldown window?
-            cur.execute(
-                """
-                SELECT 1 FROM agent_events
-                WHERE event_type = 'exit_monitor_persistent_failure'
-                  AND ts > NOW() - (%s::text || ' minutes')::interval
-                LIMIT 1
-                """,
-                (str(_EXIT_LLM_FAIL_ALERT_COOLDOWN_MIN),),
-            )
-            if cur.fetchone() is not None:
-                return  # already alerted recently, suppress
-    except Exception as e:
-        log.warning("[detect_exit_triggers] escalation count query failed: %s", e)
-        return
-
-    emit(
-        run_id=run_id, trigger=trigger, agent="detect_exit_triggers",
-        event_type="exit_monitor_persistent_failure",
-        severity=2,
-        payload={
-            "fail_count": fail_count,
-            "window_minutes": _EXIT_LLM_FAIL_WINDOW_MIN,
-            "threshold": _EXIT_LLM_FAIL_THRESHOLD,
-        },
-    )
-    try:
-        from trading_agent.notify import send as ntfy_send
-        ntfy_send(
-            topic="ops",
-            title="exit_monitor LLM DOWN",
-            body=(
-                f"{fail_count} exit_monitor LLM failures in the last "
-                f"{_EXIT_LLM_FAIL_WINDOW_MIN} min (threshold={_EXIT_LLM_FAIL_THRESHOLD}).\n"
-                f"All open positions are HOLDing with no LLM oversight. "
-                f"Stops still fire via deterministic check, but regime/thesis "
-                f"changes are not being evaluated. Check claude_code / codex / "
-                f"deepseek channels."
-            ),
-            priority=5,
-            tags=["rotating_light", "warning"],
-        )
-    except Exception as e:
-        log.warning("[detect_exit_triggers] escalation ntfy failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -709,51 +602,91 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             failed_symbols.append(symbol)
             continue
 
-        # Order placed — close journal entry on whichever source the trade lives in.
-        entry_price_j = float(pos.get("entry_price") or 0)
-        mult_j = 100 if asset_type == "OPT" else 1
-        pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
-        outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
+        # ------------------------------------------------------------------
+        # Partial vs full close routing.
+        #
+        # A scale-out rung returns action=EXIT_TARGET with 0 < factor < 1.
+        # That's a PARTIAL close — the broker order trimmed the position
+        # but the journal_trades row must stay outcome='OPEN' so the
+        # residual quantity keeps being monitored. We only need to bump
+        # scale_rungs_taken so the same rung doesn't fire next tick.
+        #
+        # Full closes (factor=1.0 OR any non-EXIT_TARGET action) flow
+        # through close_trade + close_thesis as before.
+        # ------------------------------------------------------------------
+        is_partial = (action == "EXIT_TARGET" and 0.0 < qty_factor < 1.0)
 
         closed_ok = False
-        if trade_id_source == "sqlite" and journal_close_trade is not None:
-            try:
-                journal_close_trade(
-                    trade_id=trade_id,
-                    exit_price=exit_price,
-                    outcome=outcome_j,
-                    pnl=pnl_j,
-                )
-                closed_ok = True
-            except Exception as e:
-                log.warning("[route_exit_or_hold] sqlite close_trade %s failed: %s", symbol, e)
-        if not closed_ok:
-            # Either source was postgres, or sqlite path raised — write directly to Postgres.
+        if is_partial:
             try:
                 from trading_agent.store.postgres import cursor
                 with cursor() as cur:
                     cur.execute(
                         """
                         UPDATE journal_trades
-                        SET exit_price = %s,
-                            outcome = %s,
-                            closed_at = COALESCE(closed_at, NOW()),
-                            close_reason = COALESCE(close_reason, %s)
+                        SET scale_rungs_taken = COALESCE(scale_rungs_taken, 0) + 1
                         WHERE id = %s AND outcome = 'OPEN'
                         """,
-                        (exit_price, outcome_j, action, trade_id),
+                        (trade_id,),
                     )
                 closed_ok = True
-                log.info("[route_exit_or_hold] %s journal closed via postgres trade_id=%s", symbol, trade_id)
+                log.info(
+                    "[route_exit_or_hold] %s partial close (factor=%.2f) — "
+                    "rung incremented; trade %s stays OPEN",
+                    symbol, qty_factor, trade_id,
+                )
             except Exception as e:
-                log.warning("[route_exit_or_hold] postgres close %s failed: %s", symbol, e)
+                log.warning(
+                    "[route_exit_or_hold] partial-close rung increment "
+                    "%s failed: %s", symbol, e,
+                )
+                # Treat as best-effort — broker already trimmed the position.
+                # Don't fail the whole loop; the next tick re-evaluates.
+                closed_ok = True
+        else:
+            # Full close — journal close (trade row + thesis row).
+            entry_price_j = float(pos.get("entry_price") or 0)
+            mult_j = 100 if asset_type == "OPT" else 1
+            pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
+            outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
 
-        # Once the trade row is closed, also flip the parent thesis to
-        # status='triggered' so the pretool freshness gate stops treating it
-        # as a live thesis and /eod-review stops flagging it as a zombie.
-        # Without this, theses pile up status='open' forever (the May 2026
-        # AAPL/XLE/GLD/AMZN cleanup is the canonical example).
-        if closed_ok and thesis_id is not None:
+            if trade_id_source == "sqlite" and journal_close_trade is not None:
+                try:
+                    journal_close_trade(
+                        trade_id=trade_id,
+                        exit_price=exit_price,
+                        outcome=outcome_j,
+                        pnl=pnl_j,
+                    )
+                    closed_ok = True
+                except Exception as e:
+                    log.warning("[route_exit_or_hold] sqlite close_trade %s failed: %s", symbol, e)
+            if not closed_ok:
+                # Either source was postgres, or sqlite path raised — write directly to Postgres.
+                try:
+                    from trading_agent.store.postgres import cursor
+                    with cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE journal_trades
+                            SET exit_price = %s,
+                                outcome = %s,
+                                closed_at = COALESCE(closed_at, NOW()),
+                                close_reason = COALESCE(close_reason, %s)
+                            WHERE id = %s AND outcome = 'OPEN'
+                            """,
+                            (exit_price, outcome_j, action, trade_id),
+                        )
+                    closed_ok = True
+                    log.info("[route_exit_or_hold] %s journal closed via postgres trade_id=%s", symbol, trade_id)
+                except Exception as e:
+                    log.warning("[route_exit_or_hold] postgres close %s failed: %s", symbol, e)
+
+        # Thesis flip (only on full closes — partial closes leave it open
+        # so subsequent rungs can still close out cleanly). Without this,
+        # theses pile up status='open' forever (the May 2026 AAPL/XLE/
+        # GLD/AMZN cleanup is the canonical example).
+        if closed_ok and not is_partial and thesis_id is not None:
             thesis_note = f"trade {trade_id} closed via {action} ({reason})"[:280]
             thesis_closed = False
             # Route the thesis close to the SAME store as the trade close —

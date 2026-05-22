@@ -191,6 +191,30 @@ if [ -n "$HAS_DEPS" ]; then
     "$UV_BIN" sync --extra dev --quiet 2>&1 | tail -10
 fi
 
+# Apply migrations BEFORE restarting any service. New code may insert into
+# columns added by a pending migration; if we restart first, the next
+# trade INSERT can crash against a column-not-found error in the window
+# between restart and migration apply. Migrations are idempotent
+# (schema_migrations gate) so applying first costs nothing.
+if [ -n "$HAS_MIGRATIONS" ]; then
+    echo "$LOG_TAG applying pending migrations"
+    # POSTGRES_DSN comes from the EnvironmentFile (.env.postgres).
+    for sql in $(ls migrations/*.sql | sort); do
+        ver=$(basename "$sql" .sql | grep -oE '^[0-9]+' || echo "")
+        if [ -z "$ver" ]; then
+            continue
+        fi
+        # Match either '010' or '010_watchlist_members' style — early
+        # migrations used the long form, later ones use just the number.
+        applied=$(psql "$POSTGRES_DSN" -tAc \
+            "SELECT 1 FROM schema_migrations WHERE version = '$ver' OR version LIKE '${ver}_%' LIMIT 1" 2>&1)
+        if [ -z "$applied" ]; then
+            echo "$LOG_TAG  applying $(basename "$sql")"
+            psql "$POSTGRES_DSN" -q -f "$sql" 2>&1 | tail -5
+        fi
+    done
+fi
+
 if [ -n "$HAS_SYSTEMD" ]; then
     echo "$LOG_TAG systemctl daemon-reload (units are symlinks; content is already current)"
     sudo /bin/systemctl daemon-reload
@@ -213,25 +237,6 @@ if [ -n "$HAS_SUDOERS" ]; then
     # new sudo rights for safety. Alert the operator.
     echo "$LOG_TAG SUDOERS CHANGED — manual install required: deploy/ec2/sudoers/"
     _notify_ops "auto-deploy: sudoers file changed in ${REMOTE:0:7} — install manually: sudo install -m 440 -o root -g root deploy/ec2/sudoers/* /etc/sudoers.d/" 4
-fi
-
-if [ -n "$HAS_MIGRATIONS" ]; then
-    echo "$LOG_TAG applying pending migrations"
-    # POSTGRES_DSN comes from the EnvironmentFile (.env.postgres).
-    for sql in $(ls migrations/*.sql | sort); do
-        ver=$(basename "$sql" .sql | grep -oE '^[0-9]+' || echo "")
-        if [ -z "$ver" ]; then
-            continue
-        fi
-        # Match either '010' or '010_watchlist_members' style — early
-        # migrations used the long form, later ones use just the number.
-        applied=$(psql "$POSTGRES_DSN" -tAc \
-            "SELECT 1 FROM schema_migrations WHERE version = '$ver' OR version LIKE '${ver}_%' LIMIT 1" 2>&1)
-        if [ -z "$applied" ]; then
-            echo "$LOG_TAG  applying $(basename "$sql")"
-            psql "$POSTGRES_DSN" -q -f "$sql" 2>&1 | tail -5
-        fi
-    done
 fi
 
 # ---- ntfy success notification ------------------------------------------

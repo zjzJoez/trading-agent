@@ -319,365 +319,280 @@ class TestRefreshQuotesAndGreeks:
 
 
 class TestDetectExitTriggers:
+    """Detect-exit-triggers now drives the deterministic hard executor.
+
+    Per-rule branch coverage of hard_exit_decision lives in
+    tests/exits/test_hard_executor.py — these tests check the *integration*:
+    state → enrichment → executor call → demotion guard → emit.
+    """
+
     def _make_pos(self):
+        # ITM call with plenty of DTE so the hard executor won't fire DTE
+        # rules; the test controls entry/mark/stop/target via enrichment.
         return {
-            "symbol": "US.SPY260117C00700000",
+            "symbol": "US.SPY260817C00700000",
             "asset_type": "OPT", "qty": 2,
             "entry_price": 3.0, "mark": 1.5,
-            "stop": 1.0, "target": 6.0, "age_minutes": 120,
         }
 
-    def test_hold_decision(self):
-        from trading_agent.llm.schemas import ExitMonitorOutput
+    def _enrichment(self, stop=1.0, target=6.0, exit_plan=None, mfe_so_far=None):
+        return {
+            "US.SPY260817C00700000": {
+                "trade_id": 3, "thesis_id": 4,
+                "stop": stop, "target": target,
+                "exit_plan": exit_plan, "mfe_so_far": mfe_so_far,
+                "opened_at": None,
+                "direction": "LONG_CALL", "thesis_text": "t", "invalidation": "i",
+            }
+        }
+
+    def test_hold_when_mark_between_stop_and_target(self):
+        # mark=1.5 between stop=1.0 and target=6.0 → no rule triggers → HOLD
         state = _base_state(
             trigger="intraday_monitor",
             positions=[self._make_pos()],
-            regime={"label": "BULL_TREND", "confidence": 0.9, "gate": {}},
+            regime={"label": "RANGE_LOW_VOL", "confidence": 0.9, "gate": {}},
         )
-        mock_res = MagicMock()
-        mock_res.parsed = ExitMonitorOutput(action="HOLD", exit_qty_factor=0.0, reason="thesis intact")
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": []}):
-                with patch("trading_agent.llm.get_router") as mock_router:
-                    mock_router.return_value.call.return_value = mock_res
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value=self._enrichment(),
+            ):
+                with patch(
+                    "trading_agent.mcp_servers.moomoo.server.get_quote",
+                    return_value={"rows": []},
+                ):
                     from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
                     result = detect_exit_triggers(state)
         decisions = result["journal"]["exit_decisions"]
         assert len(decisions) == 1
         assert decisions[0]["action"] == "HOLD"
 
-    def test_exit_stop_decision(self):
-        from trading_agent.llm.schemas import ExitMonitorOutput
+    def test_exit_stop_when_mark_breaches_stop(self):
+        pos = self._make_pos()
+        pos["mark"] = 0.95  # below stop=1.0
         state = _base_state(
             trigger="intraday_monitor",
-            positions=[self._make_pos()],
-            regime={"label": "BEAR_TREND", "confidence": 0.8, "gate": {}},
+            positions=[pos],
+            regime={"label": "RANGE_LOW_VOL", "confidence": 0.8, "gate": {}},
         )
-        mock_res = MagicMock()
-        mock_res.parsed = ExitMonitorOutput(action="EXIT_STOP", exit_qty_factor=1.0, reason="stop hit")
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": []}):
-                with patch("trading_agent.llm.get_router") as mock_router:
-                    mock_router.return_value.call.return_value = mock_res
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value=self._enrichment(),
+            ):
+                with patch(
+                    "trading_agent.mcp_servers.moomoo.server.get_quote",
+                    return_value={"rows": []},
+                ):
                     from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
                     result = detect_exit_triggers(state)
         decisions = result["journal"]["exit_decisions"]
         assert decisions[0]["action"] == "EXIT_STOP"
+        assert decisions[0]["exit_qty_factor"] == 1.0
 
-    def test_llm_failure_defaults_to_hold(self):
+    def test_exit_regime_when_crisis(self):
+        # mark mid-range, but regime=CRISIS → executor fires P0
         state = _base_state(
             trigger="intraday_monitor",
             positions=[self._make_pos()],
-            regime={"label": "BULL_TREND", "confidence": 0.9, "gate": {}},
+            regime={"label": "CRISIS", "confidence": 0.9, "gate": {}},
         )
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": []}):
-                with patch("trading_agent.llm.get_router") as mock_router:
-                    mock_router.return_value.call.side_effect = RuntimeError("LLM timeout")
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value=self._enrichment(),
+            ):
+                with patch(
+                    "trading_agent.mcp_servers.moomoo.server.get_quote",
+                    return_value={"rows": []},
+                ):
+                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
+                    result = detect_exit_triggers(state)
+        assert result["journal"]["exit_decisions"][0]["action"] == "EXIT_REGIME"
+
+    def test_no_plan_holds_and_warns(self):
+        """Position with no exit_plan AND no legacy stop/target → HOLD,
+        plus a sev-1 event so ops can clean it up (likely a manual fill
+        or a phantom row)."""
+        pos = self._make_pos()
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=[pos],
+            regime={"label": "RANGE_LOW_VOL", "confidence": 0.9, "gate": {}},
+        )
+        captured: list[dict] = []
+        # Don't patch the local emit so we can see what was emitted from
+        # within detect_exit_triggers specifically.
+        with patch(
+            "trading_agent.graph.nodes.intraday_nodes.emit",
+            side_effect=lambda **kw: captured.append(kw),
+        ):
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value={  # missing stop+target+exit_plan
+                    "US.SPY260817C00700000": {
+                        "trade_id": 3, "thesis_id": 4,
+                        "stop": None, "target": None, "exit_plan": None,
+                    }
+                },
+            ):
+                with patch(
+                    "trading_agent.mcp_servers.moomoo.server.get_quote",
+                    return_value={"rows": []},
+                ):
                     from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
                     result = detect_exit_triggers(state)
         decisions = result["journal"]["exit_decisions"]
         assert decisions[0]["action"] == "HOLD"
+        assert decisions[0]["reason"] == "no_exit_plan_and_no_legacy_stop_target"
+        no_plan_events = [e for e in captured if e.get("event_type") == "position_no_exit_plan"]
+        assert len(no_plan_events) == 1
+        assert no_plan_events[0]["severity"] == 1
 
-    def test_enrichment_injects_thesis_into_prompt(self):
-        """Regression test for the 5/12 NVDA SCRATCH self-exit.
+    def test_partial_exit_on_qty_1_demoted_to_hold(self):
+        """Regression: 5/12 NVDA EXIT_CAUTIOUS-but-actually-closed-100%
+        bug. The hard executor's scale-out rung could emit factor=0.5
+        on a 1-contract position; downstream route_exit_or_hold would
+        ``max(1, round(0.5))`` and force a full close. Demote to HOLD."""
+        from trading_agent.llm.schemas import ExitPlan, ScaleOutRung
 
-        Without enrichment, ``state["positions"]`` from the broker has no
-        ``thesis_id`` field, ``_thesis_summary_for`` returns
-        ``"(no thesis linked)"`` and the exit_monitor LLM closes the
-        freshly-opened position citing "unvetted exposure".
-
-        Verify the enrichment helper merges thesis fields into the broker
-        pos and the formatted prompt now shows a real thesis summary.
-        """
-        from trading_agent.graph.nodes.intraday_nodes import (
-            _format_exit_prompt,
-            _thesis_summary_for,
+        # qty=1, mark=12 (between stop=7 and full target=18); scale rung
+        # at 12 with factor=0.5 → executor returns EXIT_TARGET factor 0.5
+        pos = {
+            "symbol": "US.NVDA260817C220000",
+            "asset_type": "OPT", "qty": 1,  # ← single contract
+            "entry_price": 10.0, "mark": 12.0,
+        }
+        plan = ExitPlan(
+            hard_stop=7.0, hard_target=18.0,
+            scale_out_ladder=[ScaleOutRung(at_mark=12.0, exit_factor=0.5)],
         )
-
-        broker_pos = self._make_pos()  # no thesis_id from broker
-        # Simulate what _load_journal_enrichment_by_symbol would attach.
-        broker_pos.update({
-            "trade_id": 3,
-            "thesis_id": 4,
-            "direction": "LONG_CALL",
-            "thesis_text": "post_consolidation_breakout_continuation",
-            "invalidation": "close below 215 EOD",
-        })
-
-        summary = _thesis_summary_for(broker_pos)
-        assert "(no thesis linked)" not in summary
-        assert "(thesis not found)" not in summary
-        assert "LONG_CALL" in summary
-        assert "post_consolidation_breakout_continuation" in summary
-
-        prompt = _format_exit_prompt(broker_pos, {"label": "BULL_TREND"}, "BULL_TREND")
-        assert "(no thesis linked)" not in prompt
-        assert "post_consolidation_breakout_continuation" in prompt
-
-    def test_enrichment_merges_via_detect_exit_triggers(self):
-        """End-to-end: enrichment runs inside detect_exit_triggers so the
-        prompt the LLM sees has real thesis text — caught the actual bug.
-        """
-        from trading_agent.llm.schemas import ExitMonitorOutput
-
-        broker_pos = self._make_pos()
-        broker_pos["symbol"] = "US.NVDA260605C220000"
-
-        captured_prompts: list[str] = []
-
-        def _capture(role, prompt, **_kwargs):
-            captured_prompts.append(prompt)
-            m = MagicMock()
-            m.parsed = ExitMonitorOutput(action="HOLD", exit_qty_factor=0.0, reason="thesis intact")
-            return m
-
-        state = _base_state(
-            trigger="intraday_monitor",
-            positions=[broker_pos],
-            regime={"label": "BULL_TREND", "confidence": 0.9, "gate": {}},
-        )
-
         enrichment = {
-            "US.NVDA260605C220000": {
-                "trade_id": 3,
-                "thesis_id": 4,
-                "stop": 7.0,
-                "target": 18.0,
-                "direction": "LONG_CALL",
-                "thesis_text": "post_consolidation_breakout_continuation",
-                "invalidation": "close below 215 EOD",
+            "US.NVDA260817C220000": {
+                "trade_id": 5, "thesis_id": 6,
+                "stop": 7.0, "target": 18.0,
+                "exit_plan": plan.model_dump(),
+                "mfe_so_far": None, "opened_at": None,
             }
         }
-
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=[pos],
+            regime={"label": "RANGE_LOW_VOL", "confidence": 0.7, "gate": {}},
+        )
         with _patch_all_emits():
             with patch(
                 "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
                 return_value=enrichment,
             ):
-                with patch("trading_agent.llm.get_router") as mock_router:
-                    mock_router.return_value.call.side_effect = _capture
-                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
-                    detect_exit_triggers(state)
-
-        assert len(captured_prompts) == 1, "exit_monitor should see exactly one prompt"
-        prompt = captured_prompts[0]
-        assert "(no thesis linked)" not in prompt, (
-            "regression: enrichment didn't reach the LLM prompt — NVDA self-exit bug returns"
-        )
-        assert "LONG_CALL" in prompt
-        assert "post_consolidation_breakout_continuation" in prompt
-
-    def test_partial_exit_on_qty_1_demoted_to_hold(self):
-        """Regression for the 5/12 NVDA EXIT_CAUTIOUS-but-actually-closed-100% bug.
-
-        LLM returns EXIT_CAUTIOUS with exit_qty_factor=0.5 on a 1-contract
-        position. The downstream route_exit_or_hold would `max(1, round(0.5))`
-        and force a FULL close. Detect demotes to HOLD so the LLM's
-        "let some run" intent is preserved.
-        """
-        from trading_agent.llm.schemas import ExitMonitorOutput
-
-        pos = {
-            "symbol": "US.NVDA260605C220000",
-            "asset_type": "OPT", "qty": 1,  # ← single contract, partial impossible
-            "entry_price": 10.0, "mark": 9.8,
-            "stop": 7.0, "target": 18.0, "age_minutes": 120,
-        }
-        mock_res = MagicMock()
-        mock_res.parsed = ExitMonitorOutput(
-            action="EXIT_CAUTIOUS", exit_qty_factor=0.5,
-            reason="thesis weakening but not yet invalidated",
-        )
-        state = _base_state(
-            trigger="intraday_monitor",
-            positions=[pos],
-            regime={"label": "BULL_TREND", "confidence": 0.7, "gate": {}},
-        )
-        with _patch_all_emits():
-            with patch(
-                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
-                return_value={},
-            ):
-                with patch("trading_agent.llm.get_router") as mock_router:
-                    mock_router.return_value.call.return_value = mock_res
+                with patch(
+                    "trading_agent.mcp_servers.moomoo.server.get_quote",
+                    return_value={"rows": []},
+                ):
                     from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
                     result = detect_exit_triggers(state)
-        decisions = result["journal"]["exit_decisions"]
-        assert len(decisions) == 1
-        dec = decisions[0]
+        dec = result["journal"]["exit_decisions"][0]
         assert dec["action"] == "HOLD", (
-            "regression: partial exit on qty=1 should demote to HOLD, not force full close"
+            "regression: partial-exit signal on qty=1 should demote to HOLD"
         )
         assert dec["exit_qty_factor"] == 0.0
-        assert "demoted_from_EXIT_CAUTIOUS" in dec["reason"]
-
-    def test_full_exit_on_qty_1_still_executes(self):
-        """Counter-check: action != EXIT_CAUTIOUS-style partial, factor=1.0 → not demoted."""
-        from trading_agent.llm.schemas import ExitMonitorOutput
-
-        pos = {
-            "symbol": "US.NVDA260605C220000",
-            "asset_type": "OPT", "qty": 1,
-            "entry_price": 10.0, "mark": 6.0,
-            "stop": 7.0, "target": 18.0, "age_minutes": 120,
-        }
-        mock_res = MagicMock()
-        mock_res.parsed = ExitMonitorOutput(
-            action="EXIT_STOP", exit_qty_factor=1.0, reason="stop hit",
-        )
-        state = _base_state(
-            trigger="intraday_monitor",
-            positions=[pos],
-            regime={"label": "BULL_TREND", "confidence": 0.7, "gate": {}},
-        )
-        with _patch_all_emits():
-            with patch(
-                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
-                return_value={},
-            ):
-                with patch("trading_agent.llm.get_router") as mock_router:
-                    mock_router.return_value.call.return_value = mock_res
-                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
-                    result = detect_exit_triggers(state)
-        dec = result["journal"]["exit_decisions"][0]
-        # Full exit (factor=1.0) is fine on qty=1 — 1×1=1 contract → real close.
-        assert dec["action"] == "EXIT_STOP"
-        assert dec["exit_qty_factor"] == 1.0
-
-    def test_escalation_fires_when_threshold_hit(self):
-        """5+ exit_monitor LLM failures in the last hour → ops alert.
-
-        Direct unit test of `_maybe_escalate_exit_monitor_failures` since
-        wiring it through detect_exit_triggers needs a real failure path —
-        but the contract we care about is: fail_count >= threshold AND no
-        recent suppression → emit severity-2 + ntfy.
-        """
-        fake_cur = MagicMock()
-        # First call: COUNT(*) → 5 failures (≥ threshold of 3)
-        # Second call: cooldown check → None (no recent alert)
-        fake_cur.fetchone.side_effect = [(5,), None]
-        fake_ctx = MagicMock()
-        fake_ctx.__enter__.return_value = fake_cur
-        fake_ctx.__exit__.return_value = False
-
-        emitted: list[dict] = []
-
-        def _capture_emit(**kwargs):
-            emitted.append(kwargs)
-
-        ntfy_sent: list[dict] = []
-
-        def _capture_ntfy(**kwargs):
-            ntfy_sent.append(kwargs)
-
-        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
-            with patch("trading_agent.graph.nodes.intraday_nodes.emit", side_effect=_capture_emit):
-                with patch("trading_agent.notify.send", side_effect=_capture_ntfy):
-                    from trading_agent.graph.nodes.intraday_nodes import (
-                        _maybe_escalate_exit_monitor_failures,
-                    )
-                    _maybe_escalate_exit_monitor_failures("test_run", "intraday_monitor")
-
-        assert len(emitted) == 1, "should emit exactly one persistent_failure event"
-        assert emitted[0]["event_type"] == "exit_monitor_persistent_failure"
-        assert emitted[0]["severity"] == 2
-        assert emitted[0]["payload"]["fail_count"] == 5
-        assert len(ntfy_sent) == 1, "should fire one ntfy ops alert"
-        assert ntfy_sent[0]["priority"] == 5
-
-    def test_escalation_suppressed_when_recent_alert(self):
-        """Once an alert has fired within the cooldown window, further hits
-        should not re-fire (avoids ntfy spam)."""
-        fake_cur = MagicMock()
-        # COUNT(*) → 5 failures, cooldown check → already alerted (returns row)
-        fake_cur.fetchone.side_effect = [(5,), (1,)]
-        fake_ctx = MagicMock()
-        fake_ctx.__enter__.return_value = fake_cur
-        fake_ctx.__exit__.return_value = False
-
-        emitted: list[dict] = []
-        ntfy_sent: list[dict] = []
-        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
-            with patch(
-                "trading_agent.graph.nodes.intraday_nodes.emit",
-                side_effect=lambda **kw: emitted.append(kw),
-            ):
-                with patch(
-                    "trading_agent.notify.send",
-                    side_effect=lambda **kw: ntfy_sent.append(kw),
-                ):
-                    from trading_agent.graph.nodes.intraday_nodes import (
-                        _maybe_escalate_exit_monitor_failures,
-                    )
-                    _maybe_escalate_exit_monitor_failures("test_run", "intraday_monitor")
-
-        assert emitted == [], "alert should be suppressed during cooldown"
-        assert ntfy_sent == [], "ntfy should be suppressed during cooldown"
-
-    def test_escalation_silent_below_threshold(self):
-        """Fewer than threshold failures → no alert. Normal operation."""
-        fake_cur = MagicMock()
-        fake_cur.fetchone.return_value = (2,)  # only 2 failures < threshold of 3
-        fake_ctx = MagicMock()
-        fake_ctx.__enter__.return_value = fake_cur
-        fake_ctx.__exit__.return_value = False
-
-        emitted: list[dict] = []
-        ntfy_sent: list[dict] = []
-        with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
-            with patch(
-                "trading_agent.graph.nodes.intraday_nodes.emit",
-                side_effect=lambda **kw: emitted.append(kw),
-            ):
-                with patch(
-                    "trading_agent.notify.send",
-                    side_effect=lambda **kw: ntfy_sent.append(kw),
-                ):
-                    from trading_agent.graph.nodes.intraday_nodes import (
-                        _maybe_escalate_exit_monitor_failures,
-                    )
-                    _maybe_escalate_exit_monitor_failures("test_run", "intraday_monitor")
-
-        assert emitted == []
-        assert ntfy_sent == []
+        assert "demoted_from_EXIT_TARGET" in dec["reason"]
 
     def test_partial_exit_on_qty_2_not_demoted(self):
-        """Counter-check: partial-exit factor=0.5 on qty=2 is physically possible
-        (2 × 0.5 = 1 contract) — should NOT be demoted to HOLD."""
-        from trading_agent.llm.schemas import ExitMonitorOutput
+        """qty=2 × factor=0.5 = 1 contract → physically possible, keep."""
+        from trading_agent.llm.schemas import ExitPlan, ScaleOutRung
 
         pos = {
-            "symbol": "US.NVDA260605C220000",
-            "asset_type": "OPT", "qty": 2,  # ← can split
-            "entry_price": 10.0, "mark": 9.8,
-            "stop": 7.0, "target": 18.0, "age_minutes": 120,
+            "symbol": "US.NVDA260817C220000",
+            "asset_type": "OPT", "qty": 2,
+            "entry_price": 10.0, "mark": 12.0,
         }
-        mock_res = MagicMock()
-        mock_res.parsed = ExitMonitorOutput(
-            action="EXIT_CAUTIOUS", exit_qty_factor=0.5, reason="reduce exposure",
+        plan = ExitPlan(
+            hard_stop=7.0, hard_target=18.0,
+            scale_out_ladder=[ScaleOutRung(at_mark=12.0, exit_factor=0.5)],
         )
+        enrichment = {
+            "US.NVDA260817C220000": {
+                "trade_id": 5, "thesis_id": 6,
+                "stop": 7.0, "target": 18.0,
+                "exit_plan": plan.model_dump(),
+                "mfe_so_far": None, "opened_at": None,
+            }
+        }
         state = _base_state(
             trigger="intraday_monitor",
             positions=[pos],
-            regime={"label": "BULL_TREND", "confidence": 0.7, "gate": {}},
+            regime={"label": "RANGE_LOW_VOL", "confidence": 0.7, "gate": {}},
         )
         with _patch_all_emits():
             with patch(
                 "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
-                return_value={},
+                return_value=enrichment,
             ):
-                with patch("trading_agent.llm.get_router") as mock_router:
-                    mock_router.return_value.call.return_value = mock_res
+                with patch(
+                    "trading_agent.mcp_servers.moomoo.server.get_quote",
+                    return_value={"rows": []},
+                ):
                     from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
                     result = detect_exit_triggers(state)
         dec = result["journal"]["exit_decisions"][0]
-        # Partial on qty=2 is doable, must NOT be demoted.
-        assert dec["action"] == "EXIT_CAUTIOUS"
+        assert dec["action"] == "EXIT_TARGET"
         assert dec["exit_qty_factor"] == 0.5
+
+    def test_scale_rungs_taken_passed_through_skips_fired_rung(self):
+        """Critical fix for the scale-rung repeat-fire bug.
+
+        If a partial rung at mark=12 has already fired (scale_rungs_taken=1),
+        a subsequent tick at mark=12.5 MUST NOT re-fire it. Without
+        persistence + passthrough, the executor would close 50% every tick
+        until qty=1 and the safety demotion kicks in.
+        """
+        from trading_agent.llm.schemas import ExitPlan, ScaleOutRung
+
+        pos = {
+            "symbol": "US.NVDA260817C220000",
+            "asset_type": "OPT", "qty": 2,
+            "entry_price": 10.0, "mark": 12.5,
+        }
+        plan = ExitPlan(
+            hard_stop=7.0, hard_target=18.0,
+            scale_out_ladder=[
+                ScaleOutRung(at_mark=12.0, exit_factor=0.5),
+                ScaleOutRung(at_mark=15.0, exit_factor=1.0),
+            ],
+        )
+        enrichment = {
+            "US.NVDA260817C220000": {
+                "trade_id": 5, "thesis_id": 6,
+                "stop": 7.0, "target": 18.0,
+                "exit_plan": plan.model_dump(),
+                "mfe_so_far": None, "opened_at": None,
+                "scale_rungs_taken": 1,  # ← rung #1 already fired
+            }
+        }
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=[pos],
+            regime={"label": "RANGE_LOW_VOL", "confidence": 0.7, "gate": {}},
+        )
+        with _patch_all_emits():
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value=enrichment,
+            ):
+                with patch(
+                    "trading_agent.mcp_servers.moomoo.server.get_quote",
+                    return_value={"rows": []},
+                ):
+                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
+                    result = detect_exit_triggers(state)
+        dec = result["journal"]["exit_decisions"][0]
+        # Rung #1 already taken; mark=12.5 hasn't hit rung #2 at 15.0 → HOLD
+        assert dec["action"] == "HOLD", (
+            "regression: scale rung fired twice — scale_rungs_taken not "
+            "being passed through to the executor"
+        )
 
 
 class TestRouteExitOrHold:

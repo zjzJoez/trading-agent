@@ -13,6 +13,9 @@ Rules (from plan, canonical form):
                                 0.30 <= |delta| <= 0.55, single-trade notional <= 1% equity
   R6  earnings lock            — within 2 trading days of earnings, only
                                 strategy_labels starting with "earnings_" are allowed
+  R7  risk:reward floor        — every opening trade must have reward/risk >= 1.5
+                                (target_dist / stop_dist on the proposal). Forces
+                                positive expected value at our ~55% baseline win rate.
 
 Risk calc for R1:
   stock trade: risk = |entry - stop| * qty                      (if stop supplied)
@@ -36,8 +39,10 @@ R3 = "R3_ticker_exposure"
 R4 = "R4_sector_concentration"
 R5 = "R5_option_policy"
 R6 = "R6_earnings_lock"
+R7 = "R7_risk_reward"
 R_STOP_MISSING = "R1_stop_missing"          # warn-only signal when stop absent
 R_SECTOR_UNKNOWN = "R4_sector_unknown"      # warn-only signal when sector lookup empty
+R_TARGET_MISSING = "R7_target_missing"      # warn-only signal when target absent
 
 MAX_SINGLE_RISK_PCT = 0.02
 MAX_CONCURRENT_OPENS = 5
@@ -50,6 +55,9 @@ OPTION_DELTA_MIN = 0.30
 OPTION_DELTA_MAX = 0.55
 EARNINGS_LOCK_DAYS = 2
 IMPLICIT_STOP_FRAC = 0.05  # fallback when caller doesn't provide a stop
+# Minimum reward/risk ratio for any opening trade. Mirrored in
+# llm.schemas.MIN_RISK_REWARD — both must move together if changed.
+MIN_RISK_REWARD = 1.5
 
 # Tolerance for float comparisons (pennies-level).
 EPS = 1e-6
@@ -84,6 +92,7 @@ class ProposedTrade:
     qty: float
     entry_price: float               # limit price
     stop: float | None = None        # optional; fallback to 5% implicit stop for R1
+    target: float | None = None      # optional; required for R7 R:R check
     strategy_label: str | None = None
     sector: str | None = None        # resolved from sectors.csv by the hook
     # options-only enrichment (may be None if snapshot not fetched)
@@ -256,6 +265,49 @@ def check(ctx: SizingContext, proposed: ProposedTrade) -> list[SizingViolation]:
                 f"got {lbl!r}",
                 "block",
             ))
+
+    # ---- R7 risk:reward floor ----
+    # Mirrors the pydantic validator on TraderProposal so the same rule
+    # fires at the hook layer even if a future call path bypasses the
+    # synthesizer schema (e.g. a manual rescue order). target is optional
+    # on ProposedTrade because the hook layer may not know it; in that
+    # case we warn rather than block (warn surfaces in the audit log so
+    # ops can spot the gap).
+    if is_opening:
+        if proposed.target is None:
+            violations.append(SizingViolation(
+                R_TARGET_MISSING,
+                f"opening trade for {proposed.ticker} has no target; "
+                f"R7 R:R floor not enforced",
+                "warn",
+            ))
+        elif proposed.stop is not None:
+            risk = abs(proposed.entry_price - proposed.stop)
+            reward = abs(proposed.target - proposed.entry_price)
+            if risk < 0.01:
+                violations.append(SizingViolation(
+                    R7,
+                    f"stop ({proposed.stop}) too close to entry "
+                    f"({proposed.entry_price}); risk=${risk:.4f}",
+                    "block",
+                ))
+            elif reward < 0.01:
+                violations.append(SizingViolation(
+                    R7,
+                    f"target ({proposed.target}) too close to entry "
+                    f"({proposed.entry_price}); reward=${reward:.4f}",
+                    "block",
+                ))
+            else:
+                rr = reward / risk
+                if rr < MIN_RISK_REWARD:
+                    violations.append(SizingViolation(
+                        R7,
+                        f"R:R {rr:.2f} below floor {MIN_RISK_REWARD} "
+                        f"(risk=${risk:.2f}, reward=${reward:.2f}). "
+                        f"Tighten stop OR widen target.",
+                        "block",
+                    ))
 
     return violations
 
