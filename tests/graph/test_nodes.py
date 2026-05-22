@@ -265,6 +265,83 @@ class TestNtfyHealth:
                 assert topic == "ops"
 
 
+class TestFailedUnitsCheck:
+    """5/22 incident: persistent failed unit triggered hourly sev-2 ntfy
+    spam until the operator complained. Cooldown logic added to suppress
+    repeated alerts for the same unit set within FAILED_UNITS_NTFY_COOLDOWN_HOURS.
+    """
+
+    def _systemd_output(self, failed: list[str]) -> str:
+        return "\n".join(
+            f"{u} loaded failed failed Description for {u}" for u in failed
+        )
+
+    def test_ntfy_fires_first_time_seeing_failure(self):
+        state = _base_state(trigger="healthcheck")
+        fake_run = MagicMock(stdout=self._systemd_output(
+            ["trading-agent-watchlist-refresh.service"]
+        ))
+        # No prior alert → cooldown lookup returns no row
+        fake_cur = MagicMock()
+        fake_cur.fetchone.return_value = None
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        sent: list = []
+        with _patch_all_emits():
+            with patch("subprocess.run", return_value=fake_run):
+                with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+                    with patch("trading_agent.notify.send",
+                               side_effect=lambda **kw: sent.append(kw)):
+                        from trading_agent.graph.nodes.health_nodes import (
+                            failed_units_check,
+                        )
+                        failed_units_check(state)
+        assert len(sent) == 1, "first-time failure should fire ntfy"
+        assert "FAILED" in sent[0].get("title", "")
+
+    def test_ntfy_suppressed_during_cooldown(self):
+        state = _base_state(trigger="healthcheck")
+        fake_run = MagicMock(stdout=self._systemd_output(
+            ["trading-agent-watchlist-refresh.service"]
+        ))
+        # Prior alert exists → cooldown lookup returns (1,)
+        fake_cur = MagicMock()
+        fake_cur.fetchone.return_value = (1,)
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__.return_value = fake_cur
+        fake_ctx.__exit__.return_value = False
+
+        sent: list = []
+        with _patch_all_emits():
+            with patch("subprocess.run", return_value=fake_run):
+                with patch("trading_agent.store.postgres.cursor", return_value=fake_ctx):
+                    with patch("trading_agent.notify.send",
+                               side_effect=lambda **kw: sent.append(kw)):
+                        from trading_agent.graph.nodes.health_nodes import (
+                            failed_units_check,
+                        )
+                        failed_units_check(state)
+        assert sent == [], (
+            "repeated alert for same unit set within cooldown should be suppressed"
+        )
+
+    def test_no_failures_emits_clean(self):
+        state = _base_state(trigger="healthcheck")
+        fake_run = MagicMock(stdout="")
+        sent: list = []
+        with _patch_all_emits():
+            with patch("subprocess.run", return_value=fake_run):
+                with patch("trading_agent.notify.send",
+                           side_effect=lambda **kw: sent.append(kw)):
+                    from trading_agent.graph.nodes.health_nodes import (
+                        failed_units_check,
+                    )
+                    failed_units_check(state)
+        assert sent == [], "clean state should never ntfy"
+
+
 # ---------------------------------------------------------------------------
 # intraday_nodes
 # ---------------------------------------------------------------------------

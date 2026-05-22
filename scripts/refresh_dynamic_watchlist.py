@@ -702,6 +702,22 @@ def main() -> int:
     except Exception as e:
         log.error("refresh failed: %s\n%s", e, traceback.format_exc())
         return 1
+    finally:
+        # moomoo's OpenQuoteContext / OpenSecTradeContext spawn non-daemon
+        # background threads (callback_executor + network_manager socket
+        # reader). Without explicit shutdown they keep the interpreter
+        # alive after main() returns. 5/22 incident: watchlist-refresh
+        # finished its work in 12s but hung for 4+ minutes until systemd
+        # TERM (TimeoutStartSec=300), then healthcheck.failed_units_check
+        # fired hourly sev-2 ntfy alerts for "failed" state until the user
+        # complained. shutdown() is idempotent and swallows errors.
+        try:
+            from trading_agent.mcp_servers.moomoo.server import (
+                shutdown as moomoo_shutdown,
+            )
+            moomoo_shutdown()
+        except Exception as e:
+            log.warning("moomoo shutdown failed (non-fatal): %s", e)
 
 
 if __name__ == "__main__":

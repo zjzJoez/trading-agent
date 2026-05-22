@@ -266,6 +266,46 @@ TRACKED_UNIT_PREFIXES = (
 )
 
 
+# A persistent failed unit will keep showing up on every healthcheck tick.
+# Without a cooldown, we'd ntfy every hour for the same problem until the
+# operator notices (5/22 incident: 4 hourly sev-2 alerts for watchlist-
+# refresh in a failed state). 6h cooldown is a good balance: long enough
+# that ops doesn't get spammed, short enough that a re-failure after
+# a fix isn't silenced overnight.
+FAILED_UNITS_NTFY_COOLDOWN_HOURS = 6
+
+
+def _was_failed_units_alerted_recently(failed_units: list[str]) -> bool:
+    """True iff we ntfy'd for THIS EXACT failed-units set within cooldown.
+
+    Querying agent_events is best-effort: any DB error → return False
+    (alert as a fallback). Keying on the sorted unit set means a NEW
+    failure (different unit) still alerts immediately even if an older
+    failure is still in cooldown.
+    """
+    if not failed_units:
+        return False
+    key = ",".join(sorted(set(failed_units)))
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM agent_events
+                WHERE event_type = 'failed_units_detected'
+                  AND ts > NOW() - (%s::text || ' hours')::interval
+                  AND payload ? 'ntfy_key'
+                  AND payload->>'ntfy_key' = %s
+                LIMIT 1
+                """,
+                (str(FAILED_UNITS_NTFY_COOLDOWN_HOURS), key),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        log.warning("[failed_units_check] cooldown check failed: %s", e)
+        return False
+
+
 def failed_units_check(state: TradingGraphState) -> dict:
     """Scan systemctl --failed for tracked units and ntfy if any are failing.
 
@@ -273,6 +313,11 @@ def failed_units_check(state: TradingGraphState) -> dict:
     logrotate, and man-db were all silently failed for days before anyone
     noticed. This node flips that to a phone alert within the next healthcheck
     tick (worst case 1 hour).
+
+    Ntfy is suppressed within ``FAILED_UNITS_NTFY_COOLDOWN_HOURS`` for the
+    exact same failed-unit set so a persistent failure doesn't spam
+    hourly alerts (5/22 watchlist-refresh incident). The event row is
+    still emitted every tick for audit / dashboard visibility.
     """
     run_id = state["run_id"]
     trigger = state["trigger"]
@@ -307,13 +352,30 @@ def failed_units_check(state: TradingGraphState) -> dict:
         )
         return {}
 
+    # Did we already alert for this exact set inside the cooldown window?
+    suppress_ntfy = _was_failed_units_alerted_recently(failed_units)
+    ntfy_key = ",".join(sorted(set(failed_units)))
+
     emit(
         run_id=run_id, trigger=trigger, agent="failed_units_check",
         event_type="failed_units_detected",
         severity=SEV_ERROR,
-        payload={"count": len(failed_units), "units": failed_units,
-                 "latency_ms": elapsed_ms},
+        payload={
+            "count": len(failed_units),
+            "units": failed_units,
+            "latency_ms": elapsed_ms,
+            "ntfy_key": ntfy_key,
+            "ntfy_suppressed": suppress_ntfy,
+            "cooldown_hours": FAILED_UNITS_NTFY_COOLDOWN_HOURS,
+        },
     )
+
+    if suppress_ntfy:
+        log.info(
+            "[failed_units_check] ntfy suppressed for %s (cooldown %dh)",
+            ntfy_key, FAILED_UNITS_NTFY_COOLDOWN_HOURS,
+        )
+        return {}
 
     _alert_ops(
         title=f"{len(failed_units)} tracked unit(s) FAILED",
@@ -321,7 +383,9 @@ def failed_units_check(state: TradingGraphState) -> dict:
             "Failed systemd units detected:\n"
             + "\n".join(f"  • {u}" for u in failed_units[:10])
             + (f"\n  ... and {len(failed_units)-10} more" if len(failed_units) > 10 else "")
-            + "\n\n`sudo systemctl status <unit>` to investigate, then "
+            + f"\n\n(next ntfy for the same set suppressed for "
+              f"{FAILED_UNITS_NTFY_COOLDOWN_HOURS}h)\n"
+              "`sudo systemctl status <unit>` to investigate, then "
               "`sudo systemctl reset-failed <unit>` once fixed."
         ),
     )
