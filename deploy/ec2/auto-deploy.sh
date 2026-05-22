@@ -153,7 +153,16 @@ fi
 # while the deploy retried itself to death).
 # 4-min timeout (240s) inside systemd's 5-min TimeoutStartSec — give it
 # slack to clean up before systemd SIGTERMs the whole tree.
-if ! ( cd "$TEST_WORKTREE" && timeout 240 "$PYTHON_BIN" -m pytest tests/ -q -x --no-header -m 'not integration' 2>&1 | tail -30 ); then
+#
+# PYTHONPATH shim: prepend the temp worktree's src/ so pytest imports the
+# CANDIDATE commit's source files, not the editable install pointing at
+# the live tree. Without this, pure-source-only commits would silently
+# test the OLD code against NEW tests — and any commit that ADDS a new
+# subpackage (e.g. trading_agent.exits in 8688a83) would fail with
+# ModuleNotFoundError because the live tree doesn't have it yet.
+if ! ( cd "$TEST_WORKTREE" \
+        && PYTHONPATH="$TEST_WORKTREE/src:${PYTHONPATH:-}" \
+           timeout 240 "$PYTHON_BIN" -m pytest tests/ -q -x --no-header -m 'not integration' 2>&1 | tail -30 ); then
     echo "$LOG_TAG ABORT: pytest failed on ${REMOTE:0:7}"
     _ntfy_failure_with_backoff "deploy ABORTED: pytest failed on ${REMOTE:0:7} — live HEAD ${LOCAL:0:7} kept"
     git worktree remove --force "$TEST_WORKTREE" 2>/dev/null || true
@@ -174,6 +183,15 @@ HAS_SUDOERS=$(echo "$CHANGED_FILES" | grep -E '^deploy/ec2/sudoers/' || true)
 # restart when their source files change (oneshot services like brain@.service
 # don't, because they re-import on every fire).
 HAS_DASHBOARD=$(echo "$CHANGED_FILES" | grep -E '^src/trading_agent/web/' || true)
+# A *new subpackage* under src/trading_agent/ requires re-running uv pip
+# install so the editable install registers the new directory. Editable
+# installs cache the package list at install time, so adding e.g.
+# src/trading_agent/exits/ won't be importable until reinstall (the
+# 8688a83 deploy hit exactly this — pytest gate aborted with
+# ModuleNotFoundError despite the new files being on disk). Heuristic:
+# any new `__init__.py` under src/ is a new subpackage marker.
+HAS_NEW_SUBPKG=$(git diff --name-only --diff-filter=A "$LOCAL" "$REMOTE" \
+    | grep -E '^src/trading_agent/[^/]+/__init__\.py$' || true)
 
 NUM_CHANGED=$(echo "$CHANGED_FILES" | wc -l)
 echo "$LOG_TAG changed=$NUM_CHANGED deps=${HAS_DEPS:+y} systemd=${HAS_SYSTEMD:+y} migrations=${HAS_MIGRATIONS:+y} sudoers=${HAS_SUDOERS:+y}"
@@ -189,6 +207,14 @@ if [ -n "$HAS_DEPS" ]; then
     # deploy after a fresh setup aborts with "No module named pytest".
     echo "$LOG_TAG uv sync --extra dev"
     "$UV_BIN" sync --extra dev --quiet 2>&1 | tail -10
+fi
+
+if [ -n "$HAS_NEW_SUBPKG" ]; then
+    # New subpackage(s) require re-installing trading-agent so the editable
+    # install registers the new directory in package metadata. uv_build's
+    # editable mode caches the package list at install time.
+    echo "$LOG_TAG new subpackage(s) detected: $HAS_NEW_SUBPKG — re-installing trading-agent"
+    "$UV_BIN" pip install -e . --reinstall-package trading-agent --quiet 2>&1 | tail -5
 fi
 
 # Apply migrations BEFORE restarting any service. New code may insert into
