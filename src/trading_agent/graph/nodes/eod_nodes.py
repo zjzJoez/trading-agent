@@ -169,40 +169,51 @@ def auto_void_stale_theses(state: TradingGraphState) -> dict:
     log.info("[eod/auto_void_stale_theses] run_id=%s", run_id)
 
     voided: list[dict] = []
+    # journal_close_thesis is optional — we may be running on EC2 with an
+    # empty sqlite journal, in which case the Postgres sweep is the only
+    # path that does real work. Import failure is informational, not fatal.
+    journal_close_thesis = None  # type: ignore[assignment]
+    connection = None
     try:
         from trading_agent.mcp_servers.journal.server import (
-            close_thesis as journal_close_thesis,
-            connection,
+            close_thesis as journal_close_thesis,  # noqa: F811 - reassigned from import
+            connection,  # noqa: F811 - reassigned from import
         )
     except Exception as e:
-        log.warning("[auto_void_stale_theses] journal import failed: %s", e)
-        return {}
+        log.warning("[auto_void_stale_theses] sqlite journal import failed: %s", e)
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=STALE_THESIS_AGE_DAYS)).isoformat()
-    try:
-        with connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT t.id, t.ticker, t.created_at
-                FROM theses t
-                WHERE t.status = 'open'
-                  AND t.created_at < ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM trades tr
-                      WHERE tr.thesis_id = t.id
-                        AND tr.outcome = 'OPEN'
-                  )
-                """,
-                (cutoff,),
-            ).fetchall()
-    except Exception as e:
-        log.warning("[auto_void_stale_theses] sqlite scan failed: %s", e)
-        rows = []
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=STALE_THESIS_AGE_DAYS)
+    cutoff = cutoff_dt.isoformat()
 
-    for row in rows:
+    # ---- Sweep 1: sqlite journal-mcp (local dev / shadow journal) -----------
+    sqlite_rows: list[tuple] = []
+    if connection is not None:
+        try:
+            with connection() as conn:
+                sqlite_rows = conn.execute(
+                    """
+                    SELECT t.id, t.ticker, t.created_at
+                    FROM theses t
+                    WHERE t.status = 'open'
+                      AND t.created_at < ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM trades tr
+                          WHERE tr.thesis_id = t.id
+                            AND tr.outcome = 'OPEN'
+                      )
+                    """,
+                    (cutoff,),
+                ).fetchall()
+        except Exception as e:
+            log.warning("[auto_void_stale_theses] sqlite scan failed: %s", e)
+            sqlite_rows = []
+
+    for row in sqlite_rows:
         thesis_id = row[0]
         ticker = row[1]
         created_at = row[2]
+        if journal_close_thesis is None:
+            continue
         try:
             journal_close_thesis(
                 thesis_id=int(thesis_id),
@@ -213,10 +224,49 @@ def auto_void_stale_theses(state: TradingGraphState) -> dict:
                 ),
             )
             voided.append({"thesis_id": int(thesis_id), "ticker": ticker,
-                           "created_at": created_at})
+                           "created_at": str(created_at), "source": "sqlite"})
         except Exception as e:
-            log.warning("[auto_void_stale_theses] close_thesis(%s) failed: %s",
+            log.warning("[auto_void_stale_theses] sqlite close_thesis(%s) failed: %s",
                         thesis_id, e)
+
+    # ---- Sweep 2: Postgres journal_theses (production canonical on EC2) -----
+    # The 5/22 AAPL/XLE/GLD/AMZN zombie cleanup proved that all real theses
+    # on EC2 live in Postgres — sqlite is empty there. Without this sweep,
+    # auto_void_stale_theses does nothing on prod.
+    try:
+        from trading_agent.store.postgres import cursor as pg_cursor
+        with pg_cursor() as cur:
+            cur.execute(
+                """
+                SELECT th.id, th.ticker, th.created_at
+                FROM journal_theses th
+                WHERE th.status = 'open'
+                  AND th.created_at < %s
+                  AND NOT EXISTS (
+                      SELECT 1 FROM journal_trades tr
+                      WHERE tr.thesis_id = th.id
+                        AND tr.outcome = 'OPEN'
+                  )
+                """,
+                (cutoff_dt,),
+            )
+            pg_rows = cur.fetchall()
+        for thesis_id, ticker, created_at in pg_rows:
+            try:
+                with pg_cursor() as cur:
+                    cur.execute(
+                        "UPDATE journal_theses SET status='void' "
+                        "WHERE id=%s AND status='open'",
+                        (int(thesis_id),),
+                    )
+                voided.append({"thesis_id": int(thesis_id), "ticker": ticker,
+                               "created_at": created_at.isoformat() if created_at else None,
+                               "source": "postgres"})
+            except Exception as e:
+                log.warning("[auto_void_stale_theses] postgres update(%s) failed: %s",
+                            thesis_id, e)
+    except Exception as e:
+        log.warning("[auto_void_stale_theses] postgres scan failed: %s", e)
 
     if voided:
         emit(

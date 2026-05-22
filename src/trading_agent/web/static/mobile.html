@@ -277,27 +277,35 @@ function renderBurnIn(b) {
 // ----- positions -------------------------------------------------------------
 function renderPositions(p) {
   const list = $('pos-list');
-  if (!p || !p.rows) { list.innerHTML = '<div class="text-muted text-sm">—</div>'; return; }
-  $('pos-count').textContent = p.rows.length + ' pos';
-  if (p.rows.length === 0) {
+  // /api/positions returns {account, positions:[…], total_unrealized_pnl, count}.
+  // Older code looked for `p.rows` — that key does not exist; the list of
+  // open positions is on `p.positions`.
+  const rows = p && p.positions;
+  if (!rows) { list.innerHTML = '<div class="text-muted text-sm">—</div>'; return; }
+  $('pos-count').textContent = rows.length + ' pos';
+  if (rows.length === 0) {
     list.innerHTML = '<div class="text-muted text-sm text-center py-2">no open positions</div>';
     return;
   }
-  list.innerHTML = p.rows.map(pos => {
+  list.innerHTML = rows.map(pos => {
     const pnl = Number(pos.unrealized_pnl ?? 0);
     const pnlClass = pnl > 0 ? 'text-ok' : (pnl < 0 ? 'text-err' : 'text-muted');
     const pnlSign = pnl >= 0 ? '+' : '';
     const sym = pos.label || pos.symbol || '?';
-    const dteStr = pos.dte !== null && pos.dte !== undefined ? ` · ${pos.dte}d` : '';
+    // /api/positions enriches with `age` (relative time since opened) — no `dte`.
+    const ageStr = pos.age && pos.age !== '—' ? ` · ${pos.age}` : '';
+    // `pnl_pct` is already in percent (e.g. 35.05 means +35.05%). fmtPct
+    // multiplies by 100 internally, so divide by 100 first to get a ratio.
+    const pctVal = (pos.pnl_pct === null || pos.pnl_pct === undefined) ? null : Number(pos.pnl_pct) / 100;
     return `
       <div class="bg-cardb rounded-lg p-3 flex items-center justify-between">
         <div class="min-w-0 flex-1">
           <div class="text-sm font-medium truncate">${sym}</div>
-          <div class="text-xs text-muted num">qty ${pos.qty} · mark ${fmtNum(pos.mark, 2)}${dteStr}</div>
+          <div class="text-xs text-muted num">qty ${pos.qty} · mark ${fmtNum(pos.mark, 2)}${ageStr}</div>
         </div>
         <div class="text-right">
           <div class="text-sm font-semibold num ${pnlClass}">${pnlSign}${fmtNum(pnl, 0)}</div>
-          <div class="text-xs text-muted num">${fmtPct(pos.pl_ratio/100, 1)}</div>
+          <div class="text-xs text-muted num">${pctVal === null ? '—' : fmtPct(pctVal, 1)}</div>
         </div>
       </div>
     `;

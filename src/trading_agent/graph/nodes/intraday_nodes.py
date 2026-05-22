@@ -756,7 +756,15 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
         if closed_ok and thesis_id is not None:
             thesis_note = f"trade {trade_id} closed via {action} ({reason})"[:280]
             thesis_closed = False
-            if journal_close_thesis is not None:
+            # Route the thesis close to the SAME store as the trade close —
+            # they're written together at thesis_record time, so a postgres
+            # trade implies a postgres thesis. Without this gate, a postgres
+            # trade would try sqlite close_thesis first; sqlite MCP returns
+            # "ok" without raising even when the row is absent, leaving
+            # `thesis_closed=True` and skipping the postgres UPDATE. Result:
+            # journal_theses stays status='open' forever and accumulates
+            # zombies (the May 2026 AAPL/XLE/GLD/AMZN cleanup pattern).
+            if trade_id_source == "sqlite" and journal_close_thesis is not None:
                 try:
                     journal_close_thesis(
                         thesis_id=thesis_id,
