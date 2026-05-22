@@ -123,7 +123,12 @@ echo "$LOG_TAG deploying ${LOCAL:0:7} -> ${REMOTE:0:7}"
 # rushed. CI gates are valuable precisely because they don't.
 
 TEST_WORKTREE=$(mktemp -d -p /tmp trading-agent-deploy-test-XXXXXX)
-trap 'rm -rf "$TEST_WORKTREE"' EXIT  # cleanup on any exit path
+# Cleanup on any exit path — including SIGTERM from systemd timeout.
+# `git worktree remove` clears both the dir AND the .git/worktrees/ metadata,
+# so we don't accumulate hundreds of "prunable" stale refs (5/22 incident
+# left 103 orphans). The trailing `prune` is belt-and-suspenders in case
+# the remove fails (e.g. if the worktree dir was rm'd by some other path).
+trap 'git worktree remove --force "$TEST_WORKTREE" 2>/dev/null; rm -rf "$TEST_WORKTREE"; git worktree prune 2>/dev/null' EXIT
 
 echo "$LOG_TAG pytest gate: worktree=$TEST_WORKTREE"
 git worktree add --quiet --detach "$TEST_WORKTREE" "$REMOTE"
