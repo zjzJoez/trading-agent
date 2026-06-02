@@ -32,7 +32,14 @@ class RoleConfig:
 ROLE_CONFIG: dict[str, RoleConfig] = {
     # Claude Code (Max 20x plan)
     "regime_reviewer": RoleConfig("claude_code", MODEL_SONNET, "regime-reviewer", 80_000),
-    "scout": RoleConfig("claude_code", MODEL_HAIKU, "scout", 200_000),
+    # Scout moved Haiku → Sonnet on 2026-06-02. Haiku returned empty /
+    # malformed / list-wrapped JSON on ~13 of 25 trading days (the
+    # 40-ticker watchlist table → strict JSON is past Haiku's reliable
+    # instruction-following). json_repair salvaged the garbage into a
+    # structurally-valid but EMPTY candidates list, which silently fell
+    # back to score=0.5 (below DISPATCH_MIN_SCORE 0.55) → 0 dispatches
+    # for 11 days. Sonnet 4.6 follows the JSON contract far more reliably.
+    "scout": RoleConfig("claude_code", MODEL_SONNET, "scout", 200_000),
     "technical_analyst": RoleConfig("claude_code", MODEL_SONNET, "technical-analyst", 300_000),
     "news_analyst": RoleConfig("claude_code", MODEL_HAIKU, "news-analyst", 200_000),
     "sentiment_analyst": RoleConfig("claude_code", MODEL_HAIKU, "sentiment-analyst", 100_000),

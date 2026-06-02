@@ -226,12 +226,18 @@ def rank_candidates(state: TradingGraphState) -> dict:
     candidates: list[dict] = []
     failure_mode: str | None = None
     llm_exception: str | None = None
+    raw_sample: str | None = None  # captured raw scout text for post-mortem
 
     try:
         from trading_agent.llm import get_router
         from trading_agent.llm.schemas import ScoutOutput
         router = get_router()
         res = router.call("scout", prompt, schema=ScoutOutput, timeout_s=120)
+        # Capture the raw model text so a degraded run records what the
+        # model ACTUALLY said — not a reconstruction. (advisor 6/2: stop
+        # inferring from a 4ms log gap; read the bytes.) Tickers + scores
+        # only, nothing sensitive.
+        raw_sample = (getattr(res, "raw_text", "") or "")[:500]
         parsed: ScoutOutput | None = (
             res.parsed if isinstance(res.parsed, ScoutOutput) else None
         )
@@ -277,6 +283,9 @@ def rank_candidates(state: TradingGraphState) -> dict:
                 "llm_exception": llm_exception,
                 "n_watchlist": len(watchlist),
                 "fallback_top": [c["ticker"] for c in candidates[:3]],
+                # The actual model output (truncated) — so the next failure
+                # is read from bytes, not reconstructed from a log gap.
+                "raw_sample": raw_sample,
             },
         )
         try:

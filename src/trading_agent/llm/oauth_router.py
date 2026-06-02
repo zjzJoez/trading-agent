@@ -415,6 +415,19 @@ class OAuthLLMRouter:
                     except Exception:
                         # Repair also failed — surface the original strict-parse error
                         raise strict_err
+                # 3) Unwrap a single-element list when the schema expects a
+                #    dict/object. Weaker models sometimes wrap their object in
+                #    a list: `[{...}]` instead of `{...}`. (6/2 audit: scout
+                #    on Haiku did this — "Input should be a valid dictionary
+                #    ... input_value=[{'candidates': [...]}]"). Unwrapping
+                #    here avoids burning an LLM retry round-trip on a trivial
+                #    structural quirk.
+                if isinstance(obj, list) and len(obj) == 1 and isinstance(obj[0], dict):
+                    log.warning(
+                        "[%s] model wrapped object in a 1-element list — unwrapping",
+                        role,
+                    )
+                    obj = obj[0]
                 return schema.model_validate(obj)
             except (json.JSONDecodeError, ValidationError) as e:
                 last_err = e
@@ -534,23 +547,60 @@ def _extract_assistant_message_from_stream(stream_json_output: str) -> str:
     return "".join(parts).strip()
 
 
+class EmptyLLMResponse(RuntimeError):
+    """Raised when claude -p returns an empty / errored result envelope.
+
+    Distinct from a JSON parse failure: the model produced NO usable text
+    (empty result, is_error=true, or a tool-use turn that yielded no final
+    message). Surfacing this as a clear exception — instead of returning ""
+    that later fails json.loads with the cryptic "Expecting value: line 1
+    column 1 (char 0)" — is what makes scout failures legible. 6/2 audit:
+    Haiku returned empty results on ~13 trading days, all masked behind
+    that confusing JSON error.
+    """
+
+
 def _extract_text_from_claude_json(json_output: str) -> str:
     """Parse `claude -p --output-format=json` single-result envelope.
 
     Claude Code returns a single JSON object with shape
-    `{"type": "result", "subtype": "success", "result": "<text>", ...}`.
+    `{"type": "result", "subtype": "success", "result": "<text>",
+      "is_error": false, ...}`.
+
+    Raises EmptyLLMResponse when the envelope signals an error or yields
+    no usable text — the caller treats this as a hard failure rather than
+    silently passing "" downstream.
     """
+    stripped = json_output.strip()
     try:
-        obj = json.loads(json_output.strip())
+        obj = json.loads(stripped)
     except json.JSONDecodeError:
-        return json_output.strip()
+        # Not the JSON envelope — could be raw text (older CLI). Return it
+        # if non-empty; otherwise it's a genuine empty response.
+        if not stripped:
+            raise EmptyLLMResponse("claude returned empty stdout (no envelope)")
+        return stripped
     if isinstance(obj, dict):
-        if "result" in obj and isinstance(obj["result"], str):
-            return obj["result"].strip()
-        # Fallback: some versions return {"text": ...}
-        if "text" in obj and isinstance(obj["text"], str):
-            return obj["text"].strip()
-    return json_output.strip()
+        is_error = bool(obj.get("is_error"))
+        subtype = obj.get("subtype")
+        result = obj.get("result")
+        text = obj.get("text")
+        candidate = ""
+        if isinstance(result, str):
+            candidate = result.strip()
+        elif isinstance(text, str):
+            candidate = text.strip()
+        if is_error or not candidate:
+            raise EmptyLLMResponse(
+                f"claude envelope had no usable text "
+                f"(is_error={is_error}, subtype={subtype!r}, "
+                f"result_len={len(result) if isinstance(result, str) else 0})"
+            )
+        return candidate
+    # Non-dict JSON (e.g. a bare string/number) — stringify if non-empty.
+    if not stripped:
+        raise EmptyLLMResponse("claude returned empty/blank JSON")
+    return stripped
 
 
 def _read_codex_system_prompt(agent_name: str) -> str:
