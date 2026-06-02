@@ -1460,6 +1460,13 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
             qty=float(qi),
             entry_price=float(proposal.get("entry_price", 0)),
             stop=proposal.get("stop"),
+            # Thread target through so sizing's R7 R:R check can actually
+            # run. Without this, target=None → spurious "R7_target_missing"
+            # warn on every trade even when the proposal HAS a target
+            # (6/2 NVDA: target=234 existed but sizing never saw it). The
+            # schema validator on TraderProposal already enforced R7 at
+            # proposal time; this makes the sizing-layer net match.
+            target=proposal.get("target"),
             strategy_label=proposal.get("strategy_label"),
             sector=proposal.get("sector") or sectors_lookup.lookup(proposal.get("ticker", "")),
             delta=proposal.get("option_delta"),
