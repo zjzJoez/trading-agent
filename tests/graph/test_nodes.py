@@ -1154,6 +1154,12 @@ class TestNtfyScanDigest:
                     "trading_agent.graph.nodes.premarket_nodes._recently_dispatched",
                     return_value=False,
                 ))
+                # Market open → regular-hours gate allows dispatch (else the
+                # gate makes these tests flaky depending on wall-clock time).
+                self._stack.enter_context(patch(
+                    "trading_agent.market_calendar.is_us_market_open",
+                    return_value=True,
+                ))
                 return self
             def __exit__(self, *a):
                 return self._stack.__exit__(*a)
@@ -1259,7 +1265,8 @@ class TestNtfyScanDigest:
         )
         started: list[str] = []
         with _patch_all_emits():
-            with patch("trading_agent.graph.nodes.premarket_nodes._existing_exposure", return_value=None):
+            with patch("trading_agent.market_calendar.is_us_market_open", return_value=True):
+              with patch("trading_agent.graph.nodes.premarket_nodes._existing_exposure", return_value=None):
                 with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown", return_value=None):
                     with patch("trading_agent.graph.nodes.premarket_nodes._open_position_count", return_value=5):
                         with patch("trading_agent.notify.send"):
@@ -1291,6 +1298,7 @@ class TestNtfyScanDigest:
         skipped: list[dict] = []
         with patch("trading_agent.graph.nodes.premarket_nodes.emit",
                    side_effect=lambda **kw: skipped.append(kw) if kw.get("event_type") == "candidate_entry_skipped" else None):
+          with patch("trading_agent.market_calendar.is_us_market_open", return_value=True):
             with patch("trading_agent.graph.nodes.premarket_nodes._existing_exposure", return_value=None):
                 with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown", return_value=None):
                     with patch("trading_agent.graph.nodes.premarket_nodes._open_position_count", return_value=0):
@@ -1307,6 +1315,27 @@ class TestNtfyScanDigest:
                                             ntfy_scan_digest(state)
         assert started == [], "recently-dispatched ticker must not re-dispatch"
         assert any(s["payload"].get("reason") == "already_dispatched_recently" for s in skipped)
+
+    def test_dispatch_skipped_when_market_closed(self):
+        """6/2 fix: the 12:30 premarket scan ranks + sends digest but does NOT
+        dispatch (market closed) — the 13:35 open scan is what trades."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "x"}],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        skipped: list[dict] = []
+        with patch("trading_agent.graph.nodes.premarket_nodes.emit",
+                   side_effect=lambda **kw: skipped.append(kw) if kw.get("event_type") == "candidate_entry_skipped" else None):
+            with patch("trading_agent.market_calendar.is_us_market_open", return_value=False):
+                with patch("trading_agent.notify.send"):
+                    with patch("pathlib.Path.exists", return_value=False):
+                        with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                            with patch("subprocess.run") as mock_run:
+                                from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                ntfy_scan_digest(state)
+        mock_run.assert_not_called()  # no dispatch when market closed
+        assert any(s["payload"].get("reason") == "outside_regular_hours" for s in skipped)
 
     def test_dispatch_failed_emits_severity_2(self):
         """systemctl start non-zero exit → dispatch_failed event, severity=2."""
@@ -1342,7 +1371,8 @@ class TestNtfyScanDigest:
             regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
         )
         with _patch_all_emits():
-            with patch("trading_agent.notify.send"):
+            with patch("trading_agent.market_calendar.is_us_market_open", return_value=True):
+              with patch("trading_agent.notify.send"):
                 with patch("pathlib.Path.exists", return_value=False):
                     with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
                         with patch("trading_agent.graph.nodes.premarket_nodes._existing_exposure",
@@ -1363,7 +1393,8 @@ class TestNtfyScanDigest:
             regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
         )
         with _patch_all_emits():
-            with patch("trading_agent.notify.send"):
+            with patch("trading_agent.market_calendar.is_us_market_open", return_value=True):
+              with patch("trading_agent.notify.send"):
                 with patch("pathlib.Path.exists", return_value=False):
                     with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
                         with patch("trading_agent.graph.nodes.premarket_nodes._existing_exposure",

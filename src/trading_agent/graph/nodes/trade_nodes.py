@@ -30,6 +30,20 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Execution pricing constants (6/2 fresh-quote marketable-limit fix)
+# ---------------------------------------------------------------------------
+
+# Skip the trade if, at execution, the fresh ask is more than this above the
+# proposal entry — the name ran away during research→execute and the R:R the
+# thesis was built on no longer holds. Don't chase.
+_EXEC_RUNAWAY_PCT = 0.08
+# Marketable-limit cross-the-spread buffers over the FRESH ask. Options have
+# wide spreads (need more room to fill); liquid stock needs almost none.
+_EXEC_OPT_CROSS_BUF = 1.02
+_EXEC_STK_CROSS_BUF = 1.003
+
+
+# ---------------------------------------------------------------------------
 # Helpers — moomoo row → graph state shape
 # ---------------------------------------------------------------------------
 
@@ -689,10 +703,66 @@ def execute_paper_order(state: TradingGraphState) -> dict:
         )
         return {}
 
-    # Cap entry price at the risk decision's max_entry_price (1.005× proposal entry)
-    entry_price = float(proposal.get("entry_price") or 0.0)
-    max_price = float(risk.get("max_entry_price") or entry_price * 1.005)
-    place_price = round(min(entry_price, max_price), 2)
+    # ---- Fresh-quote marketable limit (6/2 SNOW/NVDA execution fix) ----
+    # The proposal's entry_price is the ask at RESEARCH time — minutes stale,
+    # and pre-this-fix a pre-market spike (6/2 SNOW: bought ~$273 pre-market,
+    # faded to $256 at open). Re-fetch the LIVE quote at execution and price a
+    # marketable limit off the CURRENT ask so the order fills — but cap it so
+    # we never chase a name that ran away during the pipeline.
+    proposal_entry = float(proposal.get("entry_price") or 0.0)
+    is_opt = _is_option_code(moomoo_symbol)
+    fresh_ask: float | None = None
+    try:
+        from trading_agent.mcp_servers.moomoo.server import get_quote
+        q = get_quote([moomoo_symbol])
+        for r in (q.get("rows") or []):
+            a = r.get("ask_price") or r.get("ask")
+            last = r.get("last_price") or r.get("cur_price")
+            if a and float(a) > 0:
+                fresh_ask = float(a)
+            elif last and float(last) > 0:
+                fresh_ask = float(last)
+            break
+    except Exception as e:
+        log.warning("[execute_paper_order] fresh-quote fetch failed: %s — using proposal price", e)
+
+    # Skip-if-ran-away: don't chase a name that gapped past the thesis entry
+    # during the research→execute gap. Beyond RUNAWAY_PCT the R:R is broken.
+    runaway_cap = proposal_entry * (1 + _EXEC_RUNAWAY_PCT) if proposal_entry > 0 else None
+    if fresh_ask is not None and runaway_cap and fresh_ask > runaway_cap:
+        log.info("[execute_paper_order] %s ran away: fresh_ask=%.2f > cap=%.2f (proposal=%.2f) — skip",
+                 moomoo_symbol, fresh_ask, runaway_cap, proposal_entry)
+        emit(
+            run_id=run_id, trigger=trigger, agent="execute_paper_order",
+            event_type="execution_skipped_ran_away", severity=1,
+            payload={"symbol": moomoo_symbol, "proposal_entry": proposal_entry,
+                     "fresh_ask": round(fresh_ask, 2), "runaway_pct": _EXEC_RUNAWAY_PCT},
+        )
+        # Mark the thesis rejected so it doesn't linger 'open'.
+        _tid = proposal.get("thesis_id")
+        if _tid:
+            _mark_thesis_rejected(int(_tid), reason=f"ran_away ask={fresh_ask:.2f} > {runaway_cap:.2f}")
+        return {}
+
+    # Marketable limit: cross the spread off the FRESH ask. Wider buffer for
+    # options (wide spreads) than stock. Bounded by the runaway cap — that
+    # cap (proposal × 1.08), recomputed at execution, supersedes the risk
+    # arbiter's stale pre-market max_entry_price (which was ~proposal×1.005
+    # and would block every real fill).
+    if fresh_ask is not None and fresh_ask > 0:
+        buf = _EXEC_OPT_CROSS_BUF if is_opt else _EXEC_STK_CROSS_BUF
+        marketable = fresh_ask * buf
+        bounds = [marketable] + ([runaway_cap] if runaway_cap else [])
+        place_price = round(min(bounds), 2)
+        log.info("[execute_paper_order] %s marketable limit %.2f (fresh_ask=%.2f, proposal=%.2f)",
+                 moomoo_symbol, place_price, fresh_ask, proposal_entry)
+    else:
+        # Degraded: no live quote. Fall back to the prior stale-but-capped
+        # behavior so we don't silently drop the trade.
+        max_price = float(risk.get("max_entry_price") or proposal_entry * 1.005)
+        place_price = round(min(proposal_entry, max_price), 2)
+        log.warning("[execute_paper_order] %s no fresh quote — stale fallback limit %.2f",
+                    moomoo_symbol, place_price)
 
     try:
         from trading_agent.mcp_servers.moomoo.server import place_paper_option_order

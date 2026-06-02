@@ -1,10 +1,17 @@
 [Unit]
-Description=trading-agent premarket scan @ 12:30 UTC weekdays
+Description=trading-agent scan @ 12:30 (premarket digest) + 13:35 UTC (open, executes)
 Requires=trading-agent-brain@premarket_scan.service
 
 [Timer]
-# US premarket: 8:30 ET (winter) / 7:30 ET (summer DST). UTC 12:30.
+# Two fires per weekday, both run the premarket_scan graph:
+#   12:30 UTC — pre-open. Ranks + sends the digest, but the dispatch
+#               regular-hours gate skips trading (digest-only awareness).
+#   13:35 UTC — 5 min after the 13:30 open. Ranks on LIVE regular-hours
+#               quotes and DISPATCHES candidate_entry → trades execute
+#               against real prices (not the pre-market spike). 6/2 SNOW
+#               incident fix.
 OnCalendar=Mon..Fri *-*-* 12:30:00 UTC
+OnCalendar=Mon..Fri *-*-* 13:35:00 UTC
 Persistent=true
 Unit=trading-agent-brain@premarket_scan.service
 

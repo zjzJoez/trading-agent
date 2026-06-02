@@ -561,6 +561,20 @@ def _dispatch_candidate_entry_if_eligible(
              payload={"reason": "regime_blocks_new_entries", "regime_label": regime.get("label")})
         return
 
+    # Regular-hours gate. The 12:30 UTC premarket scan runs an hour before
+    # the 13:30 open — dispatching/executing then buys pre-market spikes at
+    # unreliable quotes (6/2 SNOW: bought ~$273 pre-market, faded to $256 at
+    # open). When the market is closed the scan still ranks + sends its
+    # digest (awareness), but does NOT dispatch. The 13:35 UTC scan runs in
+    # regular hours and is the one that actually trades.
+    from trading_agent.market_calendar import is_us_market_open
+    if not is_us_market_open():
+        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+             event_type="candidate_entry_skipped",
+             payload={"reason": "outside_regular_hours",
+                      "note": "digest-only; dispatch deferred to the open scan"})
+        return
+
     # ---- Remaining position budget (R2 cap) ----
     # Don't dispatch more than (MAX_CONCURRENT_OPENS - currently_open) so we
     # never spend the full research+council LLM pipeline on a candidate that
