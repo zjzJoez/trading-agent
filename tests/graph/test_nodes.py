@@ -1040,14 +1040,24 @@ class TestRankCandidates:
             },
             regime={},
         )
+        # CRITICAL: patch notify.send. Without this, the fallback path's
+        # scout_llm_degraded ntfy call hits real ntfy.sh during every CI
+        # run (and the pre-deploy pytest gate). User got buzzed at 17:49
+        # local on 6/2 from this exact test before the patch was added.
         with _patch_all_emits():
-            with patch("trading_agent.llm.get_router") as mock_router:
-                mock_router.return_value.call.side_effect = RuntimeError("quota exceeded")
-                from trading_agent.graph.nodes.premarket_nodes import rank_candidates
-                result = rank_candidates(state)
+            with patch("trading_agent.notify.send") as mock_ntfy:
+                with patch("trading_agent.llm.get_router") as mock_router:
+                    mock_router.return_value.call.side_effect = RuntimeError("quota exceeded")
+                    from trading_agent.graph.nodes.premarket_nodes import rank_candidates
+                    result = rank_candidates(state)
         # Fallback: sorted by abs change_pct, AAPL (5%) beats NVDA (1%)
         assert len(result["candidates"]) > 0
         assert result["candidates"][0]["ticker"] == "AAPL"
+        # The new loud-alert behavior should fire exactly once
+        mock_ntfy.assert_called_once()
+        # And the title should mention scout degradation
+        call_kwargs = mock_ntfy.call_args.kwargs
+        assert "Scout" in call_kwargs.get("title", "")
 
 
 class TestNtfyScanDigest:
