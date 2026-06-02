@@ -490,8 +490,8 @@ class TestDetectExitTriggers:
 
     def test_no_plan_holds_and_warns(self):
         """Position with no exit_plan AND no legacy stop/target → HOLD,
-        plus a sev-1 event so ops can clean it up (likely a manual fill
-        or a phantom row)."""
+        plus a sev-1 event so ops can clean it up (likely a manual fill).
+        First detection in the day fires; subsequent ticks dedup."""
         pos = self._make_pos()
         state = _base_state(
             trigger="intraday_monitor",
@@ -499,8 +499,6 @@ class TestDetectExitTriggers:
             regime={"label": "RANGE_LOW_VOL", "confidence": 0.9, "gate": {}},
         )
         captured: list[dict] = []
-        # Don't patch the local emit so we can see what was emitted from
-        # within detect_exit_triggers specifically.
         with patch(
             "trading_agent.graph.nodes.intraday_nodes.emit",
             side_effect=lambda **kw: captured.append(kw),
@@ -514,18 +512,63 @@ class TestDetectExitTriggers:
                     }
                 },
             ):
+                # Patch the dedup helper to return False (no prior alert today)
+                # so the first-detection branch fires.
                 with patch(
-                    "trading_agent.mcp_servers.moomoo.server.get_quote",
-                    return_value={"rows": []},
+                    "trading_agent.graph.nodes.intraday_nodes._no_plan_alerted_today",
+                    return_value=False,
                 ):
-                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
-                    result = detect_exit_triggers(state)
+                    with patch(
+                        "trading_agent.mcp_servers.moomoo.server.get_quote",
+                        return_value={"rows": []},
+                    ):
+                        from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
+                        result = detect_exit_triggers(state)
         decisions = result["journal"]["exit_decisions"]
         assert decisions[0]["action"] == "HOLD"
-        assert decisions[0]["reason"] == "no_exit_plan_and_no_legacy_stop_target"
+        assert "no_exit_plan" in decisions[0]["reason"]
         no_plan_events = [e for e in captured if e.get("event_type") == "position_no_exit_plan"]
         assert len(no_plan_events) == 1
         assert no_plan_events[0]["severity"] == 1
+        # New: should mention manual trade interpretation
+        assert "manual" in no_plan_events[0]["payload"].get("interpretation", "")
+
+    def test_no_plan_suppressed_when_already_alerted_today(self):
+        """Per-symbol per-day dedup: if we already alerted today, the
+        decision still happens (HOLD) but no new sev-1 event fires."""
+        pos = self._make_pos()
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=[pos],
+            regime={"label": "RANGE_LOW_VOL", "confidence": 0.9, "gate": {}},
+        )
+        captured: list[dict] = []
+        with patch(
+            "trading_agent.graph.nodes.intraday_nodes.emit",
+            side_effect=lambda **kw: captured.append(kw),
+        ):
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value={
+                    "US.SPY260817C00700000": {
+                        "trade_id": 3, "thesis_id": 4,
+                        "stop": None, "target": None, "exit_plan": None,
+                    }
+                },
+            ):
+                # Dedup says: already alerted today → suppress
+                with patch(
+                    "trading_agent.graph.nodes.intraday_nodes._no_plan_alerted_today",
+                    return_value=True,
+                ):
+                    with patch(
+                        "trading_agent.mcp_servers.moomoo.server.get_quote",
+                        return_value={"rows": []},
+                    ):
+                        from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
+                        detect_exit_triggers(state)
+        no_plan_events = [e for e in captured if e.get("event_type") == "position_no_exit_plan"]
+        assert no_plan_events == [], "second alert in same day should suppress"
 
     def test_partial_exit_on_qty_1_demoted_to_hold(self):
         """Regression: 5/12 NVDA EXIT_CAUTIOUS-but-actually-closed-100%

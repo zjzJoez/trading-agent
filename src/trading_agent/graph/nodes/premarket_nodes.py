@@ -204,6 +204,12 @@ def rank_candidates(state: TradingGraphState) -> dict:
 
     Output is a ranked list of candidates stored in state["candidates"].
     If the LLM fails, falls back to top-3 by absolute change_pct.
+
+    Fallback is intentionally LOUD: 5/22-6/1 incident showed Haiku
+    intermittently returning empty / list-wrapped output, triggering
+    silent fallback to score=0.5 (below DISPATCH_MIN_SCORE 0.55) — so
+    8 of 9 trading days dispatched 0 candidates with 0 alerts. Now
+    every fallback emits sev=2 + ntfy "scout LLM degraded".
     """
     run_id = state["run_id"]
     trigger = state["trigger"]
@@ -218,6 +224,8 @@ def rank_candidates(state: TradingGraphState) -> dict:
 
     prompt = _build_scout_prompt(watchlist, market_data, regime)
     candidates: list[dict] = []
+    failure_mode: str | None = None
+    llm_exception: str | None = None
 
     try:
         from trading_agent.llm import get_router
@@ -234,10 +242,16 @@ def rank_candidates(state: TradingGraphState) -> dict:
             ]
             skipped = [s.ticker for s in (parsed.skipped or [])]
             log.info("[rank_candidates] top candidates: %s", [c["ticker"] for c in candidates[:3]])
+        elif parsed is None:
+            failure_mode = "schema_parse_failed"
+            log.warning("[rank_candidates] scout returned malformed output, parsed=None")
         else:
-            log.warning("[rank_candidates] no candidates returned — falling back")
+            failure_mode = "empty_candidates"
+            log.warning("[rank_candidates] scout returned empty candidates list")
     except Exception as e:
-        log.warning("[rank_candidates] scout LLM failed: %s — using change_pct fallback", e)
+        failure_mode = "llm_exception"
+        llm_exception = str(e)[:200]
+        log.warning("[rank_candidates] scout LLM raised: %s", e)
 
     # Fallback: rank by |change_pct| if LLM gave nothing
     if not candidates:
@@ -250,6 +264,40 @@ def rank_candidates(state: TradingGraphState) -> dict:
             {"ticker": t, "score": 0.5, "reason": "fallback_by_abs_change_pct"}
             for t in ranked_tickers[:3]
         ]
+        # Loud alert — silent degradation is exactly what caused the
+        # 5/22 → 6/1 0-trades-for-11-days incident. We want a phone ping
+        # on every degraded run so the operator knows the system is
+        # effectively offline for new entries.
+        emit(
+            run_id=run_id, trigger=trigger, agent="rank_candidates",
+            event_type="scout_llm_degraded",
+            severity=2,
+            payload={
+                "failure_mode": failure_mode or "unknown",
+                "llm_exception": llm_exception,
+                "n_watchlist": len(watchlist),
+                "fallback_top": [c["ticker"] for c in candidates[:3]],
+            },
+        )
+        try:
+            from trading_agent.notify import send as ntfy_send
+            ntfy_send(
+                topic="ops",
+                title="Scout LLM degraded — premarket dispatch will likely skip",
+                body=(
+                    f"failure_mode: {failure_mode or 'unknown'}\n"
+                    f"falling back to abs(change_pct) ranking with score=0.5\n"
+                    f"DISPATCH_MIN_SCORE is 0.55 → fallback candidates "
+                    f"will be SKIPPED.\n"
+                    f"Top fallback: {[c['ticker'] for c in candidates[:3]]}\n"
+                    f"Investigate: tail /var/log/trading-agent-brain.err | "
+                    f"grep scout"
+                ),
+                priority=4,
+                tags=["warning", "robot"],
+            )
+        except Exception as e:
+            log.warning("[rank_candidates] degraded-alert ntfy failed: %s", e)
 
     # Persist per-ticker scout scores into watchlist_members so the
     # daily refresh's eviction logic can see scout-flat tickers and

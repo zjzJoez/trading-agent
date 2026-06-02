@@ -36,6 +36,33 @@ def _bare_ticker(code: str) -> str:
     return m.group(1) if m else s
 
 
+def _no_plan_alerted_today(symbol: str) -> bool:
+    """True iff we already fired position_no_exit_plan for this symbol today.
+
+    Per-symbol per-day dedup — without this, every 15-min intraday tick
+    spams the same alert for a persistent manual position (6/1 incident:
+    22 events on one QQQ contract before operator noticed).
+    """
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM agent_events
+                WHERE event_type = 'position_no_exit_plan'
+                  AND ts > DATE_TRUNC('day', NOW())
+                  AND payload->>'symbol' = %s
+                LIMIT 1
+                """,
+                (symbol,),
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        # On DB error, default to "yes we alerted" so we don't spam
+        # if the DB is degraded.
+        return True
+
+
 def _is_option_code(code: str) -> bool:
     import re
     return bool(re.search(r"\d{6,8}[CP]\d+$", code or ""))
@@ -311,21 +338,36 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
             fallback_target=pos.get("target"),
         )
         if plan is None:
-            # No plan, no stop, no target — we cannot evaluate. Default HOLD,
-            # but emit a sev-1 event because this position is unmonitored.
+            # No plan, no stop, no target. This is almost always a MANUAL
+            # trade: the user placed the order directly on moomoo, bypassing
+            # the system, so no journal_trades row exists.
+            #
+            # Behavior:
+            #   1. Default HOLD on this tick (we cannot evaluate — no rules).
+            #   2. Emit sev-1 event once per (symbol, day) so the dashboard
+            #      sees it but every 15-min tick doesn't spam (6/1 incident:
+            #      22 events on one position in one day).
+            #
+            # The user is responsible for managing manual positions.
             no_plan_count += 1
             decisions.append({
                 "symbol": symbol,
                 "action": "HOLD",
                 "exit_qty_factor": 0.0,
-                "reason": "no_exit_plan_and_no_legacy_stop_target",
+                "reason": "no_exit_plan_and_no_legacy_stop_target_manual_trade",
             })
-            emit(
-                run_id=run_id, trigger=trigger, agent="detect_exit_triggers",
-                event_type="position_no_exit_plan",
-                severity=1,
-                payload={"symbol": symbol},
-            )
+            if not _no_plan_alerted_today(symbol):
+                emit(
+                    run_id=run_id, trigger=trigger, agent="detect_exit_triggers",
+                    event_type="position_no_exit_plan",
+                    severity=1,
+                    payload={
+                        "symbol": symbol,
+                        "interpretation": "likely_manual_trade_not_in_journal",
+                        "action_required": "either close on broker or add "
+                                           "journal_trades row with exit_plan",
+                    },
+                )
             hold_count += 1
             continue
 

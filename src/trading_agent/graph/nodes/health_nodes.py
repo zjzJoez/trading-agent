@@ -393,6 +393,133 @@ def failed_units_check(state: TradingGraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 2d: trade_engine_silence_check
+# ---------------------------------------------------------------------------
+
+# If premarket has not dispatched ANY candidate_entry in this many days,
+# the trade engine is functionally offline. 5/22 → 6/1 incident: scout
+# LLM degraded silently for 11 days, 0 dispatches, 0 alerts until
+# operator asked. Threshold of 4 = "missed at least one trading week"
+# (Mon-Fri = 5 trading days, so 4 catches a Mon→Thu silence).
+TRADE_ENGINE_SILENCE_ALERT_DAYS = 4
+# Cooldown so we don't ntfy every hour for the same persistent silence.
+SILENCE_ALERT_COOLDOWN_HOURS = 12
+
+
+def _was_silence_alerted_recently() -> bool:
+    """True iff we've already alerted on trade_engine_silence in cooldown."""
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM agent_events
+                WHERE event_type = 'trade_engine_silence_detected'
+                  AND ts > NOW() - (%s::text || ' hours')::interval
+                LIMIT 1
+                """,
+                (str(SILENCE_ALERT_COOLDOWN_HOURS),),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        log.warning("[silence_check] cooldown query failed: %s", e)
+        return False
+
+
+def trade_engine_silence_check(state: TradingGraphState) -> dict:
+    """Alert if no candidate_entry has dispatched in the last N days.
+
+    Failure mode this catches: scout LLM degrades silently → fallback
+    score 0.5 → DISPATCH_MIN_SCORE 0.55 skips everything → trade engine
+    functionally offline → operator never knows.
+
+    Looks at agent_events for the most recent `candidate_entry_dispatched`
+    event. If older than TRADE_ENGINE_SILENCE_ALERT_DAYS, emits sev=2
+    + ntfy (rate-limited to one alert per SILENCE_ALERT_COOLDOWN_HOURS).
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[health/trade_engine_silence_check] run_id=%s", run_id)
+
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT ts, EXTRACT(EPOCH FROM (NOW() - ts)) / 86400 AS days_ago
+                FROM agent_events
+                WHERE event_type = 'candidate_entry_dispatched'
+                ORDER BY ts DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        log.warning("[silence_check] query failed: %s", e)
+        return {}
+
+    if row is None:
+        days_ago = None
+        last_ts_str = "never"
+    else:
+        last_ts, days_ago = row
+        last_ts_str = last_ts.isoformat() if last_ts else "unknown"
+        days_ago = float(days_ago) if days_ago is not None else None
+
+    is_silent = days_ago is None or days_ago > TRADE_ENGINE_SILENCE_ALERT_DAYS
+    if not is_silent:
+        emit(
+            run_id=run_id, trigger=trigger, agent="trade_engine_silence_check",
+            event_type="trade_engine_active",
+            payload={"last_dispatch": last_ts_str, "days_ago": days_ago},
+        )
+        return {}
+
+    if _was_silence_alerted_recently():
+        log.info("[silence_check] silence persists but ntfy in cooldown")
+        emit(
+            run_id=run_id, trigger=trigger, agent="trade_engine_silence_check",
+            event_type="trade_engine_silence_detected",
+            severity=SEV_ERROR,
+            payload={
+                "last_dispatch": last_ts_str,
+                "days_ago": round(days_ago, 1) if days_ago else None,
+                "threshold_days": TRADE_ENGINE_SILENCE_ALERT_DAYS,
+                "ntfy_suppressed": True,
+            },
+        )
+        return {}
+
+    emit(
+        run_id=run_id, trigger=trigger, agent="trade_engine_silence_check",
+        event_type="trade_engine_silence_detected",
+        severity=SEV_ERROR,
+        payload={
+            "last_dispatch": last_ts_str,
+            "days_ago": round(days_ago, 1) if days_ago else None,
+            "threshold_days": TRADE_ENGINE_SILENCE_ALERT_DAYS,
+            "ntfy_suppressed": False,
+        },
+    )
+
+    days_str = f"{days_ago:.1f}" if days_ago is not None else "∞ (never)"
+    _alert_ops(
+        title=f"Trade engine silent for {days_str} days",
+        body=(
+            f"No candidate_entry dispatch since {last_ts_str}.\n\n"
+            f"Likely cause: scout LLM degraded → fallback score 0.5 → "
+            f"all candidates SKIPPED by DISPATCH_MIN_SCORE 0.55.\n\n"
+            f"Investigate:\n"
+            f"  grep 'scout' /var/log/trading-agent-brain.err | tail\n"
+            f"  curl localhost:8002/api/ops/summary\n\n"
+            f"Next alert suppressed for "
+            f"{SILENCE_ALERT_COOLDOWN_HOURS}h."
+        ),
+    )
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Node 3: ntfy_health
 # ---------------------------------------------------------------------------
 
