@@ -395,6 +395,67 @@ class TestRefreshQuotesAndGreeks:
         assert result == {}
 
 
+class TestSyncFillStatus:
+    """Sync stale journal SUBMITTED → real broker fill state (6/2 IBM/SNOW)."""
+
+    def _pg(self, open_rows):
+        cur = MagicMock()
+        cur.__enter__ = lambda s: cur
+        cur.__exit__ = MagicMock(return_value=False)
+        cur.fetchall.return_value = open_rows
+        cur.execute = MagicMock()
+        return cur
+
+    def test_filled_order_syncs_entry_price(self):
+        # journal has trade #7 OPEN, broker_order_id 3112455
+        pg = self._pg([(7, "US.SNOW260717C270000", "3112455", 33.80)])
+        with _patch_all_emits():
+            with patch("trading_agent.store.postgres.cursor", return_value=pg):
+                with patch("trading_agent.mcp_servers.moomoo.server.get_orders",
+                           return_value={"rows": [{"order_id": "3112455",
+                                                   "order_status": "FILLED_ALL",
+                                                   "dealt_qty": 2, "dealt_avg_price": 33.55}]}):
+                    from trading_agent.graph.nodes.intraday_nodes import sync_fill_status
+                    sync_fill_status(_base_state(trigger="intraday_monitor"))
+        executes = [c.args[0] for c in pg.execute.call_args_list if c.args]
+        assert any("UPDATE journal_trades" in q and "entry_price" in q for q in executes)
+
+    def test_cancelled_order_marks_unfilled(self):
+        pg = self._pg([(5, "US.NVDA", "3112342", 224.36)])
+        with _patch_all_emits():
+            with patch("trading_agent.store.postgres.cursor", return_value=pg):
+                with patch("trading_agent.mcp_servers.moomoo.server.get_orders",
+                           return_value={"rows": [{"order_id": "3112342",
+                                                   "order_status": "CANCELLED_ALL"}]}):
+                    from trading_agent.graph.nodes.intraday_nodes import sync_fill_status
+                    sync_fill_status(_base_state(trigger="intraday_monitor"))
+        executes = [c.args[0] for c in pg.execute.call_args_list if c.args]
+        assert any("'UNFILLED'" in q for q in executes)
+
+    def test_pending_order_left_alone(self):
+        pg = self._pg([(5, "US.NVDA", "3112342", 224.36)])
+        with _patch_all_emits():
+            with patch("trading_agent.store.postgres.cursor", return_value=pg):
+                with patch("trading_agent.mcp_servers.moomoo.server.get_orders",
+                           return_value={"rows": [{"order_id": "3112342",
+                                                   "order_status": "SUBMITTED"}]}):
+                    from trading_agent.graph.nodes.intraday_nodes import sync_fill_status
+                    sync_fill_status(_base_state(trigger="intraday_monitor"))
+        # Only the SELECT ran; no UPDATE for a still-pending order
+        executes = [c.args[0] for c in pg.execute.call_args_list if c.args]
+        assert not any("UPDATE journal_trades" in q for q in executes)
+
+    def test_broker_unreachable_skips_gracefully(self):
+        pg = self._pg([(5, "US.NVDA", "3112342", 224.36)])
+        with _patch_all_emits():
+            with patch("trading_agent.store.postgres.cursor", return_value=pg):
+                with patch("trading_agent.mcp_servers.moomoo.server.get_orders",
+                           side_effect=RuntimeError("OpenD timeout")):
+                    from trading_agent.graph.nodes.intraday_nodes import sync_fill_status
+                    result = sync_fill_status(_base_state(trigger="intraday_monitor"))
+        assert result == {}  # graceful no-op, never crashes the intraday loop
+
+
 class TestDetectExitTriggers:
     """Detect-exit-triggers now drives the deterministic hard executor.
 

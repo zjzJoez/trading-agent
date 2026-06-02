@@ -142,6 +142,7 @@ def build_intraday_monitor_graph():
     g.add_node("load_active_params", L.load_active_params_node)
     g.add_node("opend_health", H.opend_health)
     g.add_node("load_open_positions", T.load_open_positions)
+    g.add_node("sync_fill_status", IN.sync_fill_status)
     g.add_node("refresh_quotes_and_greeks", IN.refresh_quotes_and_greeks)
     g.add_node("update_excursions", EL.update_excursions_node)
     g.add_node("load_latest_regime", T.load_latest_regime)
@@ -152,7 +153,10 @@ def build_intraday_monitor_graph():
     g.add_edge(START, "load_active_params")
     g.add_edge("load_active_params", "opend_health")
     g.add_edge("opend_health", "load_open_positions")
-    g.add_edge("load_open_positions", "refresh_quotes_and_greeks")
+    # Sync real broker fill state into the journal BEFORE the exit executor
+    # reads it — so it manages real fills, not stale SUBMITTED placeholders.
+    g.add_edge("load_open_positions", "sync_fill_status")
+    g.add_edge("sync_fill_status", "refresh_quotes_and_greeks")
     g.add_edge("refresh_quotes_and_greeks", "update_excursions")
     g.add_edge("update_excursions", "load_latest_regime")
     g.add_edge("load_latest_regime", "active_risk_snapshot")

@@ -36,6 +36,135 @@ def _bare_ticker(code: str) -> str:
     return m.group(1) if m else s
 
 
+# ---------------------------------------------------------------------------
+# Node 0: sync_fill_status — reconcile journal entry-prices with broker fills
+# ---------------------------------------------------------------------------
+
+# Broker order statuses that mean "this order will never fill" → UNFILLED.
+_DEAD_ORDER_STATUSES = {"CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DELETED", "EXPIRED"}
+# Statuses that mean "filled" → sync the real avg fill price into the journal.
+_FILLED_ORDER_STATUSES = {"FILLED_ALL", "FILLED_PART"}
+
+
+def sync_fill_status(state: TradingGraphState) -> dict:
+    """Reconcile each OPEN journal_trade's fill state against the live broker.
+
+    The journal's broker_fill_json is stamped at PLACEMENT time (status
+    SUBMITTED, fill_qty 0). It is never updated when the order later fills.
+    6/2: IBM/SNOW showed SUBMITTED in the journal but were FILLED_ALL at the
+    broker. Without this sync, (a) the journal misreports entry prices, and
+    (b) reconcile_phantom_trades would WRONGLY void these real positions
+    after 24h (it keys off the stale fill_qty=0).
+
+    For each OPEN trade with a broker_order_id, look up the live order:
+      * FILLED_*  → set entry_price = real dealt_avg_price, stamp
+                    broker_fill_json {status, fill_qty, avg_fill_price}.
+      * dead      → outcome='UNFILLED', closed_at=NOW.
+      * pending   → leave (phantom-reconcile handles the truly-stuck after 24h).
+
+    Best-effort: any broker/DB error skips the sync for this tick.
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[intraday/sync_fill_status] run_id=%s", run_id)
+
+    try:
+        from trading_agent.store.postgres import cursor
+    except Exception as e:
+        log.warning("[sync_fill_status] postgres import failed: %s", e)
+        return {}
+
+    # 1. OPEN journal trades that have a broker order id
+    try:
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, symbol, broker_order_id, entry_price
+                FROM journal_trades
+                WHERE outcome = 'OPEN' AND broker_order_id IS NOT NULL
+                  AND broker_order_id <> ''
+                """,
+            )
+            open_trades = cur.fetchall()
+    except Exception as e:
+        log.warning("[sync_fill_status] open-trades read failed: %s", e)
+        return {}
+    if not open_trades:
+        return {}
+
+    # 2. Live broker order map: order_id → (status, dealt_qty, dealt_avg_price)
+    order_map: dict[str, dict] = {}
+    try:
+        from trading_agent.mcp_servers.moomoo.server import get_orders
+        for r in (get_orders().get("rows") or []):
+            oid = str(r.get("order_id") or r.get("orderID") or "").strip()
+            if oid:
+                order_map[oid] = r
+    except Exception as e:
+        log.warning("[sync_fill_status] broker get_orders failed: %s — skip tick", e)
+        return {}
+
+    synced_filled = 0
+    marked_unfilled = 0
+    for trade_id, symbol, broker_order_id, entry_price in open_trades:
+        order = order_map.get(str(broker_order_id))
+        if not order:
+            continue
+        status = str(order.get("order_status") or order.get("order_status_str") or "").upper()
+        if status in _FILLED_ORDER_STATUSES:
+            avg = order.get("dealt_avg_price") or order.get("dealt_avg_px")
+            filled_qty = order.get("dealt_qty") or order.get("qty")
+            try:
+                avg_f = float(avg) if avg else None
+            except (TypeError, ValueError):
+                avg_f = None
+            try:
+                with cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE journal_trades
+                        SET entry_price = COALESCE(%s, entry_price),
+                            broker_fill_json = COALESCE(broker_fill_json, '{}'::jsonb)
+                              || jsonb_build_object(
+                                   'status', %s,
+                                   'fill_qty', %s,
+                                   'avg_fill_price', %s,
+                                   'fill_synced_at', NOW()::text)
+                        WHERE id = %s AND outcome = 'OPEN'
+                        """,
+                        (avg_f, status, filled_qty, avg_f, int(trade_id)),
+                    )
+                synced_filled += 1
+            except Exception as e:
+                log.warning("[sync_fill_status] fill update id=%s failed: %s", trade_id, e)
+        elif status in _DEAD_ORDER_STATUSES:
+            try:
+                with cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE journal_trades
+                        SET outcome = 'UNFILLED', closed_at = NOW(),
+                            close_reason = COALESCE(close_reason,
+                                'sync_fill_status: broker order ' || %s)
+                        WHERE id = %s AND outcome = 'OPEN'
+                        """,
+                        (status, int(trade_id)),
+                    )
+                marked_unfilled += 1
+            except Exception as e:
+                log.warning("[sync_fill_status] unfilled update id=%s failed: %s", trade_id, e)
+
+    if synced_filled or marked_unfilled:
+        emit(
+            run_id=run_id, trigger=trigger, agent="sync_fill_status",
+            event_type="fill_status_synced",
+            payload={"filled": synced_filled, "unfilled": marked_unfilled,
+                     "n_open_checked": len(open_trades)},
+        )
+        log.info("[sync_fill_status] filled=%d unfilled=%d", synced_filled, marked_unfilled)
+    return {}
+
+
 def _no_plan_alerted_today(symbol: str) -> bool:
     """True iff we already fired position_no_exit_plan for this symbol today.
 
