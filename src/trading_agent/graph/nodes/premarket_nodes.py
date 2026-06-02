@@ -141,6 +141,7 @@ def collect_watchlist_data(state: TradingGraphState) -> dict:
             quote_data[ticker]["tier"] = d.get("tier")
             quote_data[ticker]["hot_today"] = bool(d.get("hot_today"))
             quote_data[ticker]["avg_volume_3m"] = d.get("avg_volume_3m")
+            quote_data[ticker]["momentum_50d"] = d.get("momentum_50d")
 
     # Also grab one recent EDGAR filing per ticker (best-effort, sequential)
     for ticker in watchlist[:6]:  # limit to top 6 to avoid rate-limit
@@ -191,9 +192,13 @@ def _build_scout_prompt(
         rvol_str = ""
         if avg_vol and avg_vol > 0 and vol:
             rvol_str = f" rvol={vol / avg_vol:.1f}x"
+        # Medium-term momentum (price vs 50-day MA) — the multi-day "trending
+        # up on a narrative" signal, distinct from rvol (today's activity).
+        mom = q.get("momentum_50d")
+        mom_str = f" mom50d={mom:+.0%}" if mom is not None else ""
         filing = q.get("recent_filing", "")
         filing_str = f" | {filing}" if filing else ""
-        return f"  {ticker}: last={last:.2f} chg={chg:+.2%} vol={vol:.0f}{rvol_str}{filing_str}"
+        return f"  {ticker}: last={last:.2f} chg={chg:+.2%} vol={vol:.0f}{rvol_str}{mom_str}{filing_str}"
 
     # Partition the watchlist into HOT TODAY (操作员's自选 names that are
     # ALSO in today's yfinance top-movers) vs the rest. The hot set is the
@@ -233,6 +238,13 @@ def _build_scout_prompt(
         f"    rvol≈1.0x is trading NORMALLY — that is NOT a signal. Do not rank a ",
         f"    name highly just because its absolute volume is large; NVDA always ",
         f"    has huge absolute volume. rvol ≥ 1.5x is what flags genuine activity.",
+        f"  • mom50d = price vs 50-day average = the multi-day NARRATIVE trend. ",
+        f"    The best setups combine BOTH: rvol ≥ 1.5x (active today) AND ",
+        f"    mom50d strongly positive (riding a weeks-long uptrend). A name ",
+        f"    that is +30% over its 50-day MA on rising rvol is a hot narrative ",
+        f"    leader — exactly what this aggressive options strategy wants. ",
+        f"    High rvol with FLAT mom50d is a one-day spike (weaker); strong ",
+        f"    mom50d with low rvol is a quiet trend (wait for the volume).",
         f"  • Single-name catalysts (8-K/Form-4 filings, earnings ≤2wk, news gaps, ",
         f"    sector-rotation leaders) rank above generic large-caps.",
         f"  • Broad ETFs (SPY/QQQ/IWM): score ≤ 0.5 unless there is an EXPLICIT ",

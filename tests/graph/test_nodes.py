@@ -1042,6 +1042,21 @@ class TestScoutPromptDeBias:
         assert "absolute" in prompt.lower()
         assert "rvol" in prompt.lower()
 
+    def test_mom50d_column_present(self):
+        """Multi-day momentum (price vs 50d MA) surfaces — the narrative-trend
+        signal the operator wanted beyond rvol (task 58)."""
+        from trading_agent.graph.nodes.premarket_nodes import _build_scout_prompt
+        market_data = {
+            "ARM": {"last": 160.0, "change_pct": 0.0, "volume": 8e7,
+                    "avg_volume_3m": 4e7, "momentum_50d": 0.32, "hot_today": True},
+            "AAPL": {"last": 200.0, "change_pct": 0.0, "volume": 5e7,
+                     "avg_volume_3m": 5e7, "momentum_50d": -0.03},
+        }
+        prompt = _build_scout_prompt(["ARM", "AAPL"], market_data, {"label": "RANGE_LOW_VOL"})
+        assert "mom50d=+32%" in prompt   # ARM trending up
+        assert "mom50d=-3%" in prompt    # AAPL flat/down
+        assert "narrative" in prompt.lower()
+
     def test_no_hot_today_still_builds(self):
         from trading_agent.graph.nodes.premarket_nodes import _build_scout_prompt
         market_data = {"AAPL": {"last": 200.0, "change_pct": 0.0, "volume": 5e7}}

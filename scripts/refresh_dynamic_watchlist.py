@@ -96,6 +96,10 @@ class Candidate:
     avg_volume_3m: float = 0.0
     change_pct: float = 0.0
     last_price: float = 0.0
+    # Medium-term momentum = (last / 50-day MA − 1). >0 = trending up over
+    # weeks (the "narrative momentum" signal the operator wanted beyond
+    # today's rvol). None when the 50d MA isn't available.
+    momentum_50d: float | None = None
     is_us_common: bool = True
     raw: dict = field(default_factory=dict)
 
@@ -115,6 +119,7 @@ class Candidate:
             "change_pct": self.change_pct,
             "last_price": self.last_price,
             "add_score": self.add_score,
+            "momentum_50d": self.momentum_50d,
             # hot_today = in操作员's自选 AND in today's yfinance top-N movers.
             # Set in refresh() via raw["hot_today"]; the scout prioritizes these.
             "hot_today": bool(self.raw.get("hot_today", False)),
@@ -159,6 +164,9 @@ def _fetch_yfinance_screener(scr_id: str, source_label: str, tier: str,
         if qt and qt not in ("EQUITY", "ETF"):
             # No mutual funds, options, futures.
             continue
+        _lp = float(q.get("regularMarketPrice") or 0)
+        _fifty = float(q.get("fiftyDayAverage") or 0)
+        _mom = (_lp / _fifty - 1.0) if (_fifty > 0 and _lp > 0) else None
         out.append(Candidate(
             ticker=sym,
             source=source_label,
@@ -167,7 +175,8 @@ def _fetch_yfinance_screener(scr_id: str, source_label: str, tier: str,
             avg_volume_3m=float(q.get("averageDailyVolume3Month") or
                                  q.get("regularMarketVolume") or 0),
             change_pct=float(q.get("regularMarketChangePercent") or 0),
-            last_price=float(q.get("regularMarketPrice") or 0),
+            last_price=_lp,
+            momentum_50d=_mom,
             is_us_common=(qt == "EQUITY"),
             raw=q,
         ))
@@ -356,6 +365,10 @@ def _enrich_with_quote_stats(cands: list[Candidate]) -> list[Candidate]:
                                      info.get("averageVolume10days") or 0)
             c.last_price = float(info.get("regularMarketPrice") or
                                   info.get("currentPrice") or 0)
+            # Medium-term momentum = price vs 50-day MA (trend strength).
+            fifty = float(info.get("fiftyDayAverage") or 0)
+            if fifty > 0 and c.last_price > 0:
+                c.momentum_50d = c.last_price / fifty - 1.0
             qt = (info.get("quoteType") or "").upper()
             c.is_us_common = qt == "EQUITY"
             if c.market_cap > 0 or c.avg_volume_3m > 0:
@@ -764,7 +777,8 @@ def get_active_watchlist_detailed() -> list[dict]:
                 """
                 SELECT ticker, tier,
                        COALESCE((metadata->>'hot_today')::boolean, FALSE) AS hot_today,
-                       (metadata->>'avg_volume_3m')::float AS avg_vol_3m
+                       (metadata->>'avg_volume_3m')::float AS avg_vol_3m,
+                       (metadata->>'momentum_50d')::float AS mom_50d
                   FROM watchlist_members
                  WHERE eligible = TRUE
                  ORDER BY
@@ -773,10 +787,11 @@ def get_active_watchlist_detailed() -> list[dict]:
                    last_seen_at DESC
                 """
             )
-            for ticker, tier, hot, avg_vol in cur.fetchall():
+            for ticker, tier, hot, avg_vol, mom in cur.fetchall():
                 out.append({
                     "ticker": ticker, "tier": tier, "hot_today": bool(hot),
                     "avg_volume_3m": float(avg_vol) if avg_vol is not None else None,
+                    "momentum_50d": float(mom) if mom is not None else None,
                 })
     except Exception as e:
         log.warning("get_active_watchlist_detailed DB read failed: %s", e)
