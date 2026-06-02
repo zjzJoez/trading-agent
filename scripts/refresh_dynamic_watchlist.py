@@ -55,23 +55,30 @@ from typing import Any
 log = logging.getLogger("refresh_dynamic_watchlist")
 
 # Tunables (env-overridable)
-WATCHLIST_MAX = int(os.environ.get("WATCHLIST_MAX", "40"))
+WATCHLIST_MAX = int(os.environ.get("WATCHLIST_MAX", "100"))                      # hard ceiling (core can be large)
+ROTATING_MAX = int(os.environ.get("WATCHLIST_ROTATING_MAX", "10"))              # today's yfinance hot picks
 MIN_MARKET_CAP = float(os.environ.get("WATCHLIST_MIN_MCAP", "2000000000"))      # $2B
 MIN_AVG_VOLUME = float(os.environ.get("WATCHLIST_MIN_AVGVOL", "1000000"))       # 1M shares
 EVICT_AGE_DAYS = int(os.environ.get("WATCHLIST_EVICT_AGE_DAYS", "14"))
 EVICT_PROPOSAL_DAYS = int(os.environ.get("WATCHLIST_EVICT_PROPOSAL_DAYS", "30"))
 EVICT_SCOUT_THRESHOLD = float(os.environ.get("WATCHLIST_EVICT_SCOUT_THRESHOLD", "0.4"))
 
-# moomoo CUSTOM groups to ingest. Group name -> tier assignment.
-# Mag-7 → core, sector / commodity groups → rotating.
-MOOMOO_GROUPS = {
-    "MGGA7":  "core",      # User-curated Mag-7
-    "芯片":   "rotating",  # Semiconductors (~17 names)
-    "指数":   "core",      # Broad indices (overlaps with seed; idempotent)
-    "商品":   "rotating",  # Commodity stocks (most are futures, filtered out by stock-type check)
-}
+# Watchlist composition (redesigned 2026-06-02 per operator request):
+#   CORE     = EVERY US stock/ETF in ANY of the operator's moomoo custom
+#              watchlist groups (自选). Never evicted. This is the operator's
+#              curated universe — they decide what's worth watching.
+#   ROTATING = the top-N hottest names from yfinance screeners each day
+#              (merged day_gainers + day_losers + most_actives, ranked by
+#              liquidity-weighted move). Refreshed daily; capped at
+#              ROTATING_MAX.
+#
+# HOT TODAY mark: a ticker that is in BOTH the operator's 自选 AND today's
+# yfinance top-N is flagged metadata.hot_today=true — "your name that is
+# moving today", the highest-priority signal for the scout. (Before this,
+# the scout only saw prior-day absolute volume pre-open and always locked
+# onto NVDA, the highest-volume mega-cap — the 6/2 NVDA-bias audit.)
 
-# yfinance screener IDs and their tier+source labels.
+# yfinance screener IDs merged into the daily top-N hot pool.
 SCREENERS = [
     ("day_gainers",  "rotating", "screener:day_gainers"),
     ("day_losers",   "rotating", "screener:day_losers"),
@@ -108,6 +115,9 @@ class Candidate:
             "change_pct": self.change_pct,
             "last_price": self.last_price,
             "add_score": self.add_score,
+            # hot_today = in操作员's自选 AND in today's yfinance top-N movers.
+            # Set in refresh() via raw["hot_today"]; the scout prioritizes these.
+            "hot_today": bool(self.raw.get("hot_today", False)),
             "captured_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -209,6 +219,90 @@ def _fetch_moomoo_group(group_name: str, tier: str) -> list[Candidate]:
         ))
     log.info("moomoo group '%s': %d candidates", group_name, len(out))
     return out
+
+
+def _fetch_all_moomoo_us_stocks() -> list[Candidate]:
+    """Pull EVERY US stock/ETF from ALL of the operator's moomoo CUSTOM groups.
+
+    This is the operator's curated universe (自选). Every name here becomes
+    tier='core' — never evicted, always presented to the scout. Replaces
+    the old hardcoded 4-group MOOMOO_GROUPS map (which crowded the
+    operator's semis/commodities out of the rotating slots).
+
+    Source label is moomoo:<first group the ticker was seen in>. Dedups
+    across groups. Non-US, non-stock/ETF (futures, indices, options, HK/CN)
+    are filtered out by the US. prefix + stock_type check.
+    """
+    out: list[Candidate] = []
+    seen: set[str] = set()
+    try:
+        from trading_agent.mcp_servers.moomoo.server import (
+            get_watchlist as moomoo_get_watchlist,
+            get_watchlist_groups as moomoo_get_groups,
+        )
+    except Exception as e:
+        log.warning("moomoo server not importable for自选 pull: %s", e)
+        return []
+    try:
+        groups = moomoo_get_groups("CUSTOM")
+    except Exception as e:
+        log.warning("get_watchlist_groups(CUSTOM) failed: %s", e)
+        return []
+    for g in (groups.get("rows") or []):
+        gn = g.get("group_name")
+        if not gn:
+            continue
+        try:
+            wl = moomoo_get_watchlist(group_name=gn)
+        except Exception as e:
+            log.warning("get_watchlist(%s) failed: %s", gn, e)
+            continue
+        n_us = 0
+        for r in (wl.get("rows") or []):
+            code = (r.get("code") or "").strip()
+            if not code.startswith("US."):
+                continue
+            bare = code.split(".", 1)[1]
+            if not bare or "." in bare:  # skip .VIX / .SPX pseudo-tickers
+                continue
+            st = (r.get("stock_type") or "").upper()
+            if st not in ("STOCK", "ETF"):  # no futures / indices / forex
+                continue
+            if r.get("delisting"):
+                continue
+            if bare in seen:
+                continue
+            seen.add(bare)
+            n_us += 1
+            out.append(Candidate(
+                ticker=bare,
+                source=f"moomoo:{gn}",
+                tier="core",  # ALL自选 names are core — never evicted
+                raw=r,
+            ))
+        log.info("moomoo自选 group '%s': %d US stock/etf", gn, n_us)
+    log.info("moomoo自选 total: %d unique US stock/etf → core", len(out))
+    return out
+
+
+def _select_yfinance_top_n(screener_cands: list[Candidate], n: int) -> list[Candidate]:
+    """From the merged screener candidates, pick the top-N hottest by
+    liquidity-weighted move (add_score = |chg_pct| × dollar_volume).
+
+    These become the daily ROTATING tier — "today's hot names". Capped at
+    n so the operator's curated 自选 (core) dominates the watchlist and the
+    rotating slots reflect only genuinely-moving liquid names.
+    """
+    # Dedup by ticker, keeping the highest-add_score instance.
+    by_ticker: dict[str, Candidate] = {}
+    for c in screener_cands:
+        ex = by_ticker.get(c.ticker)
+        if ex is None or c.add_score > ex.add_score:
+            by_ticker[c.ticker] = c
+    ranked = sorted(by_ticker.values(), key=lambda c: c.add_score, reverse=True)
+    top = ranked[:n]
+    log.info("yfinance top-%d hot: %s", n, [c.ticker for c in top])
+    return top
 
 
 def _enrich_with_quote_stats(cands: list[Candidate]) -> list[Candidate]:
@@ -367,15 +461,31 @@ def refresh(*, dry_run: bool = False) -> dict[str, Any]:
              sum(1 for r in current.values() if r["tier"] == "core"),
              sum(1 for r in current.values() if r["tier"] == "rotating"))
 
-    # Fetch all candidate sources
-    candidates: list[Candidate] = []
-    for group, tier in MOOMOO_GROUPS.items():
-        candidates += _fetch_moomoo_group(group, tier)
-    for scr_id, tier, label in SCREENERS:
-        candidates += _fetch_yfinance_screener(scr_id, label, tier)
+    # ---- Source 1: ALL moomoo自选 US stocks → core ----
+    core_cands = _fetch_all_moomoo_us_stocks()
+    core_tickers = {c.ticker for c in core_cands}
 
-    # Enrich moomoo-only candidates with yfinance stats
+    # ---- Source 2: yfinance top-N hot → rotating ----
+    screener_cands: list[Candidate] = []
+    for scr_id, tier, label in SCREENERS:
+        screener_cands += _fetch_yfinance_screener(scr_id, label, tier)
+    top_rotating = _select_yfinance_top_n(screener_cands, ROTATING_MAX)
+    top_rotating_tickers = {c.ticker for c in top_rotating}
+
+    # ---- HOT TODAY = 自选 ∩ today's top-N movers ----
+    # The operator's curated names that are ALSO moving today. The single
+    # highest-priority signal for the scout — "you like it AND it's active".
+    hot_today = core_tickers & top_rotating_tickers
+    log.info("HOT TODAY (自选 ∩ top-%d movers): %s", ROTATING_MAX, sorted(hot_today) or "(none)")
+
+    candidates = core_cands + top_rotating
+
+    # Enrich moomoo-only candidates with yfinance stats (market_cap, avg_vol)
     candidates = _enrich_with_quote_stats(candidates)
+
+    # Stamp hot_today onto each candidate's raw so to_metadata can pick it up.
+    for c in candidates:
+        c.raw["hot_today"] = c.ticker in hot_today
 
     # Deduplicate by ticker: prefer the higher-tier / earlier source.
     # core > rotating; among same tier, first-encountered wins.
@@ -470,7 +580,13 @@ def refresh(*, dry_run: bool = False) -> dict[str, Any]:
         elif p["action"] == "TOUCH" and p["tier_after"] != p["tier_before"]:
             projected_members[p["ticker"]]["tier"] = p["tier_after"]
 
-    if len(projected_members) > WATCHLIST_MAX:
+    # CAP enforcement: bound the ROTATING tier to ROTATING_MAX. Core (the
+    # operator's 自选) is NEVER capped — every自选 name stays. Only the
+    # daily yfinance hot picks compete for the rotating slots. This is the
+    # 6/2 redesign: the old WATCHLIST_MAX total-cap silently pruned the
+    # operator's curated semis/commodities; now their list is sacrosanct.
+    rotating_count = sum(1 for r in projected_members.values() if r.get("tier") == "rotating")
+    if rotating_count > ROTATING_MAX:
         # Compute add_score for everyone (existing rows use metadata.add_score if present, else 0)
         def _score(t: str) -> float:
             if t in accepted:
@@ -484,7 +600,7 @@ def refresh(*, dry_run: bool = False) -> dict[str, Any]:
             if r.get("tier") == "rotating" and t not in held
         ]
         rot_candidates.sort(key=_score)  # ascending — lowest scores evicted first
-        over_by = len(projected_members) - WATCHLIST_MAX
+        over_by = rotating_count - ROTATING_MAX
         for t in rot_candidates[:over_by]:
             # If we were about to ADD this ticker, drop the ADD instead of inserting + evicting.
             existing_add = next((p for p in plan if p["action"] == "ADD" and p["ticker"] == t), None)
@@ -615,6 +731,41 @@ def get_active_watchlist() -> list[str]:
         log.warning("get_active_watchlist DB read failed: %s — using fallback", e)
     # Fallback — same as the old DEFAULT_WATCHLIST core
     return ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "GOOGL", "META", "TSLA", "AMZN"]
+
+
+def get_active_watchlist_detailed() -> list[dict]:
+    """Like get_active_watchlist but returns tier + hot_today per ticker.
+
+    The scout prompt uses this to structure a HOT TODAY section (自选 names
+    moving today) ahead of the rest — the 6/2 NVDA-bias fix. Each item:
+    {ticker, tier, hot_today}. Empty list on DB error (caller falls back to
+    the flat list).
+    """
+    out: list[dict] = []
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT ticker, tier,
+                       COALESCE((metadata->>'hot_today')::boolean, FALSE) AS hot_today,
+                       (metadata->>'avg_volume_3m')::float AS avg_vol_3m
+                  FROM watchlist_members
+                 WHERE eligible = TRUE
+                 ORDER BY
+                   COALESCE((metadata->>'hot_today')::boolean, FALSE) DESC,
+                   (tier = 'rotating') DESC,
+                   last_seen_at DESC
+                """
+            )
+            for ticker, tier, hot, avg_vol in cur.fetchall():
+                out.append({
+                    "ticker": ticker, "tier": tier, "hot_today": bool(hot),
+                    "avg_volume_3m": float(avg_vol) if avg_vol is not None else None,
+                })
+    except Exception as e:
+        log.warning("get_active_watchlist_detailed DB read failed: %s", e)
+    return out
 
 
 def get_universe_snapshot() -> dict:

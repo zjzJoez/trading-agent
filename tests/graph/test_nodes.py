@@ -1004,6 +1004,55 @@ class TestCollectWatchlistData:
         assert "SPY" in result["watchlist"]
 
 
+class TestScoutPromptDeBias:
+    """The 6/2 NVDA-bias fix: scout prompt must present HOT TODAY names
+    separately and steer ranking toward relative volume, not absolute."""
+
+    def _md(self, **rows):
+        return rows
+
+    def test_hot_today_section_present_and_first(self):
+        from trading_agent.graph.nodes.premarket_nodes import _build_scout_prompt
+        watchlist = ["AAPL", "PLTR", "NVDA"]
+        market_data = {
+            "AAPL": {"last": 200.0, "change_pct": 0.0, "volume": 5e7, "avg_volume_3m": 5e7},
+            "PLTR": {"last": 160.0, "change_pct": 0.0, "volume": 1.2e8, "avg_volume_3m": 4e7, "hot_today": True},
+            "NVDA": {"last": 224.0, "change_pct": 0.0, "volume": 2.1e8, "avg_volume_3m": 2.0e8},
+        }
+        prompt = _build_scout_prompt(watchlist, market_data, {"label": "RANGE_LOW_VOL"})
+        assert "HOT TODAY" in prompt
+        # PLTR (hot) should appear in the HOT TODAY block, before "rest of watchlist"
+        hot_idx = prompt.index("HOT TODAY")
+        rest_idx = prompt.index("rest of watchlist")
+        pltr_idx = prompt.index("PLTR")
+        assert hot_idx < pltr_idx < rest_idx, "hot name must be in the HOT TODAY section"
+
+    def test_rvol_column_present(self):
+        from trading_agent.graph.nodes.premarket_nodes import _build_scout_prompt
+        # PLTR: 120M vol / 40M avg = 3.0x rvol (genuinely hot)
+        # NVDA: 210M vol / 200M avg = 1.05x rvol (normal despite huge absolute)
+        market_data = {
+            "PLTR": {"last": 160.0, "change_pct": 0.0, "volume": 1.2e8, "avg_volume_3m": 4e7, "hot_today": True},
+            "NVDA": {"last": 224.0, "change_pct": 0.0, "volume": 2.1e8, "avg_volume_3m": 2.0e8},
+        }
+        prompt = _build_scout_prompt(["PLTR", "NVDA"], market_data, {"label": "RANGE_LOW_VOL"})
+        assert "rvol=3.0x" in prompt  # PLTR genuinely hot
+        assert "rvol=1.0x" in prompt or "rvol=1.1x" in prompt  # NVDA normal
+        # The prompt must explicitly warn against ranking by absolute volume
+        assert "absolute" in prompt.lower()
+        assert "rvol" in prompt.lower()
+
+    def test_no_hot_today_still_builds(self):
+        from trading_agent.graph.nodes.premarket_nodes import _build_scout_prompt
+        market_data = {"AAPL": {"last": 200.0, "change_pct": 0.0, "volume": 5e7}}
+        prompt = _build_scout_prompt(["AAPL"], market_data, {"label": "RANGE_LOW_VOL"})
+        # No hot names → no hot SECTION header (the "HOT TODAY —" data block).
+        # The phrase still appears in RANKING GUIDANCE, so check the header form.
+        assert "HOT TODAY — your watchlist names" not in prompt
+        assert "rest of watchlist" in prompt
+        assert "AAPL" in prompt
+
+
 class TestRankCandidates:
     def test_llm_candidates_returned(self):
         from trading_agent.llm.schemas import ScoutOutput, ScoutCandidate
@@ -1080,6 +1129,11 @@ class TestNtfyScanDigest:
                     "trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown",
                     return_value=None,
                 ))
+                # 0 open positions → full R2 dispatch budget available
+                self._stack.enter_context(patch(
+                    "trading_agent.graph.nodes.premarket_nodes._open_position_count",
+                    return_value=0,
+                ))
                 return self
             def __exit__(self, *a):
                 return self._stack.__exit__(*a)
@@ -1133,6 +1187,74 @@ class TestNtfyScanDigest:
             "sudo", "-n", "/bin/systemctl", "start", "--no-block",
             "trading-agent-candidate-entry@NVDA.service",
         ]
+
+    def test_dispatch_top_n_not_just_top_1(self):
+        """Top-N change: multiple candidates above threshold dispatch (bounded
+        by MAX_DISPATCH_PER_SCAN + R2 slots). This breaks the NVDA winner-
+        take-all — rotation names now get a slot even when a mega-cap is #1."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[
+                {"ticker": "NVDA", "score": 0.72, "reason": "hot mega"},
+                {"ticker": "PLTR", "score": 0.61, "reason": "rotation leader"},
+                {"ticker": "HOOD", "score": 0.55, "reason": "fintech momentum"},
+                {"ticker": "INTC", "score": 0.40, "reason": "below threshold"},  # < 0.50
+            ],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        started: list[str] = []
+
+        def _fake_run(cmd, **kw):
+            # Record the ticker from the start (not reset-failed) calls
+            if "start" in cmd:
+                started.append(cmd[-1])
+            return MagicMock(returncode=0, stderr=b"")
+
+        with _patch_all_emits(), self._patch_clean_guards():
+            with patch("trading_agent.notify.send"):
+                with patch("pathlib.Path.exists", return_value=False):
+                    with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                        with patch("subprocess.run", side_effect=_fake_run):
+                            from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                            ntfy_scan_digest(state)
+        # 3 candidates clear 0.50 (NVDA, PLTR, HOOD); INTC at 0.40 excluded.
+        # MAX_DISPATCH_PER_SCAN=3, R2 budget=6 → all 3 dispatch.
+        assert started == [
+            "trading-agent-candidate-entry@NVDA.service",
+            "trading-agent-candidate-entry@PLTR.service",
+            "trading-agent-candidate-entry@HOOD.service",
+        ], f"expected top-3 dispatched, got {started}"
+
+    def test_dispatch_respects_r2_remaining_slots(self):
+        """If only 1 position slot remains (5 of 6 open), dispatch exactly 1
+        even when 3 candidates clear threshold."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[
+                {"ticker": "NVDA", "score": 0.72, "reason": "a"},
+                {"ticker": "PLTR", "score": 0.61, "reason": "b"},
+                {"ticker": "HOOD", "score": 0.55, "reason": "c"},
+            ],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        started: list[str] = []
+        with _patch_all_emits():
+            with patch("trading_agent.graph.nodes.premarket_nodes._existing_exposure", return_value=None):
+                with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown", return_value=None):
+                    with patch("trading_agent.graph.nodes.premarket_nodes._open_position_count", return_value=5):
+                        with patch("trading_agent.notify.send"):
+                            with patch("pathlib.Path.exists", return_value=False):
+                                with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                                    def _fake_run(cmd, **kw):
+                                        if "start" in cmd:
+                                            started.append(cmd[-1])
+                                        return MagicMock(returncode=0, stderr=b"")
+                                    with patch("subprocess.run", side_effect=_fake_run):
+                                        from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                        ntfy_scan_digest(state)
+        assert started == ["trading-agent-candidate-entry@NVDA.service"], (
+            f"only 1 slot remained (6-5); expected 1 dispatch, got {started}"
+        )
 
     def test_dispatch_failed_emits_severity_2(self):
         """systemctl start non-zero exit → dispatch_failed event, severity=2."""

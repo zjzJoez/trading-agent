@@ -21,6 +21,7 @@ from typing import Any
 
 from trading_agent.events import emit
 from trading_agent.graph.state import TradingGraphState
+from trading_agent.sizing import MAX_CONCURRENT_OPENS
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +96,9 @@ def collect_watchlist_data(state: TradingGraphState) -> dict:
     log.info("[premarket/collect_watchlist_data] run_id=%s", run_id)
 
     watchlist: list[str] = list(state.get("watchlist") or [])
+    # Per-ticker detail (tier, hot_today, avg_volume_3m) for the scout
+    # prompt's HOT TODAY structuring + relative-volume column.
+    detail_by_ticker: dict[str, dict] = {}
     if not watchlist:
         # Source of truth for the dynamic watchlist lives in Postgres
         # watchlist_members (migration 010), refreshed daily by
@@ -106,9 +110,22 @@ def collect_watchlist_data(state: TradingGraphState) -> dict:
             scripts_dir = Path(__file__).resolve().parents[4] / "scripts"
             if str(scripts_dir) not in sys.path:
                 sys.path.insert(0, str(scripts_dir))
-            from refresh_dynamic_watchlist import get_active_watchlist  # type: ignore
-            watchlist = get_active_watchlist()
-            log.info("[premarket/collect_watchlist_data] DB watchlist loaded (%d tickers)", len(watchlist))
+            from refresh_dynamic_watchlist import (  # type: ignore
+                get_active_watchlist,
+                get_active_watchlist_detailed,
+            )
+            detailed = get_active_watchlist_detailed()
+            if detailed:
+                watchlist = [d["ticker"] for d in detailed]
+                detail_by_ticker = {d["ticker"]: d for d in detailed}
+                n_hot = sum(1 for d in detailed if d.get("hot_today"))
+                log.info(
+                    "[premarket/collect_watchlist_data] DB watchlist loaded "
+                    "(%d tickers, %d hot_today)", len(watchlist), n_hot,
+                )
+            else:
+                watchlist = get_active_watchlist()
+                log.info("[premarket/collect_watchlist_data] DB watchlist loaded (%d tickers, no detail)", len(watchlist))
         except Exception as e:
             log.warning("[premarket/collect_watchlist_data] DB watchlist read failed: %s — using hardcoded fallback", e)
             watchlist = [
@@ -117,6 +134,13 @@ def collect_watchlist_data(state: TradingGraphState) -> dict:
             ]
 
     quote_data = _fetch_quotes_batch(watchlist)
+    # Merge detail (tier / hot_today / avg_volume_3m) into the quote rows
+    # so the scout prompt builder has everything in one place.
+    for ticker, d in detail_by_ticker.items():
+        if ticker in quote_data:
+            quote_data[ticker]["tier"] = d.get("tier")
+            quote_data[ticker]["hot_today"] = bool(d.get("hot_today"))
+            quote_data[ticker]["avg_volume_3m"] = d.get("avg_volume_3m")
 
     # Also grab one recent EDGAR filing per ticker (best-effort, sequential)
     for ticker in watchlist[:6]:  # limit to top 6 to avoid rate-limit
@@ -150,51 +174,75 @@ def _build_scout_prompt(
     allow_entries = gate.get("allow_new_entries", True)
     size_mult = float(gate.get("size_multiplier") or 1.0)
 
+    def _fmt_quote(ticker: str) -> str:
+        q = market_data.get(ticker) or {}
+        if q.get("error"):
+            return f"  {ticker}: (quote unavailable)"
+        last = q.get("last", 0)
+        chg = q.get("change_pct", 0)
+        vol = q.get("volume", 0)
+        # Relative volume = prior-day volume / 3-month average. This is the
+        # KEY de-bias signal: NVDA's 212M shares is ~1.0x its own norm
+        # (not special), while a small-cap doubling its volume is 2.0x
+        # (genuinely hot). Pre-open, change_pct is ~0 for everything, so
+        # WITHOUT rvol the scout falls back to absolute volume and always
+        # locks onto the highest-volume mega-cap (the 6/2 NVDA-bias audit).
+        avg_vol = q.get("avg_volume_3m")
+        rvol_str = ""
+        if avg_vol and avg_vol > 0 and vol:
+            rvol_str = f" rvol={vol / avg_vol:.1f}x"
+        filing = q.get("recent_filing", "")
+        filing_str = f" | {filing}" if filing else ""
+        return f"  {ticker}: last={last:.2f} chg={chg:+.2%} vol={vol:.0f}{rvol_str}{filing_str}"
+
+    # Partition the watchlist into HOT TODAY (操作员's自选 names that are
+    # ALSO in today's yfinance top-movers) vs the rest. The hot set is the
+    # single strongest rotation signal — set membership, not a fragile
+    # ratio — and directly answers "what should I look at today".
+    hot = [t for t in watchlist if (market_data.get(t) or {}).get("hot_today")]
+    rest = [t for t in watchlist if t not in set(hot)]
+
     lines = [
         f"date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
         f"regime: {regime_label} (confidence={regime_conf:.2f})",
         f"allow_new_entries: {allow_entries}",
         f"size_multiplier: {size_mult:.2f}",
         f"",
-        f"watchlist_quotes:",
     ]
-    for ticker in watchlist:
-        q = market_data.get(ticker) or {}
-        if q.get("error"):
-            lines.append(f"  {ticker}: (quote unavailable)")
-            continue
-        last = q.get("last", 0)
-        chg = q.get("change_pct", 0)
-        vol = q.get("volume", 0)
-        filing = q.get("recent_filing", "")
-        filing_str = f" | {filing}" if filing else ""
-        lines.append(
-            f"  {ticker}: last={last:.2f} chg={chg:+.2%} vol={vol:.0f}{filing_str}"
-        )
+    if hot:
+        lines.append("HOT TODAY — your watchlist names that are ALSO in today's biggest movers.")
+        lines.append("These are the HIGHEST PRIORITY: you already track them AND they're active now.")
+        lines.append("Weight these UP. Prefer them unless a clear reason not to.")
+        for t in hot:
+            lines.append(_fmt_quote(t))
+        lines.append("")
+    lines.append("rest of watchlist (your standing names, ranked normally):")
+    for t in rest:
+        lines.append(_fmt_quote(t))
 
     lines += [
         f"",
-        f"Rank the watchlist tickers from most to least actionable as of today's open. ",
-        f"Score 0.0–1.0. Include only tickers where there is a concrete near-term setup ",
-        f"(momentum, mean-reversion, event-driven, or regime-aligned).",
+        f"Rank from most to least actionable as of today's open. Score 0.0–1.0. ",
+        f"Include only tickers with a concrete near-term setup (momentum, ",
+        f"mean-reversion, event-driven, or regime-aligned).",
         f"",
-        f"PREFERENCE ORDER (most→least preferred when ranking):",
-        f"  1. Single-name catalyst plays: recent filings (8-K, 4), earnings within ",
-        f"     2 weeks, news-driven gaps, sector rotation candidates.",
-        f"  2. High-volume single names with above-average premarket move ",
-        f"     (|chg_pct| ≥ 1.5%).",
-        f"  3. Mag-7 / large-caps with a SPECIFIC thesis tied to today (not just ",
-        f"     'good company, will go up').",
-        f"  4. Broad ETFs (SPY, QQQ, IWM) — ONLY when there is an explicit ",
-        f"     macro thesis (FOMC, CPI print, NFP, sector breadth turn). Default ",
-        f"     ETF score should be ≤ 0.5; anything > 0.7 needs explicit ",
-        f"     justification in the `reason` field naming the macro trigger.",
+        f"RANKING GUIDANCE:",
+        f"  • HOT TODAY names: start from a higher base — they're moving AND tracked. ",
+        f"    A hot name with rvol ≥ 1.5x and a coherent setup should score ≥ 0.55.",
+        f"  • Use rvol (relative volume), NOT absolute share count. A mega-cap at ",
+        f"    rvol≈1.0x is trading NORMALLY — that is NOT a signal. Do not rank a ",
+        f"    name highly just because its absolute volume is large; NVDA always ",
+        f"    has huge absolute volume. rvol ≥ 1.5x is what flags genuine activity.",
+        f"  • Single-name catalysts (8-K/Form-4 filings, earnings ≤2wk, news gaps, ",
+        f"    sector-rotation leaders) rank above generic large-caps.",
+        f"  • Broad ETFs (SPY/QQQ/IWM): score ≤ 0.5 unless there is an EXPLICIT ",
+        f"    macro trigger named in `reason` (FOMC/CPI/NFP/breadth turn).",
         f"",
-        f"Reject silently (don't put in candidates list): tickers with no clear edge, ",
-        f"tickers that contradict the current regime, or ETFs without a macro thesis.",
+        f"Reject silently (omit from candidates): no clear edge, contradicts regime, ",
+        f"or ETF without a macro thesis. Do NOT pad the list with a mega-cap just to ",
+        f"have an entry — returning fewer, higher-conviction names is correct.",
         f"",
-        f"Return at most 5 candidates. Quality over quantity — if only 1 ticker has ",
-        f"a real catalyst, return just that one. Respond per your ScoutOutput schema.",
+        f"Return up to 5 candidates, a single JSON object per ScoutOutput schema.",
     ]
     return "\n".join(lines)
 
@@ -470,150 +518,168 @@ def _dispatch_candidate_entry_if_eligible(
 
     if not candidates:
         return
-    top = candidates[0]
-    top_score = float(top.get("score") or 0.0)
-    ticker = (top.get("ticker") or "").strip().upper()
-    if not ticker:
-        return
 
-    # Guard 1: score threshold
-    if top_score < DISPATCH_MIN_SCORE:
-        emit(
-            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-            event_type="candidate_entry_skipped",
-            payload={"ticker": ticker, "score": top_score, "reason": "below_score_threshold",
-                     "threshold": DISPATCH_MIN_SCORE},
-        )
-        return
-
-    # Guard 2: halt flag
+    # ---- Global guards (checked ONCE for the whole scan) ----
+    # Halt flag
     from pathlib import Path
     halt_flag = Path.home() / "trading-agent" / "data" / "halt.flag"
     if halt_flag.exists():
-        emit(
-            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-            event_type="candidate_entry_skipped",
-            payload={"ticker": ticker, "reason": "halt_flag_set"},
-        )
+        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+             event_type="candidate_entry_skipped",
+             payload={"reason": "halt_flag_set"})
         return
 
-    # Guard 3: soak phase
+    # Soak phase
     try:
         from trading_agent.learning.soak import current_phase, is_new_entry_allowed
         phase = current_phase()
         if not is_new_entry_allowed(phase):
-            emit(
-                run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-                event_type="candidate_entry_skipped",
-                payload={"ticker": ticker, "reason": "soak_read_only", "soak_phase": phase.value},
-            )
+            emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+                 event_type="candidate_entry_skipped",
+                 payload={"reason": "soak_read_only", "soak_phase": phase.value})
             return
     except Exception as e:
         log.warning("[dispatch] soak check failed: %s", e)
 
-    # Guard 4: regime gate
+    # Regime gate
     gate = regime.get("gate") or {}
     if not gate.get("allow_new_entries", True):
-        emit(
-            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-            event_type="candidate_entry_skipped",
-            payload={"ticker": ticker, "reason": "regime_blocks_new_entries",
-                     "regime_label": regime.get("label")},
-        )
+        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+             event_type="candidate_entry_skipped",
+             payload={"reason": "regime_blocks_new_entries", "regime_label": regime.get("label")})
         return
 
-    # Guard 5: position-aware skip — already exposed to this ticker or sector
-    exposure = _existing_exposure(ticker)
-    if exposure:
-        emit(
-            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-            event_type="candidate_entry_skipped",
-            payload={"ticker": ticker, "reason": exposure["reason"],
-                     "detail": exposure["detail"]},
-        )
+    # ---- Remaining position budget (R2 cap) ----
+    # Don't dispatch more than (MAX_CONCURRENT_OPENS - currently_open) so we
+    # never spend the full research+council LLM pipeline on a candidate that
+    # R2 will VETO anyway. Bounded further by MAX_DISPATCH_PER_SCAN so one
+    # scan can't fan out the whole budget at once. This is the top-N change
+    # that breaks the NVDA winner-take-all: rotation names now get a slot
+    # even when a mega-cap is #1.
+    open_n = _open_position_count()
+    remaining_slots = max(0, MAX_CONCURRENT_OPENS - open_n)
+    budget = min(MAX_DISPATCH_PER_SCAN, remaining_slots)
+    if budget <= 0:
+        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+             event_type="candidate_entry_skipped",
+             payload={"reason": "position_cap_full", "open_positions": open_n,
+                      "max_concurrent": MAX_CONCURRENT_OPENS})
         return
 
-    # Guard 6: cooldown — recent FILLED entry on same ticker (VETO/DEFER do
-    # not lock; only an executed fill within the window blocks re-dispatch).
-    cd = _in_dispatch_cooldown(ticker, days=SAME_TICKER_COOLDOWN_DAYS)
-    if cd:
-        emit(
-            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-            event_type="candidate_entry_skipped",
-            payload={"ticker": ticker, "reason": "ticker_cooldown",
-                     "last_fill_age_days": cd["age_days"],
-                     "cooldown_days": SAME_TICKER_COOLDOWN_DAYS},
-        )
+    # Eligible = score ≥ threshold, sorted desc (already sorted upstream).
+    eligible = [
+        c for c in candidates
+        if float(c.get("score") or 0.0) >= DISPATCH_MIN_SCORE
+        and (c.get("ticker") or "").strip()
+    ]
+    if not eligible:
+        top = candidates[0]
+        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+             event_type="candidate_entry_skipped",
+             payload={"ticker": (top.get("ticker") or "").upper(),
+                      "score": float(top.get("score") or 0.0),
+                      "reason": "below_score_threshold", "threshold": DISPATCH_MIN_SCORE})
         return
 
-    # All guards passed — dispatch via systemd unit (NOT subprocess.Popen).
-    #
-    # Why systemd unit instead of subprocess.Popen(start_new_session=True):
-    #
-    # subprocess.Popen with start_new_session=True changes the SESSION ID but
-    # does NOT leave the parent's systemd cgroup. When the parent unit
-    # (trading-agent-brain@premarket_scan.service) ExecStart returns, systemd
-    # defaults to KillMode=control-group and SIGTERMs every PID in the cgroup
-    # — including the "detached" child. We saw this happen on 5/13 12:31:
-    # SPY was dispatched, child PID 96421 silently died before LangGraph
-    # could emit `run_start`, and nothing wrote to the journal or log files
-    # because Python was killed during import.
-    #
-    # The fix is to start a SEPARATE systemd unit per ticker. systemd already
-    # provides `trading-agent-candidate-entry@.service` as a template — each
-    # instance lives in its own cgroup, has its own 15-min TimeoutStartSec,
-    # its own journalctl trace (`journalctl -u trading-agent-candidate-entry@SPY`),
-    # and its own EnvironmentFile loading. The parent unit exiting no longer
-    # touches it.
-    #
-    # Requires sudoers entry on EC2:
-    #   ubuntu ALL=(root) NOPASSWD: /bin/systemctl start trading-agent-candidate-entry@*.service, \
-    #                               /bin/systemctl reset-failed trading-agent-candidate-entry@*.service
-    # See deploy/ec2/INSTALL.md for the install snippet.
+    # ---- Per-ticker loop: dispatch up to `budget` distinct tickers ----
+    dispatched = 0
+    for cand in eligible:
+        if dispatched >= budget:
+            break
+        ticker = (cand.get("ticker") or "").strip().upper()
+        score = float(cand.get("score") or 0.0)
+
+        # Per-ticker guard: already exposed to this ticker/sector
+        exposure = _existing_exposure(ticker)
+        if exposure:
+            emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+                 event_type="candidate_entry_skipped",
+                 payload={"ticker": ticker, "reason": exposure["reason"],
+                          "detail": exposure["detail"]})
+            continue
+
+        # Per-ticker guard: cooldown on a recent FILLED entry
+        cd = _in_dispatch_cooldown(ticker, days=SAME_TICKER_COOLDOWN_DAYS)
+        if cd:
+            emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+                 event_type="candidate_entry_skipped",
+                 payload={"ticker": ticker, "reason": "ticker_cooldown",
+                          "last_fill_age_days": cd["age_days"],
+                          "cooldown_days": SAME_TICKER_COOLDOWN_DAYS})
+            continue
+
+        ok, err = _start_candidate_unit(ticker)
+        if ok:
+            dispatched += 1
+            emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+                 event_type="candidate_entry_dispatched",
+                 payload={"ticker": ticker, "score": score,
+                          "reason": cand.get("reason", "")[:160],
+                          "unit": f"trading-agent-candidate-entry@{ticker}.service",
+                          "rank": dispatched})
+            log.info("[dispatch] candidate_entry started for %s (score=%.2f, %d/%d)",
+                     ticker, score, dispatched, budget)
+        else:
+            emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+                 event_type="candidate_entry_dispatch_failed",
+                 severity=2, payload={"ticker": ticker, "error": str(err)[:200]})
+
+
+# Max distinct tickers to dispatch from a single premarket scan. Bounded so
+# one scan can't consume the whole R2 budget; the rest wait for tomorrow.
+MAX_DISPATCH_PER_SCAN = 3
+
+
+def _open_position_count() -> int:
+    """Count OPEN journal_trades (for the R2 remaining-slots calc). 0 on error."""
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM journal_trades WHERE outcome = 'OPEN'")
+            return int(cur.fetchone()[0] or 0)
+    except Exception as e:
+        log.warning("[dispatch] open-position count failed: %s — assuming 0", e)
+        return 0
+
+
+def _start_candidate_unit(ticker: str) -> tuple[bool, str | None]:
+    """Start the per-ticker candidate_entry systemd unit. Returns (ok, err).
+
+    Why a SEPARATE systemd unit per ticker (not subprocess.Popen):
+    subprocess.Popen(start_new_session=True) changes the session id but stays
+    in the parent's systemd cgroup. When the parent premarket unit's ExecStart
+    returns, systemd's KillMode=control-group SIGTERMs every PID in the cgroup
+    — including the "detached" child (observed 5/13: SPY child died before
+    LangGraph emitted run_start). A per-ticker template unit
+    (trading-agent-candidate-entry@.service) lives in its own cgroup with its
+    own TimeoutStartSec + journalctl trace, untouched by the parent exiting.
+
+    Requires sudoers on EC2:
+      ubuntu ALL=(root) NOPASSWD: /bin/systemctl start trading-agent-candidate-entry@*.service, \\
+                                  /bin/systemctl reset-failed trading-agent-candidate-entry@*.service
+    """
     import subprocess
     unit_name = f"trading-agent-candidate-entry@{ticker}.service"
-
     try:
-        # Clear any prior "failed" state of this instance — systemctl start
-        # silently no-ops if the unit is in failed state (e.g. previous run
-        # hit TimeoutStartSec). reset-failed is a noop when state is clean.
+        # reset-failed: systemctl start no-ops if the unit is in failed state
+        # (e.g. a prior TimeoutStartSec). Harmless when state is clean.
         subprocess.run(
             ["sudo", "-n", "/bin/systemctl", "reset-failed", unit_name],
             check=False, capture_output=True, timeout=10,
         )
-        # Fire-and-forget start. --no-block means systemctl returns
-        # immediately; the unit runs asynchronously in its own cgroup.
         result = subprocess.run(
             ["sudo", "-n", "/bin/systemctl", "start", "--no-block", unit_name],
             check=False, capture_output=True, timeout=10,
         )
         if result.returncode != 0:
-            raise RuntimeError(
+            return False, (
                 f"systemctl start exit={result.returncode}: "
                 f"{result.stderr.decode('utf-8', 'replace')[:300]}"
             )
-        emit(
-            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-            event_type="candidate_entry_dispatched",
-            payload={
-                "ticker": ticker,
-                "score": top_score,
-                "reason": top.get("reason", "")[:160],
-                "unit": unit_name,
-            },
-        )
-        log.info(
-            "[dispatch] candidate_entry started for %s via systemd (score=%.2f)",
-            ticker, top_score,
-        )
+        return True, None
     except Exception as e:
         log.error("[dispatch] systemctl start failed for %s: %s", ticker, e)
-        emit(
-            run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-            event_type="candidate_entry_dispatch_failed",
-            severity=2,
-            payload={"ticker": ticker, "error": str(e)[:200]},
-        )
+        return False, str(e)
 
 
 # ---------------------------------------------------------------------------
