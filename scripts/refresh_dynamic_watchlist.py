@@ -221,17 +221,27 @@ def _fetch_moomoo_group(group_name: str, tier: str) -> list[Candidate]:
     return out
 
 
+# Optional allowlist of moomoo custom group names to use as the watchlist
+# core. Comma-separated, env-overridable. When set, ONLY these groups are
+# pulled (e.g. "美股"). When empty, ALL custom groups are pulled. The
+# operator created a dedicated 美股 group as the single source of truth —
+# set WATCHLIST_MOOMOO_GROUPS=美股 on EC2 to use only it.
+WATCHLIST_MOOMOO_GROUPS = [
+    g.strip() for g in os.environ.get("WATCHLIST_MOOMOO_GROUPS", "").split(",")
+    if g.strip()
+]
+
+
 def _fetch_all_moomoo_us_stocks() -> list[Candidate]:
-    """Pull EVERY US stock/ETF from ALL of the operator's moomoo CUSTOM groups.
+    """Pull EVERY US stock/ETF from the operator's moomoo CUSTOM groups.
 
-    This is the operator's curated universe (自选). Every name here becomes
-    tier='core' — never evicted, always presented to the scout. Replaces
-    the old hardcoded 4-group MOOMOO_GROUPS map (which crowded the
-    operator's semis/commodities out of the rotating slots).
+    Which groups: if WATCHLIST_MOOMOO_GROUPS is set, ONLY those named groups;
+    otherwise ALL custom groups. Every name becomes tier='core' — never
+    evicted, always presented to the scout.
 
-    Source label is moomoo:<first group the ticker was seen in>. Dedups
-    across groups. Non-US, non-stock/ETF (futures, indices, options, HK/CN)
-    are filtered out by the US. prefix + stock_type check.
+    Source label is moomoo:<group>. Dedups across groups. Non-US,
+    non-stock/ETF (futures, indices, options, HK/CN) are filtered out by
+    the US. prefix + stock_type check.
     """
     out: list[Candidate] = []
     seen: set[str] = set()
@@ -248,9 +258,14 @@ def _fetch_all_moomoo_us_stocks() -> list[Candidate]:
     except Exception as e:
         log.warning("get_watchlist_groups(CUSTOM) failed: %s", e)
         return []
+    allow = set(WATCHLIST_MOOMOO_GROUPS)
+    if allow:
+        log.info("watchlist restricted to moomoo groups: %s", sorted(allow))
     for g in (groups.get("rows") or []):
         gn = g.get("group_name")
         if not gn:
+            continue
+        if allow and gn not in allow:
             continue
         try:
             wl = moomoo_get_watchlist(group_name=gn)
