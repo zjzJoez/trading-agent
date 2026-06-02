@@ -645,7 +645,17 @@ def _check_dispatch_silent_die(run_id: str, trigger: str) -> None:
             FROM recent_dispatches d
             LEFT JOIN recent_starts s
                 ON s.ticker = d.ticker
-                AND s.started_at >= d.dispatched_at
+                -- Window is SYMMETRIC (±10 min), not forward-only. When the
+                -- same ticker is dispatched twice in quick succession (e.g.
+                -- a manual run + the scheduled 12:30 premarket both surface
+                -- the same top pick), the SECOND dispatch's `systemctl start`
+                -- no-ops because the unit is already running from the FIRST
+                -- dispatch — so it emits no new run_start. Matching a
+                -- run_start slightly BEFORE the dispatch recognizes that the
+                -- ticker is already being processed and is NOT a silent die.
+                -- (6/2 false-positive: IBM/CBOE/SNOW dispatched 12:27 + 12:30,
+                -- ran fine, but the 12:30 dispatch alarmed.)
+                AND s.started_at >= d.dispatched_at - interval '10 minutes'
                 AND s.started_at <= d.dispatched_at + interval '10 minutes'
             WHERE s.ticker IS NULL
               AND d.ticker NOT IN (SELECT ticker FROM recent_alerts WHERE ticker IS NOT NULL)

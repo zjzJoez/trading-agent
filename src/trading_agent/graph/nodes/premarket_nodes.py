@@ -620,6 +620,17 @@ def _dispatch_candidate_entry_if_eligible(
                           "cooldown_days": SAME_TICKER_COOLDOWN_DAYS})
             continue
 
+        # Per-ticker guard: already dispatched in the last ~20 min — its
+        # candidate_entry unit is still running (or just finished). A second
+        # dispatch would no-op on systemctl start and false-trip the
+        # silent-die watchdog (6/2 IBM/CBOE/SNOW double-dispatch incident).
+        if _recently_dispatched(ticker):
+            emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+                 event_type="candidate_entry_skipped",
+                 payload={"ticker": ticker, "reason": "already_dispatched_recently",
+                          "dedup_window_min": _RECENT_DISPATCH_DEDUP_MIN})
+            continue
+
         ok, err = _start_candidate_unit(ticker)
         if ok:
             dispatched += 1
@@ -810,6 +821,42 @@ def _in_dispatch_cooldown(ticker: str, days: int = 7) -> dict | None:
     except Exception as e:
         log.warning("[cooldown] db check failed: %s", e)
     return None
+
+
+# A candidate_entry pipeline runs ~5-8 min. If the same ticker was dispatched
+# inside this window, its unit is still running (or just finished) — a second
+# dispatch's `systemctl start` would no-op and emit no run_start, which then
+# false-trips the silent-die watchdog. 20 min covers the pipeline + margin.
+_RECENT_DISPATCH_DEDUP_MIN = 20
+
+
+def _recently_dispatched(ticker: str, minutes: int = _RECENT_DISPATCH_DEDUP_MIN) -> bool:
+    """True if `ticker` already has a candidate_entry_dispatched in the last
+    `minutes`. Prevents double-dispatch when two scans (e.g. a manual run +
+    the scheduled 12:30 premarket) surface the same top pick within minutes.
+
+    Best-effort: any DB error → False (don't block dispatch on a flaky read).
+    """
+    try:
+        from trading_agent.store.postgres import cursor
+        norm = (ticker or "").strip().upper()
+        if not norm:
+            return False
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM agent_events
+                WHERE event_type = 'candidate_entry_dispatched'
+                  AND payload->>'ticker' = %s
+                  AND ts > NOW() - (%s::text || ' minutes')::interval
+                LIMIT 1
+                """,
+                (norm, str(minutes)),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        log.warning("[dispatch] recent-dispatch dedup check failed: %s", e)
+        return False
 
 
 __all__ = [

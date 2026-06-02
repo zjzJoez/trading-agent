@@ -1149,6 +1149,11 @@ class TestNtfyScanDigest:
                     "trading_agent.graph.nodes.premarket_nodes._open_position_count",
                     return_value=0,
                 ))
+                # Not recently dispatched → dedup guard allows dispatch
+                self._stack.enter_context(patch(
+                    "trading_agent.graph.nodes.premarket_nodes._recently_dispatched",
+                    return_value=False,
+                ))
                 return self
             def __exit__(self, *a):
                 return self._stack.__exit__(*a)
@@ -1270,6 +1275,38 @@ class TestNtfyScanDigest:
         assert started == ["trading-agent-candidate-entry@NVDA.service"], (
             f"only 1 slot remained (6-5); expected 1 dispatch, got {started}"
         )
+
+    def test_dispatch_dedup_skips_recently_dispatched(self):
+        """Same ticker dispatched in the last ~20 min → skip (no double-fire).
+
+        Regression for the 6/2 silent-die false positive: a manual run + the
+        scheduled 12:30 premarket both surfaced IBM/CBOE/SNOW; the second
+        dispatch no-op'd on systemctl start and the watchdog false-alarmed."""
+        state = _base_state(
+            trigger="premarket_scan",
+            candidates=[{"ticker": "NVDA", "score": 0.72, "reason": "x"}],
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        started: list[str] = []
+        skipped: list[dict] = []
+        with patch("trading_agent.graph.nodes.premarket_nodes.emit",
+                   side_effect=lambda **kw: skipped.append(kw) if kw.get("event_type") == "candidate_entry_skipped" else None):
+            with patch("trading_agent.graph.nodes.premarket_nodes._existing_exposure", return_value=None):
+                with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown", return_value=None):
+                    with patch("trading_agent.graph.nodes.premarket_nodes._open_position_count", return_value=0):
+                        with patch("trading_agent.graph.nodes.premarket_nodes._recently_dispatched", return_value=True):
+                            with patch("trading_agent.notify.send"):
+                                with patch("pathlib.Path.exists", return_value=False):
+                                    with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                                        def _fake_run(cmd, **kw):
+                                            if "start" in cmd:
+                                                started.append(cmd[-1])
+                                            return MagicMock(returncode=0, stderr=b"")
+                                        with patch("subprocess.run", side_effect=_fake_run):
+                                            from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                            ntfy_scan_digest(state)
+        assert started == [], "recently-dispatched ticker must not re-dispatch"
+        assert any(s["payload"].get("reason") == "already_dispatched_recently" for s in skipped)
 
     def test_dispatch_failed_emits_severity_2(self):
         """systemctl start non-zero exit → dispatch_failed event, severity=2."""
