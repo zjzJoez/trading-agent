@@ -120,19 +120,24 @@ def sync_fill_status(state: TradingGraphState) -> dict:
                 avg_f = None
             try:
                 with cursor() as cur:
+                    # Explicit casts — jsonb_build_object + COALESCE can't
+                    # infer param types from a bare %s placeholder (psycopg
+                    # sends them untyped), which raised "could not determine
+                    # data type of parameter $2".
                     cur.execute(
                         """
                         UPDATE journal_trades
-                        SET entry_price = COALESCE(%s, entry_price),
+                        SET entry_price = COALESCE(%s::numeric, entry_price),
                             broker_fill_json = COALESCE(broker_fill_json, '{}'::jsonb)
                               || jsonb_build_object(
-                                   'status', %s,
-                                   'fill_qty', %s,
-                                   'avg_fill_price', %s,
+                                   'status', %s::text,
+                                   'fill_qty', %s::text,
+                                   'avg_fill_price', %s::numeric,
                                    'fill_synced_at', NOW()::text)
                         WHERE id = %s AND outcome = 'OPEN'
                         """,
-                        (avg_f, status, filled_qty, avg_f, int(trade_id)),
+                        (avg_f, status, str(filled_qty) if filled_qty is not None else None,
+                         avg_f, int(trade_id)),
                     )
                 synced_filled += 1
             except Exception as e:
