@@ -259,7 +259,16 @@ def rank_candidates(state: TradingGraphState) -> dict:
         llm_exception = str(e)[:200]
         log.warning("[rank_candidates] scout LLM raised: %s", e)
 
-    # Fallback: rank by |change_pct| if LLM gave nothing
+    # Fallback: rank by |change_pct| if LLM gave nothing.
+    #
+    # Score is 0.0, NOT 0.5. The fallback means "scout produced no real
+    # signal" — that is a DO-NOT-DISPATCH state, not moderate conviction.
+    # The old 0.5 score made a failed scout look almost dispatchable and
+    # forced DISPATCH_MIN_SCORE artificially high (0.55) just to exclude
+    # fallbacks. With scout on Sonnet (reliable) and fallback scored 0.0,
+    # the threshold can sit at the natural "real signal" level (0.50) and
+    # fallbacks are cleanly excluded. The candidates are still surfaced in
+    # the digest (so the operator sees what moved) but won't dispatch.
     if not candidates:
         ranked_tickers = sorted(
             watchlist,
@@ -267,7 +276,7 @@ def rank_candidates(state: TradingGraphState) -> dict:
             reverse=True,
         )
         candidates = [
-            {"ticker": t, "score": 0.5, "reason": "fallback_by_abs_change_pct"}
+            {"ticker": t, "score": 0.0, "reason": "fallback_by_abs_change_pct_NO_LLM_SIGNAL"}
             for t in ranked_tickers[:3]
         ]
         # Loud alert — silent degradation is exactly what caused the
@@ -419,11 +428,15 @@ def ntfy_scan_digest(state: TradingGraphState) -> dict:
 #   0.6  → still too tight in aggressive mode. 5/22 audit: NVDA scored 0.56
 #          ("203M premarket vol vs 40M baseline; AI sector momentum") —
 #          legitimate setup but missed cutoff by 0.04
-#   0.55 → catches real setups while still excluding fallback-mode scores
-#          (LLM-failure fallback hard-codes 0.50). At 0.55 we accept the
-#          full-pipeline LLM cost (~$0.20) on moderate-conviction candidates;
-#          if false-positive rate gets high we'll bump back to 0.6
-DISPATCH_MIN_SCORE = 0.55
+#   0.55 → still excluded today's legit NVDA (0.52). The 0.55 floor only
+#          existed to clear the 0.50 fallback score — but that fallback
+#          score was itself wrong (a failed scout isn't "moderate
+#          conviction").
+#   0.50 → fallback score is now 0.0 (see rank_candidates), so the floor
+#          no longer needs headroom above it. 0.50 = "any genuine scout
+#          signal dispatches; the downstream trader-synthesizer is the
+#          real quality gate (it DECLINED on 5/28 when no edge existed)."
+DISPATCH_MIN_SCORE = 0.50
 
 # Don't dispatch the same ticker more than once in this many days. Prevents
 # the scout's daily "top pick" from collapsing onto a handful of names if the
