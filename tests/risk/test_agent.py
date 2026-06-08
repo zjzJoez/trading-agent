@@ -208,10 +208,18 @@ def test_downsize_one_contract_at_half_factor_stays_open():
         assert out.approved_qty >= 1.0
 
 
-def test_data_quality_critical_defers():
-    """Stale Greeks (age >60min) on existing position → degradation_level=2 → DEFER."""
-    bad = _opt(delta=None, gamma=None)  # missing critical greeks
-    snap = build_snapshot(equity=100_000, cash=100_000, open_positions=[bad])
+def test_held_position_missing_greeks_does_not_block_entry():
+    """Missing greeks on a HELD position is a WARNING (degradation_level=1),
+    NOT a hard block — it must never DEFER a new entry.
+
+    Regression guard for the 2026-06 candidate_entry lockup: a single
+    un-greek'd holding (e.g. a manually-added option leg the entry graph never
+    runs refresh_quotes_and_greeks on) used to drive degradation_level=2 and
+    DEFER every new trade for days. Market/candidate blindness is gated
+    separately via the regime path, not by held-position greek completeness."""
+    held = _opt(delta=None, gamma=None)  # held leg we can't fully greek
+    snap = build_snapshot(equity=100_000, cash=100_000, open_positions=[held])
+    assert snap.data_quality["degradation_level"] == 1
     out = decide(
         RiskInput(
             proposal=_proposal(),
@@ -219,8 +227,8 @@ def test_data_quality_critical_defers():
             regime={"label": "BULL_TREND", "confidence": 0.85},
         )
     )
-    assert out.decision == "DEFER"
-    assert out.approved_qty == 0.0
+    assert out.decision != "DEFER"
+    assert out.decision in ("APPROVE", "DOWNSIZE")
 
 
 def test_max_entry_price_includes_headroom():

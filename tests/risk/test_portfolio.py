@@ -119,9 +119,13 @@ def test_correlation_matrix_identity_on_self():
 
 
 def test_data_quality_flags_missing_greeks():
+    # Missing greeks on a HELD position is a WARNING (level 1), not a hard
+    # block: it must never DEFER new entries. A single un-greek'd holding
+    # previously froze the whole entry engine. The symbol is still surfaced
+    # in `missing` so exit-side monitoring can flag it.
     p = _opt(delta=None, gamma=None)
     snap = build_snapshot(equity=100_000, cash=100_000, open_positions=[p])
-    assert snap.data_quality["degradation_level"] == 2
+    assert snap.data_quality["degradation_level"] == 1
     assert any("greeks" in m for m in snap.data_quality["missing"])
 
 

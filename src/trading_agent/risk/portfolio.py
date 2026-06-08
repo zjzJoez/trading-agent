@@ -347,5 +347,13 @@ def _assess_data_quality(positions: list[OpenPosition]) -> dict[str, Any]:
         "missing": missing,
         "stale": stale,
         "outlier": [],
-        "degradation_level": 2 if missing else (1 if stale else 0),
+        # Held-position greek/quote gaps describe our ability to *manage
+        # existing* positions — NOT whether market data for a *new* candidate
+        # is trustworthy. Keep them a WARNING (level 1) so they never DEFER new
+        # entries; otherwise a single un-greek'd holding freezes the entire
+        # entry engine (root cause of the 2026-06 candidate_entry lockup:
+        # candidate_entry_graph never runs refresh_quotes_and_greeks, so any
+        # held option shows missing greeks -> level 2 -> DEFER every new trade).
+        # Market/candidate blindness is gated separately via the regime path.
+        "degradation_level": 1 if (missing or stale) else 0,
     }
