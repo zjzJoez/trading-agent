@@ -219,6 +219,11 @@ def check(ctx: SizingContext, proposed: ProposedTrade) -> list[SizingViolation]:
     """
     violations: list[SizingViolation] = []
 
+    # `intent` distinguishes opens from closes; closing orders reduce risk
+    # (selling a long, buying back a short) and must skip the opening-only
+    # rules below (R1, R2, R3, R5 notional caps).
+    is_opening = proposed.intent == "open"
+
     # ---- R1 single-trade risk ----
     if proposed.asset_type == "STK" and proposed.stop is None:
         violations.append(SizingViolation(
@@ -228,7 +233,7 @@ def check(ctx: SizingContext, proposed: ProposedTrade) -> list[SizingViolation]:
             "warn",
         ))
     r1_budget = MAX_SINGLE_RISK_PCT * ctx.equity
-    if proposed.max_loss > r1_budget + EPS:
+    if is_opening and proposed.max_loss > r1_budget + EPS:
         violations.append(SizingViolation(
             R1,
             f"max loss ${proposed.max_loss:,.2f} exceeds "
@@ -237,10 +242,6 @@ def check(ctx: SizingContext, proposed: ProposedTrade) -> list[SizingViolation]:
         ))
 
     # ---- R2 concurrent open count ----
-    # `intent` distinguishes opens from closes; for short option opens
-    # the side is SELL but it's still an OPENING action and counts against
-    # R2 / R5 / R1.
-    is_opening = proposed.intent == "open"
     if is_opening and len(ctx.opens) >= MAX_CONCURRENT_OPENS:
         violations.append(SizingViolation(
             R2,

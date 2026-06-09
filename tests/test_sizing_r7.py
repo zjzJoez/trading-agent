@@ -10,6 +10,7 @@ from __future__ import annotations
 from trading_agent.sizing import (
     MIN_RISK_REWARD,
     ProposedTrade,
+    R1,
     R5B,
     R5C,
     R7,
@@ -227,6 +228,44 @@ def test_naked_call_without_stop_max_loss_infinite():
     """No stop on naked call → max_loss = inf so R1 blocks even before R5c."""
     t = _naked_call(stop=None, premium=1.5)
     assert t.max_loss == float("inf")
+
+
+# ---------------------------------------------------------------------------
+# R1 must EXEMPT closing orders — regression for the 2026-05-28 incident where
+# SELL-to-close a long call was blocked by R1 "max loss $inf" (max_loss treats
+# a SELL call w/o stop as a naked-call OPEN). Every other rule already exempts
+# closes via is_opening / is_opening_option_short; R1 was the only gap.
+# ---------------------------------------------------------------------------
+
+
+def _close_long_call(stop=None) -> ProposedTrade:
+    """Unwinding a long call = SELL, OPT, intent='close'. Its max_loss is inf —
+    the property can't tell a close from a naked-call open, so the GATE must."""
+    return ProposedTrade(
+        ticker="AAPL", asset_type="OPT", side="SELL",
+        qty=6, entry_price=2.75, stop=stop,
+        right="C", strike=300.0, dte=28, delta=0.27,
+        strategy_label="directional_long_call", intent="close",
+    )
+
+
+def test_r1_exempts_closing_a_long_call():
+    """The exact 2026-05-28 case: SELL 6 AAPL calls to CLOSE, no stop. max_loss
+    is inf, but a CLOSE must not be R1-blocked (nor blocked at all)."""
+    t = _close_long_call(stop=None)
+    assert t.max_loss == float("inf")  # property unchanged; the gate must exempt closes
+    bs = blockers(check(_ctx(), t))
+    assert not any(v.rule == R1 for v in bs), [(v.rule, v.message) for v in bs]
+    assert bs == [], [(v.rule, v.message) for v in bs]
+
+
+def test_open_side_naked_call_still_blocked_after_close_exemption():
+    """Guard: exempting CLOSES must not weaken the OPEN side — a stopless naked
+    call OPEN is still blocked (R1 inf + R5c)."""
+    bs = blockers(check(_ctx(), _naked_call(stop=None)))
+    rules = {v.rule for v in bs}
+    assert R1 in rules, rules     # max_loss inf still blocks the open
+    assert R5C in rules, rules    # and the naked-call-needs-stop rule
 
 
 def test_r7_skipped_for_short_opens():
