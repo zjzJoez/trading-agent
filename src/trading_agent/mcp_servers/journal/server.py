@@ -297,14 +297,44 @@ def close_trade(
     caller should pre-compute and pass it.
     """
     closed_at = closed_at or _now()
+    thesis_id = None
+    thesis_closed = False
     with connection() as conn:
         conn.execute(
             "UPDATE trades SET exit_price = ?, outcome = ?, closed_at = ?, pnl = ? "
             "WHERE id = ?",
             (exit_price, outcome, closed_at, pnl, trade_id),
         )
+        # Thesis lifecycle: once a position fully closes its thesis is no longer
+        # live, so it must not linger as a stale 'open' thesis. When this trade's
+        # thesis has no remaining OPEN trades, transition it out of 'open'.
+        # (Previously close_trade only touched the trade row — every closed
+        # position left its thesis 'open' forever, which is why a pile of stale
+        # theses accumulated even though their trades had all closed.)
+        row = conn.execute(
+            "SELECT thesis_id FROM trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+        thesis_id = row[0] if row else None
+        if thesis_id is not None:
+            remaining_open = conn.execute(
+                "SELECT COUNT(*) FROM trades WHERE thesis_id = ? AND outcome = 'OPEN'",
+                (thesis_id,),
+            ).fetchone()[0]
+            if remaining_open == 0:
+                cur = conn.execute(
+                    "UPDATE theses SET status = 'triggered' "
+                    "WHERE id = ? AND status = 'open'",
+                    (thesis_id,),
+                )
+                thesis_closed = cur.rowcount > 0
         conn.commit()
-    return {"trade_id": trade_id, "outcome": outcome, "closed_at": closed_at}
+    return {
+        "trade_id": trade_id,
+        "outcome": outcome,
+        "closed_at": closed_at,
+        "thesis_id": thesis_id,
+        "thesis_closed": thesis_closed,
+    }
 
 
 @mcp.tool()
