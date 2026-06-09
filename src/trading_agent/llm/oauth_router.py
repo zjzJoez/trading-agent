@@ -239,14 +239,18 @@ class OAuthLLMRouter:
                 else:
                     raise RuntimeError(f"Unknown channel: {cfg.channel}")
         except RuntimeError as e:
-            # Detect quota / rate-limit shaped failures from the subprocess
-            # and route through the degrade table.  Other RuntimeError shapes
-            # (network, parsing, real bugs) propagate so we see them.
+            # codex is a non-critical CHALLENGER channel (4 cross-family roles).
+            # ANY codex failure — quota/rate-limit, auth/401 (expired OAuth
+            # refresh token), or network — must DEGRADE rather than crash the
+            # whole run. Flag the channel unhealthy so the remaining codex roles
+            # in this process skip the (slow ~100s) CLI spawn + retry and
+            # degrade instantly. claude_code / deepseek errors still propagate
+            # so genuine bugs in the primary path stay visible.
             err_str = str(e).lower()
-            if cfg.channel == "codex" and any(p in err_str for p in self._CODEX_QUOTA_PATTERNS):
+            if cfg.channel == "codex":
                 log.warning(
-                    "[%s] codex returned quota-shaped error: %s — flagging codex "
-                    "unhealthy for this process and degrading",
+                    "[%s] codex failed (%s) — flagging codex unhealthy for this "
+                    "process and degrading",
                     role, str(e)[:200],
                 )
                 self._channel_unhealthy["codex"] = str(e)[:200]
@@ -507,7 +511,28 @@ class OAuthLLMRouter:
                 degrade_target=None,
             )
         log.info("[%s] degrading → %s", role, target)
-        result = self.call(target, user_prompt, schema, max_tokens, timeout_s)
+        try:
+            result = self.call(target, user_prompt, schema, max_tokens, timeout_s)
+        except Exception as e:  # noqa: BLE001 — the fallback channel may ALSO be down
+            # e.g. DeepSeek returns 402 Insufficient Balance, or its key is
+            # unset. A dead fallback must NOT crash the run — return an empty
+            # degraded result (parsed=None) so the caller treats this role as
+            # "no signal" and the rest of the pipeline (working channels)
+            # continues. This is the same graceful shape as the no-degrade-
+            # target path above.
+            log.error(
+                "[%s] degrade target %s ALSO failed (%s) — returning empty "
+                "degraded result so the run can continue", role, target, str(e)[:200],
+            )
+            return LLMResult(
+                role=role,
+                raw_text="",
+                parsed=None,
+                tokens_estimated=0,
+                cost_usd=0.0,
+                degraded=True,
+                degrade_target=target,
+            )
         result.degraded = True
         result.degrade_target = target
         return result

@@ -224,3 +224,30 @@ def test_claude_codex_logged_in_returns_bool():
     """These are environment-dependent; just verify they don't raise."""
     assert isinstance(claude_logged_in(), bool)
     assert isinstance(codex_logged_in(), bool)
+
+
+def test_degrade_survives_dead_codex_and_dead_fallback(monkeypatch):
+    """codex 401 (expired OAuth) + DeepSeek 402 (zero balance) — BOTH channels
+    dead — must NOT crash the run. The codex role returns an empty degraded
+    result (parsed=None) so the pipeline continues on the working channels, and
+    codex is flagged unhealthy so sibling codex roles degrade instantly.
+
+    Regression for the 2026-06-09 incident: an expired codex refresh token plus
+    a zero-balance DeepSeek fallback crashed every candidate_entry at the first
+    challenger-role call (only 4 events recorded, no decision).
+    """
+    router = OAuthLLMRouter()
+
+    def _codex_dead(cfg, prompt, timeout_s):
+        raise RuntimeError("codex exited 1: 401 Unauthorized: refresh_token_reused")
+
+    def _deepseek_dead(cfg, prompt, timeout_s):
+        raise RuntimeError("deepseek HTTP 402: Insufficient Balance")
+
+    monkeypatch.setattr(router, "_invoke_codex", _codex_dead)
+    monkeypatch.setattr(router, "_invoke_deepseek", _deepseek_dead)
+
+    res = router.call(role="bear_researcher", user_prompt="x", timeout_s=5)
+    assert res.degraded is True
+    assert res.parsed is None
+    assert "codex" in router._channel_unhealthy
