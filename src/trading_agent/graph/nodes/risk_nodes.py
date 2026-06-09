@@ -472,11 +472,17 @@ def _proposal_to_hypothetical(proposal: dict) -> OpenPosition | None:
         mark=float(proposal.get("entry_price", 0)),
         stop=proposal.get("stop"),
         target=proposal.get("target"),
-        delta=proposal.get("option_delta") if asset_type == "OPT" else 1.0,
-        gamma=proposal.get("option_gamma", 0.0),
-        vega=proposal.get("option_vega", 0.0),
-        theta=proposal.get("option_theta", 0.0),
-        iv=proposal.get("option_iv", 0.0),
+        # Greeks must default to 0.0 and never be None: a None delta/gamma reads
+        # as "missing critical greeks" → data_quality degradation_level=2 → DEFER.
+        # candidate_entry's only snapshot position is this not-yet-filled
+        # hypothetical (held positions aren't wired into its state), so a
+        # proposal that omits option_delta used to freeze EVERY new entry.
+        # `or 0.0` covers both an absent key and a present-but-None value.
+        delta=(proposal.get("option_delta") or 0.0) if asset_type == "OPT" else 1.0,
+        gamma=proposal.get("option_gamma") or 0.0,
+        vega=proposal.get("option_vega") or 0.0,
+        theta=proposal.get("option_theta") or 0.0,
+        iv=proposal.get("option_iv") or 0.0,
         notional=float(proposal.get("entry_price", 0)) * float(proposal.get("qty", 0))
         * (100 if asset_type == "OPT" else 1),
         unrealized_pnl=0.0,

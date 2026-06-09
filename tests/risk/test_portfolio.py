@@ -137,3 +137,23 @@ def test_to_db_payload_round_trip_friendly():
     assert "aggregate_greeks" in payload
     assert isinstance(payload["open_positions"], list)
     assert payload["open_positions"][0]["symbol"] == p.symbol
+
+
+def test_proposal_without_option_delta_is_not_missing_greeks():
+    # Regression: a proposal that omits option_delta must yield a hypothetical
+    # with delta/gamma defaulted to 0.0 (never None), so it does NOT read as
+    # "missing critical greeks" → data_quality level 2 → DEFER. In candidate_entry
+    # the hypothetical is the only snapshot position, so a delta-less proposal
+    # previously froze every new entry.
+    from trading_agent.graph.nodes.risk_nodes import _proposal_to_hypothetical
+
+    proposal = {
+        "symbol": "US.NVDA260116C00150000", "ticker": "NVDA",
+        "asset_type": "OPT", "side": "BUY", "qty": 1, "entry_price": 2.5,
+    }  # deliberately no option_delta / option_gamma
+    hyp = _proposal_to_hypothetical(proposal)
+    assert hyp.delta == 0.0
+    assert hyp.gamma == 0.0
+    snap = build_snapshot(equity=100_000, cash=100_000, open_positions=[hyp])
+    assert snap.data_quality["degradation_level"] == 0
+    assert not any("greeks" in m for m in snap.data_quality["missing"])
