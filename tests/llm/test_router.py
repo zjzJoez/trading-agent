@@ -227,26 +227,33 @@ def test_claude_codex_logged_in_returns_bool():
 
 
 def test_degrade_survives_dead_codex_and_dead_fallback(monkeypatch):
-    """codex 401 (expired OAuth) + DeepSeek 402 (zero balance) — BOTH channels
-    dead — must NOT crash the run. The codex role returns an empty degraded
-    result (parsed=None) so the pipeline continues on the working channels, and
-    codex is flagged unhealthy so sibling codex roles degrade instantly.
+    """A codex challenger role whose primary AND fallback are both down must NOT
+    crash the run — it returns an empty degraded result (parsed=None) so the
+    pipeline continues, and codex is flagged unhealthy so sibling codex roles
+    degrade instantly.
 
-    Regression for the 2026-06-09 incident: an expired codex refresh token plus
-    a zero-balance DeepSeek fallback crashed every candidate_entry at the first
-    challenger-role call (only 4 events recorded, no decision).
+    codex challengers now fall back to CLAUDE (not DeepSeek), so this mocks
+    codex + claude_code (the fallback) + deepseek all failing. Regression for the
+    2026-06-09 incident: an expired codex refresh token crashed every
+    candidate_entry at the first challenger-role call (4 events, no decision).
     """
     router = OAuthLLMRouter()
 
     def _codex_dead(cfg, prompt, timeout_s):
         raise RuntimeError("codex exited 1: 401 Unauthorized: refresh_token_reused")
 
+    def _cc_dead(cfg, prompt, timeout_s):
+        raise RuntimeError("claude exited 1: auth error")
+
     def _deepseek_dead(cfg, prompt, timeout_s):
         raise RuntimeError("deepseek HTTP 402: Insufficient Balance")
 
     monkeypatch.setattr(router, "_invoke_codex", _codex_dead)
+    monkeypatch.setattr(router, "_invoke_cc", _cc_dead)
     monkeypatch.setattr(router, "_invoke_deepseek", _deepseek_dead)
 
+    # bear_researcher (codex) -> degrades to bear_researcher_claude (claude_code);
+    # with that ALSO dead, the degrade is still graceful (parsed=None).
     res = router.call(role="bear_researcher", user_prompt="x", timeout_s=5)
     assert res.degraded is True
     assert res.parsed is None

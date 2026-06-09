@@ -83,6 +83,26 @@ ROLE_CONFIG: dict[str, RoleConfig] = {
     "learning_critic_deepseek": RoleConfig(
         "deepseek", MODEL_DEEPSEEK_V4_PRO, "learning-critic", 50_000
     ),
+
+    # Claude (claude_code) degrade targets for the codex CHALLENGER roles.
+    # When codex is unavailable (expired OAuth, quota, network) these roles
+    # fall back to CLAUDE rather than DeepSeek — same agent file (so the source
+    # role's pydantic schema still validates), Sonnet tier. The claude_code
+    # primaries keep DeepSeek as their universal fallback; the codex challengers
+    # fall back to Claude. (Set 2026-06-09 after codex OAuth + DeepSeek balance
+    # both lapsed; Claude is the reliable always-on channel here.)
+    "fundamental_analyst_claude": RoleConfig(
+        "claude_code", MODEL_SONNET, "fundamental-analyst", 80_000
+    ),
+    "bear_researcher_claude": RoleConfig(
+        "claude_code", MODEL_SONNET, "bear-researcher", 100_000
+    ),
+    "risk_opportunity_claude": RoleConfig(
+        "claude_code", MODEL_SONNET, "risk-opportunity", 80_000
+    ),
+    "learning_critic_claude": RoleConfig(
+        "claude_code", MODEL_SONNET, "learning-critic", 50_000
+    ),
 }
 
 
@@ -98,12 +118,15 @@ ROLE_CONFIG: dict[str, RoleConfig] = {
 #
 # `None` = defer (skip the LLM call entirely; downstream defaults to safe path).
 DEGRADE_TABLE: dict[str, str | None] = {
+    # claude_code primaries → DeepSeek (cross-family universal fallback).
     "trader_synthesizer": "trader_synthesizer_deepseek",
     "risk_arbiter": "risk_arbiter_deepseek",
-    "bear_researcher": "bear_researcher_deepseek",
-    "fundamental_analyst": "fundamental_analyst_deepseek",
-    "risk_opportunity": "risk_opportunity_deepseek",
-    "learning_critic": "learning_critic_deepseek",
+    # codex challengers → Claude (DeepSeek is unreliable/unfunded; Claude is the
+    # always-on channel). Changed 2026-06-09.
+    "bear_researcher": "bear_researcher_claude",
+    "fundamental_analyst": "fundamental_analyst_claude",
+    "risk_opportunity": "risk_opportunity_claude",
+    "learning_critic": "learning_critic_claude",
     # Other roles (regime_reviewer, scout, technical_analyst, etc.): no
     # degrade configured — if their cap is hit, the entire run defers.
     # Add `<role>_deepseek` entries above + map them here if needed.
