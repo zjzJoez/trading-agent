@@ -1,13 +1,13 @@
 ---
 name: position-sizing
-description: Hard sizing rules (R1-R6) for every proposed paper order. The PreToolUse hook re-validates these numerically — if you skip them, the order is blocked.
+description: Hard sizing rules (R1-R6) for every proposed paper order. The order tools re-validate these numerically inside the moomoo MCP server — if you skip them, the order is blocked.
 ---
 
 # Position sizing
 
-Every order proposal MUST pass these six rules. The `pretool_order_guard` hook re-checks them against live equity + open positions at order-time, so slop here means a blocked order, not a soft warning.
+Every order proposal MUST pass these six rules. The shared order guard re-checks them against live equity + open positions at order-time — once client-side in the `pretool_order_guard` hook, and again **inside `place_paper_order` / `place_paper_option_order` themselves** (the authoritative check; the autonomous graph, scripts, and direct MCP calls cannot route around it). Slop here means a blocked order, not a soft warning.
 
-Canonical code: `src/trading_agent/sizing.py` (pure functions, no I/O). Hook: `src/trading_agent/hooks/pretool_order_guard.py`.
+Canonical code: `src/trading_agent/sizing.py` (pure rules, no I/O) + `src/trading_agent/order_guard.py` (shared gate: thesis freshness, open/close intent, SELL-to-open block, audit). Hook: `src/trading_agent/hooks/pretool_order_guard.py`. Every evaluation is recorded in the `hook_audit_log` table; `jobs/reconcile_order_guard.py` alerts nightly on any fill with no evaluation row.
 
 ## The six rules
 
@@ -29,11 +29,11 @@ Canonical code: `src/trading_agent/sizing.py` (pure functions, no I/O). Hook: `s
 - If the proposed ticker isn't in the table, the hook emits `R4_sector_unknown` warn and does NOT block. Add missing tickers manually if you trade them often.
 
 ### R5 — options policy (long premium only)
-- **Side** = BUY only (selling premium is out of scope for MVP).
+- **Side** = BUY only to open. SELL-to-open is hard-blocked at the order layer (`R_short_option_open_blocked`) — including the short leg of a would-be spread — until multi-leg combos get atomic sizing. SELL-to-close an existing long is exempt.
 - **DTE** ∈ [14, 60]. Parsed from the OCC expiry in the option code; caller can also pass `dte` explicitly.
 - **|delta|** ∈ [0.30, 0.55] when `delta` is passed.
 - **Notional** ≤ 1% equity (= `contracts × 100 × entry` for long calls/puts).
-- Single-leg only at the hook level. Multi-leg requires manual journal entry.
+- Single-leg only. Do NOT leg into spreads with two orders — the SELL leg will be refused.
 
 ### R6 — earnings lock
 - Within 2 trading days of next earnings (`earnings_dte ∈ [0, 2]`), only strategy labels starting with `earnings_` are allowed.
@@ -62,11 +62,11 @@ cap_notional  = min(0.01 × equity,            # R5
 max_contracts = floor(cap_notional / (debit × 100))
 ```
 
-## When the hook blocks
+## When the guard blocks
 
-The hook stderr message names the rule + shows the numbers. Read it. Don't retry the same order — fix the inputs (smaller qty, wider stop, or different ticker). If you genuinely believe the rule is wrong for your strategy, that's a Phase-2 policy discussion — don't edit the hook.
+The hook stderr message (or the order tool's `{"order_blocked": true, "violations": [...]}` response) names the rule + shows the numbers. Read it. Don't retry the same order — fix the inputs (smaller qty, wider stop, or different ticker). If you genuinely believe the rule is wrong for your strategy, that's a Phase-2 policy discussion — don't edit the guard.
 
-## What the hook DOES NOT check
+## What the guard DOES NOT check
 
 - Liquidity (bid/ask spread, volume, open interest). That's your job.
 - Correlation beyond sector bucket. Two tech stocks = blocked by R4 once you have two opens; two banks with different exposure profiles might both be "Financials" — treat the rule as a floor, not a ceiling.

@@ -215,13 +215,20 @@ generated per-deployment and stored in `~/trading-agent/.env`.
 
 ### `hooks/`
 
-Same Phase-1 hooks, kept intact:
-
 ```
 hooks/reject_real_env.py        L3 defense — pattern match on tool input JSON
-hooks/pretool_order_guard.py    thesis freshness (10 min) + R1–R6 numerical re-validation
+hooks/pretool_order_guard.py    thin client-side wrapper over order_guard.py (early feedback)
 hooks/posttool_fill_capture.py  inserts trades + market_snapshots after a fill
 ```
+
+Since 2026-06 the order gate itself lives in `order_guard.py` (thesis
+freshness 10 min + R1–R7 numerical re-validation + SELL-to-open option hard
+block) and runs **inside** `place_paper_order` / `place_paper_option_order`
+in the moomoo MCP server — the authoritative choke point covering the
+autonomous graph, scripts, and any MCP client, not just Claude Code
+sessions. Every evaluation is audited to the `hook_audit_log` table;
+`jobs/reconcile_order_guard.py` (nightly launchd) alerts on any opening
+fill without a matching evaluation row.
 
 Phase 2 extends `pretool_order_guard.py` to also accept the autonomous-order
 path: requires a valid `risk_decision_id` referencing a non-expired

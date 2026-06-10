@@ -8,6 +8,10 @@ Design invariants:
 - Security firm = FUTUSG (Moomoo SG's internal firm code; unchanged since
   the SDK was forked from futu-api).
 - Context objects are lazily initialized and reused for the server lifetime.
+- Order tools are NOT a thin transport: they run the shared risk gate
+  (trading_agent.order_guard — thesis freshness, R1-R7, SELL-to-open
+  option block) and audit every evaluation to hook_audit_log before any
+  order reaches the broker. Client-side hooks are advisory layers on top.
 """
 from __future__ import annotations
 
@@ -31,6 +35,7 @@ from moomoo import (
 from mcp.server.fastmcp import FastMCP
 
 from trading_agent.config import CONFIG
+from trading_agent.order_guard import GuardDecision, audit_decision, evaluate_order
 
 # ---------------------------------------------------------------------------
 # Silence moomoo-api SDK stdout pollution.
@@ -464,8 +469,88 @@ def get_real_history_orders(
 # ------------------------ Paper-only order placement (Day 3) ------------------------
 #
 # These tools do NOT accept trd_env and always route through PAPER_ENV.
-# A separate PreToolUse hook enforces thesis + sizing gates before any of
-# these can run — this module only contains the transport layer.
+#
+# RISK GATE LIVES HERE. Every order runs the shared guard
+# (trading_agent.order_guard: thesis freshness + R1-R7 sizing + the
+# SELL-to-open option hard block) before touching the broker. The Claude
+# Code PreToolUse hook runs the SAME engine client-side for earlier
+# feedback, but it only covers interactive sessions — the autonomous
+# graph, other MCP clients, and scripts all reach this code directly, so
+# this is the authoritative choke point (the MRVL/AAPL spreads of
+# 2026-06-02/08 entered through exactly that gap). Every evaluation is
+# written to hook_audit_log; jobs/reconcile_order_guard.py alerts nightly
+# on fills with no matching row.
+
+
+def _fetch_paper_equity_cash() -> tuple[float, float | None]:
+    """Live (total_assets, cash) for the paper account, for sizing math.
+
+    Raises on any failure — the guard treats that as fail-closed ("cannot
+    verify sizing"). Cash is best-effort (field name varies by plan tier);
+    None lets R5b fall back to equity.
+    """
+    df = _require_ok(*_trade().accinfo_query(trd_env=PAPER_ENV), op="accinfo_query")
+    if df is None or df.empty:
+        raise RuntimeError("accinfo_query returned no rows")
+    equity = float(df.iloc[0]["total_assets"])
+    cash: float | None = None
+    for key in ("cash", "available_funds", "available_cash"):
+        v = df.iloc[0].get(key)
+        if v is None:
+            continue
+        try:
+            cash = float(v)
+            break
+        except (TypeError, ValueError):
+            continue
+    return equity, cash
+
+
+def _run_order_guard(
+    kind: Literal["stock", "option"],
+    params: dict,
+    tool_name: str,
+) -> dict | None:
+    """Evaluate + audit the order. Returns None when allowed, otherwise a
+    structured refusal dict for the caller to return verbatim.
+
+    The refusal deliberately has no "rows" key, so posttool_fill_capture
+    treats it as a no-op and never journals a trade for a refused order.
+    """
+    try:
+        equity, cash = _fetch_paper_equity_cash()
+    except Exception as e:
+        decision = GuardDecision(
+            allowed=False,
+            reason="cannot verify sizing — moomoo equity lookup failed",
+            symbol=str(params.get("option_symbol") or params.get("symbol") or ""),
+        )
+        audit_decision(decision, guard_name="server_order_guard", tool_name=tool_name)
+        return {
+            "order_blocked": True,
+            "guard": "server_order_guard",
+            "reason": decision.reason,
+            "detail": repr(e),
+            "violations": [],
+            "hint": "OpenD equity lookup failed; order refused fail-closed. "
+                    "Check OpenD connectivity and retry.",
+        }
+
+    decision = evaluate_order(kind, params, equity=equity, cash=cash)
+    audit_decision(decision, guard_name="server_order_guard", tool_name=tool_name)
+    if decision.allowed:
+        return None
+    return {
+        "order_blocked": True,
+        "guard": "server_order_guard",
+        "reason": decision.reason,
+        "violations": decision.violations_json(),
+        "warns": list(decision.warns),
+        "thesis_id": decision.thesis_id,
+        "hint": "Order refused by the server-side risk gate (thesis freshness "
+                "+ R1-R7 + no SELL-to-open option legs). Fix the violation and "
+                "retry; see data/trader.db hook_audit_log for the full record.",
+    }
 
 @mcp.tool()
 def place_paper_order(
@@ -486,16 +571,30 @@ def place_paper_order(
     the hook blocks the call if no matching open thesis exists.
 
     `stop` / `target` / `strategy_label` are *not* sent to the broker; the
-    Moomoo paper API only takes a single order leg. They are consumed by
-    the PreToolUse sizing hook (stop → R1 risk calc) and by the PostToolUse
-    fill-capture hook (persisted into trades for future post-mortem). A
-    BUY order without a stop still clears R1 via the 5% implicit-stop
-    fallback, but gets a warn entry in the audit log.
+    Moomoo paper API only takes a single order leg. They feed the risk
+    gate (stop → R1 risk calc) and the PostToolUse fill-capture hook
+    (persisted into trades for future post-mortem). A BUY order without
+    a stop still clears R1 via the 5% implicit-stop fallback, but gets
+    a warn entry in the audit log.
+
+    The order is re-validated HERE against thesis freshness + R1-R7
+    before reaching the broker; on violation the tool returns
+    `{"order_blocked": True, "violations": [...]}` and places nothing.
 
     Returns the broker order id and the fill status. The extra params
     are echoed back so the post-hook can recover them from tool_response.
     """
     _assert_paper()
+    refusal = _run_order_guard(
+        "stock",
+        {
+            "symbol": symbol, "side": side, "qty": qty, "price": price,
+            "stop": stop, "target": target, "strategy_label": strategy_label,
+        },
+        tool_name="place_paper_order",
+    )
+    if refusal is not None:
+        return refusal
     otype = OrderType.NORMAL if order_type == "NORMAL" else OrderType.MARKET
     tside = TrdSide.BUY if side == "BUY" else TrdSide.SELL
     ret, df = _trade().place_order(
@@ -534,14 +633,32 @@ def place_paper_option_order(
     only and limit-price only — market orders on options are rejected to
     avoid wide-spread fills on illiquid strikes.
 
-    `strategy_label` / `delta` / `dte` are consumed by the PreToolUse
-    sizing hook (R5 policy) and the PostToolUse fill-capture hook. They
-    are not sent to the broker.
+    `strategy_label` / `delta` / `dte` feed the risk gate (R5 policy)
+    and the PostToolUse fill-capture hook. They are not sent to the
+    broker.
+
+    The order is re-validated HERE against thesis freshness + R1-R7
+    before reaching the broker. SELL-to-OPEN (any short option leg,
+    including the short leg of a would-be spread) is hard-blocked until
+    multi-leg combos get atomic sizing; SELL-to-close an existing long
+    is allowed. On violation the tool returns
+    `{"order_blocked": True, "violations": [...]}` and places nothing.
 
     Falls back to a virtual fill (recorded directly in the journal) if
     MoomooOpenD rejects paper option orders for this account tier.
     """
     _assert_paper()
+    refusal = _run_order_guard(
+        "option",
+        {
+            "option_symbol": option_symbol, "side": side,
+            "contracts": contracts, "price": price,
+            "strategy_label": strategy_label, "delta": delta, "dte": dte,
+        },
+        tool_name="place_paper_option_order",
+    )
+    if refusal is not None:
+        return refusal
     tside = TrdSide.BUY if side == "BUY" else TrdSide.SELL
     ret, df = _trade().place_order(
         price=price,

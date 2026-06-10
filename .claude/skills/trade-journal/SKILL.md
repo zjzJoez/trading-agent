@@ -1,11 +1,11 @@
 ---
 name: trade-journal
-description: Every paper order requires a thesis recorded in the last 10 minutes. Use journal-mcp before calling any moomoo order tool — the PreToolUse hook blocks otherwise.
+description: Every paper order requires a thesis recorded in the last 10 minutes. Use journal-mcp before calling any moomoo order tool — the order guard blocks otherwise.
 ---
 
 # Trade journal — thesis-first discipline
 
-The self-learning loop depends on every trade having a recorded reason. The PreToolUse hook enforces this: **no open thesis for the ticker in the last 10 minutes → order is blocked.**
+The self-learning loop depends on every trade having a recorded reason. The order guard enforces this twice — in the PreToolUse hook AND inside the moomoo order tools themselves (so the graph, scripts, and direct MCP calls hit the same gate): **no open thesis for the ticker in the last 10 minutes → opening order is blocked.** Closes are exempt.
 
 MCP server: `journal-mcp`. DB tables: `theses`, `trades`, `notes`, `notes_vec`, `market_snapshots`, `post_mortems`.
 

@@ -5,7 +5,7 @@ description: How to pick single-leg long-premium options for directional setups.
 
 # Options strategy — MVP scope
 
-Phase-1 is **long premium only, single leg**. Short premium (covered calls, cash-secured puts, credit spreads, iron condors) is out of scope — R5 in the sizing hook blocks any SELL-side option order. This is deliberate: the learning loop works better on bounded-loss trades first.
+Phase-1 is **long premium only, single leg**. Short premium (covered calls, cash-secured puts, credit spreads, iron condors) is out of scope — the order guard inside `place_paper_option_order` itself **hard-blocks any SELL-to-open option leg** (rule `R_short_option_open_blocked`; SELL-to-close an existing long is fine). The same guard runs in the PreToolUse hook for early feedback, but the server-side check is authoritative — there is no way to route around it with scripts or direct MCP calls. This is deliberate: per-order sizing cannot bound a short leg's assignment exposure (a "spread" legged in as two orders evaluates its short leg as a naked short — see the 2026-06-08 AAPL 8x 300P leg, ~$235k assignment exposure at zero portfolio heat), and the learning loop works better on bounded-loss trades first.
 
 ## When to use options vs stock
 
@@ -40,7 +40,7 @@ Use these `strategy_label` values consistently — post-mortem aggregates by lab
 - `directional_long_call` / `directional_long_put` — straight single-leg with a clear catalyst.
 - `pullback_to_MA` — long call when underlying bounces off 50/200 DMA with volume confirmation.
 - `breakout_long_call` — long call when price closes above a consolidation range on volume.
-- `earnings_directional_debit_spread` — NOTE: MVP hook is single-leg; if you want a spread, leg into it manually with two `place_paper_option_order` calls **on the same thesis_id**. Journal will treat them as two trades; post-mortem aggregates by `strategy_label`.
+- `earnings_directional_debit_spread` — **currently unavailable.** Legging into a spread with two `place_paper_option_order` calls no longer works: the SELL leg is a SELL-to-open and the order guard refuses it (the old legging advice routed around per-order max-loss math — exactly how the MRVL/AAPL spreads slipped through in June 2026). Until multi-leg combos are first-class (atomic width-minus-credit sizing), express the view with a single long leg instead, sized so the full debit is the max loss.
 - `earnings_iv_drop` — buy the call *after* earnings once IV collapses (known edge on outliers).
 
 Any label starting with `earnings_` is the only allowed form within 2 trading days of the earnings date (R6).
