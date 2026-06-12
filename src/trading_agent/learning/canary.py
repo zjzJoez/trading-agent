@@ -159,7 +159,13 @@ def list_active_canaries() -> list[ActiveCanary]:
         return out
     seen_families: set[ParamFamily] = set()
     for r in rows:
-        params = {k: v for k, v in (r.get("params") or {}).items()
+        # Clamp values at read time, exactly like the ACTIVE read path
+        # (params._validate_payload): route_canary overlays these verbatim
+        # onto the live resolver, and the stop-distance consumer applies
+        # them without its own re-validation — an out-of-band DB edit must
+        # not be able to push a live stop outside the declared bounds.
+        params = {k: PARAM_BOUNDS[k].clamp(v)
+                  for k, v in (r.get("params") or {}).items()
                   if k in PARAM_BOUNDS}
         try:
             family = family_of_params(params)

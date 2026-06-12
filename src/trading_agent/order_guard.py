@@ -322,12 +322,21 @@ def fetch_option_quote(option_code: str,
         from trading_agent.mcp_servers.moomoo.server import get_quote
     except Exception:
         return None
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+    # NOT a context manager: with-block exit calls shutdown(wait=True), which
+    # JOINS a hung get_quote worker — stalling the order tool/hook in exactly
+    # the unsubscribed-contract hang this timeout exists for. On timeout we
+    # abandon the worker thread (shutdown(wait=False)) and fail closed to
+    # R5d_unquotable; the hook's moomoo server.shutdown() + hard process exit
+    # reap what's left.
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
         future = ex.submit(get_quote, [option_code])
         try:
             result = future.result(timeout=timeout_s)
         except Exception:
             return None
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     rows = (result or {}).get("rows") or []
     return rows[0] if rows else None
 

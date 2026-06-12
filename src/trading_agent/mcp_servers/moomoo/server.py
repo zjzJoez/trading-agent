@@ -510,12 +510,19 @@ def _run_order_guard(
     kind: Literal["stock", "option"],
     params: dict,
     tool_name: str,
+    option_quote: dict | None = None,
 ) -> dict | None:
     """Evaluate + audit the order. Returns None when allowed, otherwise a
     structured refusal dict for the caller to return verbatim.
 
     The refusal deliberately has no "rows" key, so posttool_fill_capture
     treats it as a no-op and never journals a trade for a refused order.
+
+    ``option_quote`` is a live snapshot row the caller already fetched (the
+    graph's execute_paper_order pulls one for marketable-limit pricing);
+    passing it through lets R5d evaluate it instead of re-fetching. It only
+    arrives via the INTERNAL placement impl — never the public MCP tool
+    signature, which a caller could spoof to bypass the liquidity gate.
     """
     try:
         equity, cash = _fetch_paper_equity_cash()
@@ -536,7 +543,8 @@ def _run_order_guard(
                     "Check OpenD connectivity and retry.",
         }
 
-    decision = evaluate_order(kind, params, equity=equity, cash=cash)
+    decision = evaluate_order(kind, params, equity=equity, cash=cash,
+                              option_quote=option_quote)
     audit_decision(decision, guard_name="server_order_guard", tool_name=tool_name)
     if decision.allowed:
         return None
@@ -616,6 +624,63 @@ def place_paper_order(
     }
 
 
+def _place_paper_option_order_impl(
+    option_symbol: str,
+    side: Literal["BUY", "SELL"],
+    contracts: int,
+    price: float,
+    thesis_id: int,
+    strategy_label: str | None = None,
+    delta: float | None = None,
+    dte: int | None = None,
+    option_quote: dict | None = None,
+) -> dict:
+    """Internal placement path — the MCP tool wrapper plus the autonomous
+    graph both land here. ``option_quote`` (a snapshot row the caller
+    already holds) is internal-only: exposing it on the MCP tool signature
+    would let any client hand the guard a fabricated quote and bypass R5d.
+    """
+    _assert_paper()
+    refusal = _run_order_guard(
+        "option",
+        {
+            "option_symbol": option_symbol, "side": side,
+            "contracts": contracts, "price": price,
+            "strategy_label": strategy_label, "delta": delta, "dte": dte,
+        },
+        tool_name="place_paper_option_order",
+        option_quote=option_quote,
+    )
+    if refusal is not None:
+        return refusal
+    tside = TrdSide.BUY if side == "BUY" else TrdSide.SELL
+    ret, df = _trade().place_order(
+        price=price,
+        qty=contracts,
+        code=option_symbol,
+        trd_side=tside,
+        order_type=OrderType.NORMAL,
+        trd_env=PAPER_ENV,
+    )
+    if ret != RET_OK:
+        return {
+            "thesis_id": thesis_id,
+            "strategy_label": strategy_label,
+            "delta": delta,
+            "dte": dte,
+            "virtual_fill_suggested": True,
+            "reason": str(df),
+            "hint": "MoomooOpenD rejected paper option order; caller should invoke trade-journal-mcp.record_virtual_fill",
+        }
+    return {
+        "thesis_id": thesis_id,
+        "strategy_label": strategy_label,
+        "delta": delta,
+        "dte": dte,
+        "rows": _df_records(df),
+    }
+
+
 @mcp.tool()
 def place_paper_option_order(
     option_symbol: str,
@@ -651,44 +716,12 @@ def place_paper_option_order(
     Falls back to a virtual fill (recorded directly in the journal) if
     MoomooOpenD rejects paper option orders for this account tier.
     """
-    _assert_paper()
-    refusal = _run_order_guard(
-        "option",
-        {
-            "option_symbol": option_symbol, "side": side,
-            "contracts": contracts, "price": price,
-            "strategy_label": strategy_label, "delta": delta, "dte": dte,
-        },
-        tool_name="place_paper_option_order",
+    # Thin wrapper — option_quote stays internal (see impl docstring).
+    return _place_paper_option_order_impl(
+        option_symbol=option_symbol, side=side, contracts=contracts,
+        price=price, thesis_id=thesis_id, strategy_label=strategy_label,
+        delta=delta, dte=dte, option_quote=None,
     )
-    if refusal is not None:
-        return refusal
-    tside = TrdSide.BUY if side == "BUY" else TrdSide.SELL
-    ret, df = _trade().place_order(
-        price=price,
-        qty=contracts,
-        code=option_symbol,
-        trd_side=tside,
-        order_type=OrderType.NORMAL,
-        trd_env=PAPER_ENV,
-    )
-    if ret != RET_OK:
-        return {
-            "thesis_id": thesis_id,
-            "strategy_label": strategy_label,
-            "delta": delta,
-            "dte": dte,
-            "virtual_fill_suggested": True,
-            "reason": str(df),
-            "hint": "MoomooOpenD rejected paper option order; caller should invoke trade-journal-mcp.record_virtual_fill",
-        }
-    return {
-        "thesis_id": thesis_id,
-        "strategy_label": strategy_label,
-        "delta": delta,
-        "dte": dte,
-        "rows": _df_records(df),
-    }
 
 
 @mcp.tool()

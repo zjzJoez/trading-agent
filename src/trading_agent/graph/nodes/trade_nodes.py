@@ -915,10 +915,15 @@ def execute_paper_order(state: TradingGraphState) -> dict:
     is_opt = _is_option_code(moomoo_symbol)
     fresh_ask: float | None = None
     fresh_bid: float | None = None
+    fresh_quote_row: dict | None = None
     try:
         from trading_agent.mcp_servers.moomoo.server import get_quote
         q = get_quote([moomoo_symbol])
         for r in (q.get("rows") or []):
+            # Keep the WHOLE row: the order guard's R5d liquidity gate takes
+            # it via the internal placement path, so the guard doesn't
+            # re-fetch (and can't re-hang) on a quote we already hold.
+            fresh_quote_row = r
             a = r.get("ask_price") or r.get("ask")
             b = r.get("bid_price") or r.get("bid")
             last = r.get("last_price") or r.get("cur_price")
@@ -973,9 +978,11 @@ def execute_paper_order(state: TradingGraphState) -> dict:
                     moomoo_symbol, place_price)
 
     try:
-        from trading_agent.mcp_servers.moomoo.server import place_paper_option_order
+        from trading_agent.mcp_servers.moomoo.server import (
+            _place_paper_option_order_impl,
+        )
 
-        result = place_paper_option_order(
+        result = _place_paper_option_order_impl(
             option_symbol=moomoo_symbol,
             side="BUY",
             contracts=approved_qty,
@@ -984,6 +991,10 @@ def execute_paper_order(state: TradingGraphState) -> dict:
             strategy_label=proposal.get("strategy_label"),
             delta=proposal.get("option_delta"),
             dte=proposal.get("option_dte"),
+            # Internal path: hand R5d the snapshot we just fetched for
+            # pricing instead of letting the guard double-fetch (and
+            # double-expose itself to the unsubscribed-contract hang).
+            option_quote=fresh_quote_row,
         )
     except Exception as e:
         log.error("[execute_paper_order] place_paper_option_order raised: %s", e)

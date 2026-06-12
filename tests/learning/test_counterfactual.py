@@ -58,14 +58,18 @@ _HALVER = {"size_mult_bull_trend": 0.5}  # candidate halves size vs default 1.0
 def test_is_qty_only_params():
     assert is_qty_only_params({"r1_soft_cap_pct": 0.01})
     assert is_qty_only_params({"size_mult_bull_trend": 0.8})
-    assert is_qty_only_params(
-        {"r5_soft_notional_pct": 0.005, "r3_ticker_exposure_pct": 0.08}
-    )
     # stop_distances is NOT qty-only — its effect needs the price path
     assert not is_qty_only_params({"implicit_stop_frac": 0.04})
     # mixed → not qty-only (the non-qty key needs the traffic split)
     assert not is_qty_only_params(
         {"r1_soft_cap_pct": 0.01, "implicit_stop_frac": 0.04}
+    )
+    # r3 is family-qty-only but replay can't model per-ticker exposure
+    # netting (needs the rest of the portfolio at each historical entry) —
+    # canaries touching it must take the traffic-split path.
+    assert not is_qty_only_params({"r3_ticker_exposure_pct": 0.08})
+    assert not is_qty_only_params(
+        {"r5_soft_notional_pct": 0.005, "r3_ticker_exposure_pct": 0.08}
     )
     # empty / unrecognised-only → False (fall back, never auto-promote)
     assert not is_qty_only_params({})
@@ -257,9 +261,28 @@ def test_maybe_evaluate_fails_open_on_db_error():
         assert maybe_evaluate_qty_only(42) is None
 
 
+def _patched_promote_preamble(status: str = "CANARY"):
+    """Patch promote.cursor (status read) + the hard-rollback triggers so a
+    dispatch test reaches the counterfactual hand-off. The dispatch sits
+    AFTER the sanity check and rollback triggers — they are routed-arm
+    safety brakes that must run for every canary, qty-only included."""
+    cur = MagicMock()
+    cur.fetchone.return_value = (status, 1)
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=cur)
+    ctx.__exit__ = MagicMock(return_value=False)
+    return (
+        patch("trading_agent.learning.promote.cursor", return_value=ctx),
+        patch("trading_agent.learning.promote.first_n_trades_breach",
+              return_value=False),
+        patch("trading_agent.learning.promote.consecutive_losing_days",
+              return_value=0),
+    )
+
+
 def test_promote_evaluate_canary_dispatches_qty_only():
     """evaluate_canary must return the counterfactual decision verbatim for
-    qty-only canaries — no traffic-split queries at all."""
+    qty-only canaries — no traffic-split stats."""
     from trading_agent.learning.promote import evaluate_canary
 
     cf = CounterfactualDecision(
@@ -267,7 +290,8 @@ def test_promote_evaluate_canary_dispatches_qty_only():
         rationale=["paired counterfactual: n=25 ..."], n_pairs=25,
         mean_diff=0.5, lb95=0.5, ub95=0.5,
     )
-    with patch(
+    p1, p2, p3 = _patched_promote_preamble()
+    with p1, p2, p3, patch(
         "trading_agent.learning.promote.maybe_evaluate_qty_only",
         return_value=cf,
     ):
@@ -283,10 +307,33 @@ def test_promote_evaluate_canary_reject_carries_rollback_reason():
         canary_version_id=42, decision="REJECT",
         rationale=["..."], n_pairs=25, mean_diff=-0.5, lb95=-0.5, ub95=-0.5,
     )
-    with patch(
+    p1, p2, p3 = _patched_promote_preamble()
+    with p1, p2, p3, patch(
         "trading_agent.learning.promote.maybe_evaluate_qty_only",
         return_value=cf,
     ):
         d = evaluate_canary(42)
     assert d.decision == "REJECT"
     assert d.rollback_reason == "counterfactual_ub95_negative"
+
+
+def test_promote_hard_rollback_precedes_counterfactual_dispatch():
+    """A qty-only canary with a first-5 hard-risk breach must be REJECTED by
+    the rollback trigger BEFORE the counterfactual can say PROMOTE — the
+    canary routes live traffic, so the safety brakes apply regardless of
+    which statistic decides promotion."""
+    from trading_agent.learning.promote import evaluate_canary
+
+    cur = MagicMock()
+    cur.fetchone.return_value = ("CANARY", 1)
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=cur)
+    ctx.__exit__ = MagicMock(return_value=False)
+    with patch("trading_agent.learning.promote.cursor", return_value=ctx), \
+         patch("trading_agent.learning.promote.first_n_trades_breach",
+               return_value=True), \
+         patch("trading_agent.learning.promote.maybe_evaluate_qty_only") as cf_mock:
+        d = evaluate_canary(42)
+    assert d.decision == "REJECT"
+    assert d.rollback_reason == "first5_breach"
+    cf_mock.assert_not_called()

@@ -273,25 +273,6 @@ class PromoteDecision:
 
 def evaluate_canary(canary_version_id: int) -> PromoteDecision:
     """Decide whether to promote, retain, or reject a canary row."""
-    # ITEM 11 dispatch — canaries whose changed keys are ALL qty-only
-    # (sizing_aggression / regime_size_multipliers) are evaluated by exact
-    # paired counterfactual replay over every closed trade, NOT by the
-    # traffic-split stats below: their effect is a deterministic qty rescale,
-    # so the paired design uses 100% of the sample with no attribution
-    # problem (full rationale in learning/counterfactual.py).  Returns None
-    # for non-qty families or on any read failure → fall through.
-    cf = maybe_evaluate_qty_only(canary_version_id)
-    if cf is not None:
-        return PromoteDecision(
-            canary_version_id=canary_version_id,
-            decision=cf.decision,
-            rationale=cf.rationale,
-            rollback_reason=(
-                "counterfactual_ub95_negative" if cf.decision == "REJECT"
-                else None
-            ),
-        )
-
     # 0. Sanity — only consider rows still flagged CANARY
     with cursor() as cur:
         cur.execute(
@@ -311,7 +292,11 @@ def evaluate_canary(canary_version_id: int) -> PromoteDecision:
             rationale=[f"status={status} — not a live canary"],
         )
 
-    # 1. Hard rollback triggers
+    # 1. Hard rollback triggers — these run for EVERY canary, including
+    # qty-only ones: they are routed-arm safety brakes (the canary IS taking
+    # live traffic), orthogonal to whichever statistic decides promotion.
+    # Dispatching to the counterfactual before them would exempt qty-only
+    # canaries from the first-5-breach and losing-streak rollbacks entirely.
     if first_n_trades_breach(canary_version_id):
         return PromoteDecision(
             canary_version_id=canary_version_id, decision="REJECT",
@@ -324,6 +309,26 @@ def evaluate_canary(canary_version_id: int) -> PromoteDecision:
             canary_version_id=canary_version_id, decision="REJECT",
             rationale=[f"{streak} consecutive losing days — rollback gate"],
             rollback_reason=f"losing_streak_{streak}",
+        )
+
+    # 1.5 ITEM 11 dispatch — canaries whose changed keys are ALL qty-only
+    # (sizing_aggression / regime_size_multipliers) get their PROMOTION
+    # statistic from exact paired counterfactual replay over every closed
+    # trade, NOT from the traffic-split stats below: their effect is a
+    # deterministic qty rescale, so the paired design uses 100% of the
+    # sample with no attribution problem (full rationale in
+    # learning/counterfactual.py).  Returns None for non-qty families or on
+    # any read failure → fall through to the traffic-split gates.
+    cf = maybe_evaluate_qty_only(canary_version_id)
+    if cf is not None:
+        return PromoteDecision(
+            canary_version_id=canary_version_id,
+            decision=cf.decision,
+            rationale=cf.rationale,
+            rollback_reason=(
+                "counterfactual_ub95_negative" if cf.decision == "REJECT"
+                else None
+            ),
         )
 
     # 2. Sample-size gate

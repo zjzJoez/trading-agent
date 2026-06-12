@@ -68,13 +68,23 @@ QTY_ONLY_FAMILIES: frozenset[ParamFamily] = frozenset({
 # — not routed journal rows.
 N_PAIRED_MIN = 20
 
+# Keys whose effect the replay CANNOT model even though their family is
+# qty-only: r3 needs the rest of the portfolio (per-ticker exposure netting)
+# at each historical entry, which replay_sizing_caps doesn't reconstruct.
+# Canaries touching these fall back to the traffic-split evaluation.
+_REPLAY_UNMODELED_KEYS: frozenset[str] = frozenset({"r3_ticker_exposure_pct"})
+
+
 def is_qty_only_params(params: dict[str, Any]) -> bool:
-    """True iff every recognised key sits in a qty-only family.
+    """True iff every recognised key sits in a qty-only family AND the
+    replay can faithfully model it.
 
     Unrecognised keys are ignored (they were rejected at insert time);
     an empty / fully-unrecognised dict returns False so the caller falls
     back to the traffic-split path rather than promoting a no-op row.
     """
+    if any(k in _REPLAY_UNMODELED_KEYS for k in params):
+        return False
     fams = {
         PARAM_BOUNDS[k].family for k in params if k in PARAM_BOUNDS
     }
@@ -311,7 +321,6 @@ def maybe_evaluate_qty_only(
 __all__ = [
     "N_PAIRED_MIN",
     "QTY_ONLY_FAMILIES",
-    "Z_95",
     "CounterfactualDecision",
     "evaluate_qty_only",
     "is_qty_only_params",

@@ -109,17 +109,42 @@ class ExitPlan(_Strict):
     time_in_trade_max_days: int = Field(ge=1, default=30)
 
 
-# Minimum risk-reward floor for LONG opening trades. 1.3:1 means we must
-# stand to make 1.3x what we risk on every entry. 5/22 raised from 1.5
-# after the SPY 742C 0.6:1 audit; 1.3 is still positive-EV at our ~55%
-# baseline win rate (0.55 × 1.3 − 0.45 = +0.27 R/trade), and accepts
-# more setups than 1.5 would.
+# ABSOLUTE minimum risk-reward floor for LONG opening trades — the floor
+# for labels with no strategy spec. Labels mapped to a spec in
+# strategy_specs.REGISTRY use the SPEC's min_risk_reward when higher (the
+# convexity track demands 2.0): _validate_geometry resolves the effective
+# floor via _effective_min_rr(), so a too-thin proposal fails HERE, inside
+# the router's schema-retry loop where the LLM can widen the target
+# in-flight — not after the full analyst/debate/synthesis pipeline has
+# burned its tokens only to die at deterministic sizing's R7.
+#
+# History: 5/22 raised from 1.5 to 1.3 after the SPY 742C 0.6:1 audit,
+# justified at the time by an UNCITED "~55% baseline win rate". The Phase-2
+# strategy specs replaced that arithmetic: each spec declares a falsifiable
+# expectancy profile with a friction-aware breakeven win rate
+# (strategy_specs.py is canonical).
 #
 # SHORT premium positions are not gated by R7 — see _validate_risk_reward.
 # R:R is structurally capped (reward = premium collected ≤ strike), so a
 # CSP at strike 100 selling for $2 would always fail R7 1.3:1 even when
 # the EV is clearly positive.
 MIN_RISK_REWARD = 1.3
+
+
+def _effective_min_rr(strategy_label: str | None) -> float:
+    """Spec floor when the label maps to one, else the global floor.
+
+    Never raises and never loosens: registry errors fall back to
+    MIN_RISK_REWARD, and a spec can only RAISE the floor (max()).
+    """
+    try:
+        from trading_agent.strategy_specs import spec_for_label
+        spec = spec_for_label(strategy_label)
+        if spec is not None and spec.min_risk_reward is not None:
+            return max(MIN_RISK_REWARD, float(spec.min_risk_reward))
+    except Exception:  # noqa: BLE001 — schema validation must never crash
+        pass
+    return MIN_RISK_REWARD
 
 
 def default_exit_plan(
@@ -388,12 +413,14 @@ class TraderProposal(_Strict):
                     f"entry ({self.entry_price})."
                 )
             rr = reward / risk
-            if rr < MIN_RISK_REWARD:
+            min_rr = _effective_min_rr(getattr(self, "strategy_label", None))
+            if rr < min_rr:
                 raise ValueError(
-                    f"R:R {rr:.2f} below floor {MIN_RISK_REWARD} "
+                    f"R:R {rr:.2f} below floor {min_rr} for "
+                    f"strategy_label={getattr(self, 'strategy_label', None)!r} "
                     f"(risk=${risk:.2f}, reward=${reward:.2f}). "
                     f"Tighten stop OR widen target until reward/risk >= "
-                    f"{MIN_RISK_REWARD}."
+                    f"{min_rr}."
                 )
 
         # If exit_plan is supplied, its hard_stop/hard_target should match

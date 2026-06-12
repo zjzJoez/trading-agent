@@ -143,20 +143,37 @@ def replay_sizing_caps(
     """Re-derive qty_shadow under the shadow resolver.
 
     Mirrors the qty-shrink loop in ``trade_nodes.deterministic_sizing`` but
-    parameterised by the resolver.  Hard caps from ``sizing.py`` (R1=0.02
-    notional risk, R5=0.01 notional ceiling) are still applied — soft knobs
-    can only tighten further.
+    parameterised by the resolver. Hard caps are IMPORTED from ``sizing.py``
+    — this function is now a promotion-gating instrument (the qty-only
+    counterfactual path), so its semantics must track the live consumer
+    exactly: hardcoded 0.020/0.010 here silently diverged when the
+    2026-05-22 threshold raises moved the live caps to 0.025/0.015, making
+    every replay over-tighten relative to what the candidate would really do.
+
+    Soft keys apply ONLY when explicitly present in the resolver's values —
+    mirroring the live consumer's strictly-tighter-only semantics. Resolving
+    a missing key to its PARAM_BOUNDS default here would manufacture a
+    treatment the live path never executes.
     """
+    from trading_agent.sizing import MAX_OPTION_NOTIONAL_PCT, MAX_SINGLE_RISK_PCT
+
     contracts_to_qty = max(1, int(contract_multiplier))
     notional_per_contract = entry_price * contracts_to_qty
 
     # Hard caps from sizing.py — never crossed
-    HARD_R1_PCT = 0.020
-    HARD_R5_PCT = 0.010
+    HARD_R1_PCT = MAX_SINGLE_RISK_PCT
+    HARD_R5_PCT = MAX_OPTION_NOTIONAL_PCT
+
+    def _soft(r: ParamResolver, key: str, hard: float) -> float:
+        # Only an EXPLICIT override tightens; absent key = hard cap, exactly
+        # like trade_nodes._soft_pct.
+        if key in r.values:
+            return min(float(r.values[key]), hard)
+        return hard
 
     def _resolve_qty(r: ParamResolver, mult: float) -> tuple[int, float, float, str | None]:
-        soft_r1 = min(r.get("r1_soft_cap_pct"), HARD_R1_PCT)
-        soft_r5 = min(r.get("r5_soft_notional_pct"), HARD_R5_PCT)
+        soft_r1 = _soft(r, "r1_soft_cap_pct", HARD_R1_PCT)
+        soft_r5 = _soft(r, "r5_soft_notional_pct", HARD_R5_PCT)
         r1_budget = soft_r1 * equity
         r5_cap = soft_r5 * equity
         # apply regime multiplier first

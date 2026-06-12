@@ -242,17 +242,29 @@ def main(argv: list[str] | None = None) -> int:
     failures: dict[str, str] = {}
     total_rows = 0
 
-    for u in underlyings:
-        try:
-            rows = snapshot_underlying(u, today)
-            if not args.dry_run and rows:
-                _insert_rows(rows)
-            per_underlying[u] = len(rows)
-            total_rows += len(rows)
-            log.info("[cache_option_chains] %s: %d contracts", u, len(rows))
-        except Exception as e:  # noqa: BLE001 — per-underlying isolation
-            failures[u] = repr(e)
-            log.warning("[cache_option_chains] %s failed: %s", u, e)
+    try:
+        for u in underlyings:
+            try:
+                rows = snapshot_underlying(u, today)
+                if not args.dry_run and rows:
+                    _insert_rows(rows)
+                per_underlying[u] = len(rows)
+                total_rows += len(rows)
+                log.info("[cache_option_chains] %s: %d contracts", u, len(rows))
+            except Exception as e:  # noqa: BLE001 — per-underlying isolation
+                failures[u] = repr(e)
+                log.warning("[cache_option_chains] %s failed: %s", u, e)
+    finally:
+        # The moomoo SDK's quote context starts NON-daemon callback threads;
+        # without an explicit shutdown this systemd oneshot hangs at exit and
+        # gets killed/failed by the unit every night. Same pattern as the
+        # PreToolUse hook's cleanup — only if the module actually loaded.
+        srv = sys.modules.get("trading_agent.mcp_servers.moomoo.server")
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception as e:  # noqa: BLE001 — never mask the run result
+                log.warning("[cache_option_chains] moomoo shutdown failed: %s", e)
 
     all_failed = bool(underlyings) and len(failures) == len(underlyings)
     if not args.dry_run:
