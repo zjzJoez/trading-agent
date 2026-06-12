@@ -37,7 +37,7 @@ heat = Σ  max(0, unrealized_loss_to_stop) over open positions
        (= per-position R1 contribution if stops were hit simultaneously)
 ```
 
-The hook caps R1 per trade at 2% equity and R2 caps concurrent opens at 5. Worst-case heat ≈ 10% equity if every stop hits at once. Live with that number — if it feels too high, keep open count below 5 or widen position stops.
+The order guard caps R1 per trade at 2.5% equity and R2 caps concurrent opens at 6 (2026-05-22 threshold raises; src/trading_agent/sizing.py is canonical). Worst-case heat ≈ 15% equity if every stop hits at once — and short option legs now contribute assignment-stress heat too. Live with that number — if it feels too high, keep open count down or widen position stops.
 
 ## The "don't touch it" list
 
@@ -46,7 +46,7 @@ Paper account or not, these reflexes kill real accounts:
 1. **Averaging down into a loss without a new thesis.** Hook allows it if sizing passes, but it almost always compounds the mistake. File a new thesis first, explaining *why* the second entry is different from the first.
 2. **Moving stops further away.** If the original stop is hit, that's the trade. Don't escape-hatch by widening.
 3. **Revenge trading.** After a loss, the `/research` step (with `search_past_trades`) is mandatory, not optional.
-4. **Selling premium on the way down.** Not a failure mode today (R5 blocks short options), but don't invent workarounds.
+4. **Selling premium on the way down.** Cash-secured puts (R5b, full collateral) and stop-protected naked calls (R5c) are allowed; SELL-to-open without those protections is hard-blocked at the order tools. Don't invent workarounds — every short leg charges assignment-stress heat.
 5. **Holding single-leg long options through earnings.** IV crush is a known lesson (see earnings-play skill).
 
 ## What the hook does NOT catch

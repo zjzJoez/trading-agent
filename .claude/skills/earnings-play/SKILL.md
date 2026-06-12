@@ -38,7 +38,7 @@ Before filing an earnings thesis:
 After the print, new thesis + new trade. Do NOT carry a pre-print position through unless the original thesis explicitly stated "through earnings" (rare and usually a mistake).
 
 1. **Gap beat + guide up** → consider `earnings_post_drift` long for 1-3 weeks.
-2. **Gap miss + guide cut** → consider short (stock only; R5 blocks long puts' sibling).
+2. **Gap miss + guide cut** → consider short stock, long puts, or a cash-secured put below the gap (R5b); naked short calls need a stop (R5c).
 3. **In-line + muted reaction** → no edge; move on.
 4. **Big gap + IV still elevated** → `earnings_iv_drop` after the first 1-2 days once IV normalizes.
 
