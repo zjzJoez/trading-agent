@@ -61,26 +61,29 @@ mcp__moomoo-mcp__place_paper_order(
 )
 ```
 
-**Option (single-leg, long premium only)**:
+**Option (single-leg; BUY opens long premium, SELL opens short premium — R5b/R5c apply)**:
 ```
 mcp__moomoo-mcp__place_paper_option_order(
   option_symbol="US.<OCC>",
-  side="BUY",
+  side="BUY" | "SELL",
   contracts=<from /size>,
-  price=<debit>,
+  price=<debit (BUY) / credit (SELL)>,
   thesis_id=<from step 1>,
   strategy_label=<earnings_... or directional_long_call/...>,
   delta=<from research>,
   dte=<from research>,
+  stop=<option-price stop > entry premium — REQUIRED when opening a naked short call (R5c)>,
 )
 ```
+
+Opening a short put must be fully cash-collateralized (R5b: `cash ≥ strike × 100 × qty − premium`); opening a naked short call without `stop` is blocked outright (R5c), and R1 sizes its risk on a 1.5× stress-buffered stop distance.
 
 ### If the hook blocks:
 
 Exit code 2 with stderr explaining which rule. Read it carefully — do NOT retry the identical order. Possible causes:
 
 - Thesis aged out of the 10-min window → re-file.
-- Sizing rule failed (R1-R6) → fix inputs. Tell the user which rule and the fix.
+- Sizing rule failed (R1-R7; thresholds canonical in `src/trading_agent/sizing.py`) → fix inputs. Tell the user which rule and the fix.
 - `reject_real_env` caught something → audit the tool_input for `trd_env` / `trading_password` / `REAL`. This is a real anomaly; surface to user loudly.
 
 ### If the option tool returns `virtual_fill_suggested=True`:
