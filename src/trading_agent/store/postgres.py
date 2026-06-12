@@ -198,5 +198,53 @@ def health() -> dict:
         return {"ok": False, "error": str(e)}
 
 
+# ---------------------------------------------------------------------------
+# Journal queries
+# ---------------------------------------------------------------------------
+
+
+def get_open_journal_trades() -> list[dict]:
+    """Return open journal_trades rows joined with journal_theses.
+
+    Canonical replacement for journal-mcp ``get_open_positions_with_thesis``
+    when called from the autonomous orchestrator: the MCP function reads the
+    Phase-1 SQLite ``trades`` table, but autonomous fills only write to
+    Postgres ``journal_trades`` (persist_trade_event), so SQLite is
+    perpetually empty for fills made by the agent itself.
+
+    Each row dict carries the broker symbol, trade/thesis ids, sizing and
+    risk levels, the deterministic exit machinery's fields (``exit_plan``,
+    ``mfe_so_far``, ``scale_rungs_taken``) plus the joined thesis fields
+    needed by mark-to-market and the exit-trigger enrichment.
+    ``strategy_label`` is extracted from ``broker_fill_json`` (it isn't a
+    top-level column on the Postgres mirror).
+
+    Returns ``[]`` on any DB error — callers must tolerate that.
+    """
+    sql = """
+        SELECT
+            t.id AS trade_id, t.symbol, t.asset_type, t.side,
+            t.qty, t.entry_price, t.stop, t.target,
+            t.exit_plan, t.mfe_so_far,
+            COALESCE(t.scale_rungs_taken, 0) AS scale_rungs_taken,
+            t.opened_at, t.thesis_id,
+            t.broker_fill_json->>'strategy_label' AS strategy_label,
+            th.direction, th.thesis_text, th.invalidation,
+            th.status AS thesis_status
+        FROM journal_trades t
+        LEFT JOIN journal_theses th ON th.id = t.thesis_id
+        WHERE t.outcome = 'OPEN'
+        ORDER BY t.opened_at DESC
+    """
+    try:
+        with cursor() as cur:
+            cur.execute(sql)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as e:
+        log.warning("get_open_journal_trades query failed: %s", e)
+        return []
+
+
 if __name__ == "__main__":
     migrate_cli()

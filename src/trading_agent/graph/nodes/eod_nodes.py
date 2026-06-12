@@ -66,14 +66,18 @@ def _get_moomoo_positions() -> tuple[dict[str, dict], float, float]:
 
 
 def _get_journal_open_trades() -> list[dict]:
-    """Return open journal_trades rows from SQLite via journal MCP server."""
+    """Return open journal_trades rows from Postgres (joined with theses).
+
+    Postgres ``journal_trades`` is the canonical source — autonomous fills
+    only write there, not to the Phase-1 SQLite mirror. The helper itself
+    returns ``[]`` on DB error, so this wrapper just guards the import.
+    """
     try:
-        from trading_agent.mcp_servers.journal.server import get_open_positions_with_thesis
-        result = get_open_positions_with_thesis()
-        return list(result.get("rows") or [])
+        from trading_agent.store.postgres import get_open_journal_trades
     except Exception as e:
-        log.warning("[eod] journal open positions fetch failed: %s", e)
+        log.warning("[eod] postgres import failed: %s", e)
         return []
+    return list(get_open_journal_trades())
 
 
 # ---------------------------------------------------------------------------

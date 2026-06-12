@@ -819,8 +819,8 @@ class TestRouteExitOrHold:
         )
         mock_order = {"thesis_id": 7, "rows": [{"order_id": "ORD123", "order_status": "SUBMITTED"}]}
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": [{"symbol": "US.AAPL", "trade_id": 7}]}):
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": "US.AAPL", "trade_id": 7}]):
                 with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order",
                            return_value=mock_order) as mock_place:
                     with patch("trading_agent.mcp_servers.journal.server.close_trade"):
@@ -849,8 +849,8 @@ class TestRouteExitOrHold:
         )
         mock_order = {"thesis_id": 15, "rows": [{"order_id": "OPT456", "order_status": "SUBMITTED"}]}
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": [{"symbol": opt_sym, "trade_id": 15}]}):
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": opt_sym, "trade_id": 15}]):
                 with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
                            return_value=mock_order) as mock_place_opt:
                     with patch("trading_agent.exits.fill_confirm.write_pending_close",
@@ -890,25 +890,30 @@ class TestRouteExitOrHold:
             }],
         )
         mock_order = {"thesis_id": 15, "rows": [{"order_id": "OPT456", "order_status": "SUBMITTED"}]}
+        pg_cursor = self._mock_pg_cursor([])
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": [{"symbol": opt_sym, "trade_id": 15}]}):
-                with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
-                           return_value=mock_order):
-                    with patch("trading_agent.exits.fill_confirm.write_pending_close",
-                               return_value=False):
-                        with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_sqlite",
-                                   return_value=set()):
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": opt_sym, "trade_id": 15}]):
+                with patch("trading_agent.store.postgres.cursor", return_value=pg_cursor):
+                    with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
+                               return_value=mock_order):
+                        with patch("trading_agent.exits.fill_confirm.write_pending_close",
+                                   return_value=False):
                             with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_pg",
                                        return_value=set()):
-                                with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
-                                    with patch("trading_agent.notify.send"):
-                                        from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
-                                        route_exit_or_hold(state)
-            # gross (6.37-3.0)×2×100 = 674; round-trip fees 2×$1×2 = $4 → 670
-            mock_close.assert_called_once_with(
-                trade_id=15, exit_price=pytest.approx(6.37),
-                outcome="WIN", pnl=pytest.approx(670.0))
+                                with patch("trading_agent.notify.send"):
+                                    from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                    route_exit_or_hold(state)
+        # Postgres-only journal: the fallback close is an UPDATE journal_trades
+        # at the executable-side limit with the fee-derived outcome.
+        # gross (6.37-3.0)×2×100 = 674; round-trip fees 2×$1×2 = $4 → net 670 → WIN
+        closes = [c for c in pg_cursor.execute.call_args_list
+                  if c.args and "SET exit_price" in c.args[0]]
+        assert len(closes) == 1, f"expected exactly one journal close, saw {closes!r}"
+        params = closes[0].args[1]
+        assert params[0] == pytest.approx(6.37)   # exit at bid-side limit
+        assert params[1] == "WIN"                 # outcome from NET pnl
+        assert params[3] == 15                    # trade_id
 
     def test_order_failure_does_not_journal(self):
         state = _base_state(
@@ -923,8 +928,8 @@ class TestRouteExitOrHold:
             }],
         )
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": [{"symbol": "US.SPY", "trade_id": 99}]}):
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": "US.SPY", "trade_id": 99}]):
                 with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order",
                            side_effect=ConnectionError("OpenD down")):
                     with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
@@ -957,8 +962,8 @@ class TestRouteExitOrHold:
             }],
         )
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": []}):  # empty SQLite
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[]):  # empty journal
                 with patch("trading_agent.store.postgres.cursor",
                            return_value=self._mock_pg_cursor([])):  # empty Postgres
                     with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order") as mock_place:
@@ -989,32 +994,27 @@ class TestRouteExitOrHold:
             }],
         )
         mock_order = {"thesis_id": 42, "rows": [{"order_id": "QQQ789", "order_status": "SUBMITTED"}]}
-        # SELECT id, symbol, thesis_id FROM journal_trades ...
-        # thesis_id column added when route_exit_or_hold gained close_thesis
-        # call. Using thesis_id=None exercises the "no parent thesis" branch.
-        pg_cursor = self._mock_pg_cursor([(42, opt_sym, None)])
+        # thesis_id=None exercises the "no parent thesis" branch.
+        pg_cursor = self._mock_pg_cursor([])
 
         with _patch_all_emits():
-            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                       return_value={"rows": []}):  # SQLite empty
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": opt_sym, "trade_id": 42,
+                                      "thesis_id": None}]):
                 with patch("trading_agent.store.postgres.cursor", return_value=pg_cursor):
-                    with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_sqlite",
-                               return_value=set()):
-                        with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_pg",
-                                   return_value=set()):
-                            with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
-                                       return_value=mock_order) as mock_place_opt:
-                                with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_sqlite_close:
-                                    with patch("trading_agent.notify.send"):
-                                        from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
-                                        route_exit_or_hold(state)
+                    with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
+                               return_value=mock_order) as mock_place_opt:
+                        with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_sqlite_close:
+                            with patch("trading_agent.notify.send"):
+                                from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                route_exit_or_hold(state)
 
         # Order placed with the Postgres-resolved trade_id (42)
         mock_place_opt.assert_called_once()
         opt_kwargs = mock_place_opt.call_args[1]
         assert opt_kwargs.get("thesis_id") == 42
 
-        # SQLite close_trade should NOT be called (trade not in SQLite)
+        # SQLite close_trade is never part of the autonomous path anymore
         mock_sqlite_close.assert_not_called()
 
         # Phase 0.3: the Postgres write is now the PENDING-CLOSE state stamp
@@ -1039,8 +1039,8 @@ class TestReconcileJournal:
                        return_value={"rows": [{"total_assets": 100_000, "cash": 50_000}]}):
                 with patch("trading_agent.mcp_servers.moomoo.server.get_positions",
                            return_value={"rows": [{"code": "US.AAPL", "qty": 10, "cost_price": 200}]}):
-                    with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                               return_value={"rows": [{"symbol": "US.AAPL", "trade_id": 1}]}):
+                    with patch("trading_agent.store.postgres.get_open_journal_trades",
+                               return_value=[{"symbol": "US.AAPL", "trade_id": 1}]):
                         from trading_agent.graph.nodes.eod_nodes import reconcile_journal
                         result = reconcile_journal(state)
         reconcile = result["journal"]["reconcile"]
@@ -1054,8 +1054,8 @@ class TestReconcileJournal:
                        return_value={"rows": []}):
                 with patch("trading_agent.mcp_servers.moomoo.server.get_positions",
                            return_value={"rows": [{"code": "US.NVDA", "qty": 5, "cost_price": 900}]}):
-                    with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
-                               return_value={"rows": []}):
+                    with patch("trading_agent.store.postgres.get_open_journal_trades",
+                               return_value=[]):
                         from trading_agent.graph.nodes.eod_nodes import reconcile_journal
                         result = reconcile_journal(state)
         reconcile = result["journal"]["reconcile"]

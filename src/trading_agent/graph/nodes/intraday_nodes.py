@@ -351,42 +351,35 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
     """
     out: dict[str, dict] = {}
     try:
-        from trading_agent.store.postgres import cursor
-        with cursor() as cur:
-            cur.execute(
-                """
-                SELECT t.symbol, t.id AS trade_id, t.thesis_id,
-                       t.stop, t.target, t.exit_plan,
-                       t.mfe_so_far, t.opened_at,
-                       COALESCE(t.scale_rungs_taken, 0) AS scale_rungs_taken,
-                       th.direction, th.thesis_text, th.invalidation
-                FROM journal_trades t
-                LEFT JOIN journal_theses th ON th.id = t.thesis_id
-                WHERE t.outcome = 'OPEN'
-                """,
-            )
-            for row in cur.fetchall():
-                (symbol, trade_id, thesis_id, stop, target, exit_plan,
-                 mfe_so_far, opened_at, scale_rungs_taken,
-                 direction, thesis_text, invalidation) = row
-                if not symbol:
-                    continue
-                out[str(symbol)] = {
-                    "trade_id": int(trade_id) if trade_id is not None else None,
-                    "thesis_id": int(thesis_id) if thesis_id is not None else None,
-                    "stop": float(stop) if stop is not None else None,
-                    "target": float(target) if target is not None else None,
-                    # exit_plan is JSONB; psycopg returns a dict directly.
-                    "exit_plan": exit_plan if isinstance(exit_plan, dict) else None,
-                    "mfe_so_far": float(mfe_so_far) if mfe_so_far is not None else None,
-                    "opened_at": opened_at,
-                    "scale_rungs_taken": int(scale_rungs_taken or 0),
-                    "direction": direction,
-                    "thesis_text": thesis_text,
-                    "invalidation": invalidation,
-                }
+        from trading_agent.store.postgres import get_open_journal_trades
+        rows = get_open_journal_trades()
     except Exception as e:
         log.warning("[detect_exit_triggers] journal enrichment query failed: %s", e)
+        return out
+    for row in rows:
+        symbol = row.get("symbol")
+        if not symbol:
+            continue
+        trade_id = row.get("trade_id")
+        thesis_id = row.get("thesis_id")
+        stop = row.get("stop")
+        target = row.get("target")
+        exit_plan = row.get("exit_plan")
+        mfe_so_far = row.get("mfe_so_far")
+        out[str(symbol)] = {
+            "trade_id": int(trade_id) if trade_id is not None else None,
+            "thesis_id": int(thesis_id) if thesis_id is not None else None,
+            "stop": float(stop) if stop is not None else None,
+            "target": float(target) if target is not None else None,
+            # exit_plan is JSONB; psycopg returns a dict directly.
+            "exit_plan": exit_plan if isinstance(exit_plan, dict) else None,
+            "mfe_so_far": float(mfe_so_far) if mfe_so_far is not None else None,
+            "opened_at": row.get("opened_at"),
+            "scale_rungs_taken": int(row.get("scale_rungs_taken") or 0),
+            "direction": row.get("direction"),
+            "thesis_text": row.get("thesis_text"),
+            "invalidation": row.get("invalidation"),
+        }
     return out
 
 
@@ -641,82 +634,44 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
 
     # Build a one-shot map of journal trade_ids by symbol so we never close
     # a position the journal doesn't know about (i.e. user-placed manual fills).
-    # Multi-source resolver: SQLite journal MCP first (canonical), then
-    # Postgres journal_trades as a fallback when SQLite is empty / out of sync.
-    # Value is (trade_id, thesis_id, source) where source ∈ {"sqlite", "postgres"}.
+    # Postgres journal_trades is the SOLE source: autonomous fills only write
+    # there (persist_trade_event); the Phase-1 SQLite mirror is perpetually
+    # empty for them, so consulting it first could only resolve the wrong row
+    # (e.g. an operator manual fill shadowing the agent's own trade).
     # thesis_id is included so close_thesis can fire after a successful exit —
     # otherwise the thesis stays status='open' forever and creates a zombie row
     # that blocks /eod-review hygiene checks.
-    journal_trade_id_by_symbol: dict[str, tuple[int, int | None, str]] = {}
-
-    # Source 1: SQLite journal MCP
-    journal_close_thesis = None  # type: ignore[assignment]
+    journal_trade_id_by_symbol: dict[str, tuple[int, int | None]] = {}
     try:
-        from trading_agent.mcp_servers.journal.server import (
-            close_thesis as journal_close_thesis,  # noqa: F811 - assignment from import
-            close_trade as journal_close_trade,
-            get_open_positions_with_thesis,
-        )
-        for row in (get_open_positions_with_thesis().get("rows") or []):
+        from trading_agent.store.postgres import get_open_journal_trades
+        for row in get_open_journal_trades():
             sym = row.get("symbol")
             tid = row.get("trade_id")
             th_id = row.get("thesis_id")
-            if sym and tid:
+            if sym and tid is not None:
                 journal_trade_id_by_symbol[str(sym)] = (
                     int(tid),
                     int(th_id) if th_id is not None else None,
-                    "sqlite",
                 )
     except Exception as e:
-        log.warning("[route_exit_or_hold] sqlite journal lookup failed: %s", e)
-        journal_close_trade = None  # type: ignore[assignment]
-
-    # Source 2: Postgres journal_trades (fallback for symbols not in SQLite)
-    needed_symbols = {d["symbol"] for d in exits} - set(journal_trade_id_by_symbol)
-    if needed_symbols:
-        try:
-            from trading_agent.store.postgres import cursor
-            with cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, symbol, thesis_id FROM journal_trades
-                    WHERE outcome = 'OPEN' AND symbol = ANY(%s)
-                    ORDER BY opened_at DESC
-                    """,
-                    (list(needed_symbols),),
-                )
-                for tid, sym, th_id in cur.fetchall():
-                    journal_trade_id_by_symbol.setdefault(
-                        str(sym),
-                        (
-                            int(tid),
-                            int(th_id) if th_id is not None else None,
-                            "postgres",
-                        ),
-                    )
-        except Exception as e:
-            log.warning("[route_exit_or_hold] postgres journal fallback failed: %s", e)
+        log.warning("[route_exit_or_hold] postgres journal lookup failed: %s", e)
 
     # In-flight closes (pending fill confirmation) — placing a second close
     # order for the same trade would over-close the position at the broker.
-    # The lookups return None on store error; that means "unknown", and
-    # unknown must FAIL CLOSED (skip exits resolved from that store this
-    # tick) — forgetting an in-flight close and placing a second one is
-    # unrecoverable, a one-tick delay is not.
+    # The lookup returns None on store error; that means "unknown", and
+    # unknown must FAIL CLOSED (skip all exits this tick) — forgetting an
+    # in-flight close and placing a second one is unrecoverable, a one-tick
+    # delay is not.
     try:
         from trading_agent.exits.fill_confirm import (
             find_adoptable_close_order,
             pending_close_trade_ids_pg,
-            pending_close_trade_ids_sqlite,
         )
-        pending_by_source: dict[str, set[int] | None] = {
-            "sqlite": pending_close_trade_ids_sqlite(),
-            "postgres": pending_close_trade_ids_pg(),
-        }
+        pending_ids_pg: set[int] | None = pending_close_trade_ids_pg()
     except Exception as e:
         log.warning("[route_exit_or_hold] pending-close lookup failed: %s", e)
         find_adoptable_close_order = None  # type: ignore[assignment]
-        pending_by_source = {"sqlite": None, "postgres": None}
+        pending_ids_pg = None
 
     # Live broker orders, for orphan adoption: a crash between a previous
     # run's order placement and its pending-state write leaves a resting
@@ -766,23 +721,22 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             )
             skipped_no_journal.append(symbol)
             continue
-        trade_id, thesis_id, trade_id_source = resolved
+        trade_id, thesis_id = resolved
 
-        pending_ids = pending_by_source.get(trade_id_source)
-        if pending_ids is None:
+        if pending_ids_pg is None:
             log.warning(
-                "[route_exit_or_hold] %s: pending-close state for store %s "
-                "unreadable — failing closed, exit deferred one tick",
-                symbol, trade_id_source,
+                "[route_exit_or_hold] %s: pending-close state unreadable — "
+                "failing closed, exit deferred one tick",
+                symbol,
             )
             emit(
                 run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
                 event_type="exit_deferred_pending_unknown", severity=1,
-                payload={"symbol": symbol, "store": trade_id_source},
+                payload={"symbol": symbol, "store": "postgres"},
             )
             failed_symbols.append(symbol)
             continue
-        if trade_id in pending_ids:
+        if trade_id in pending_ids_pg:
             log.info(
                 "[route_exit_or_hold] %s trade %s already has an exit in "
                 "flight — awaiting fill confirmation, skipping",
@@ -975,7 +929,7 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                 quoted_bid=float(quoted_bid) if quoted_bid else None,
                 quoted_ask=float(quoted_ask) if quoted_ask else None,
                 thesis_id=thesis_id,
-                source=trade_id_source,
+                source="postgres",
             )
             if write_pending_close(trade_id, pending):
                 exit_pending = True
@@ -1007,84 +961,50 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                 outcome_j = outcome_for_pnl(pnl_j)
                 close_reason_j = f"{action} [exit fill UNCONFIRMED — pending-state write failed]"
 
-                if trade_id_source == "sqlite" and journal_close_trade is not None:
-                    try:
-                        journal_close_trade(
-                            trade_id=trade_id,
-                            exit_price=exit_price,
-                            outcome=outcome_j,
-                            pnl=pnl_j,
-                        )
-                        closed_ok = True
-                    except Exception as e:
-                        log.warning("[route_exit_or_hold] sqlite close_trade %s failed: %s", symbol, e)
-                if not closed_ok:
-                    # Either source was postgres, or sqlite path raised — write directly to Postgres.
-                    try:
-                        from trading_agent.store.postgres import cursor
-                        with cursor() as cur:
-                            cur.execute(
-                                """
-                                UPDATE journal_trades
-                                SET exit_price = %s,
-                                    outcome = %s,
-                                    closed_at = COALESCE(closed_at, NOW()),
-                                    close_reason = COALESCE(close_reason, %s)
-                                WHERE id = %s AND outcome = 'OPEN'
-                                """,
-                                (exit_price, outcome_j, close_reason_j, trade_id),
-                            )
-                        closed_ok = True
-                        log.info("[route_exit_or_hold] %s journal closed via postgres trade_id=%s", symbol, trade_id)
-                    except Exception as e:
-                        log.warning("[route_exit_or_hold] postgres close %s failed: %s", symbol, e)
-
-        # Thesis flip (only on full closes — partial closes leave it open
-        # so subsequent rungs can still close out cleanly). Without this,
-        # theses pile up status='open' forever (the May 2026 AAPL/XLE/
-        # GLD/AMZN cleanup is the canonical example).
-        if closed_ok and not is_partial and thesis_id is not None:
-            thesis_note = f"trade {trade_id} closed via {action} ({reason})"[:280]
-            thesis_closed = False
-            # Route the thesis close to the SAME store as the trade close —
-            # they're written together at thesis_record time, so a postgres
-            # trade implies a postgres thesis. Without this gate, a postgres
-            # trade would try sqlite close_thesis first; sqlite MCP returns
-            # "ok" without raising even when the row is absent, leaving
-            # `thesis_closed=True` and skipping the postgres UPDATE. Result:
-            # journal_theses stays status='open' forever and accumulates
-            # zombies (the May 2026 AAPL/XLE/GLD/AMZN cleanup pattern).
-            if trade_id_source == "sqlite" and journal_close_thesis is not None:
-                try:
-                    journal_close_thesis(
-                        thesis_id=thesis_id,
-                        status="triggered",
-                        note=thesis_note,
-                    )
-                    thesis_closed = True
-                except Exception as e:
-                    log.warning(
-                        "[route_exit_or_hold] sqlite close_thesis(%s) failed: %s",
-                        thesis_id, e,
-                    )
-            if not thesis_closed:
+                # Postgres is the sole journal for autonomous trades — the
+                # resolver above only yields Postgres rows.
                 try:
                     from trading_agent.store.postgres import cursor
                     with cursor() as cur:
                         cur.execute(
-                            "UPDATE journal_theses SET status='triggered' "
-                            "WHERE id = %s AND status='open'",
-                            (thesis_id,),
+                            """
+                            UPDATE journal_trades
+                            SET exit_price = %s,
+                                outcome = %s,
+                                closed_at = COALESCE(closed_at, NOW()),
+                                close_reason = COALESCE(close_reason, %s)
+                            WHERE id = %s AND outcome = 'OPEN'
+                            """,
+                            (exit_price, outcome_j, close_reason_j, trade_id),
                         )
-                    log.info(
-                        "[route_exit_or_hold] thesis %s closed via postgres",
-                        thesis_id,
-                    )
+                    closed_ok = True
+                    log.info("[route_exit_or_hold] %s journal closed via postgres trade_id=%s", symbol, trade_id)
                 except Exception as e:
-                    log.warning(
-                        "[route_exit_or_hold] postgres close_thesis(%s) failed: %s",
-                        thesis_id, e,
+                    log.warning("[route_exit_or_hold] postgres close %s failed: %s", symbol, e)
+
+        # Thesis flip (only on full closes — partial closes leave it open
+        # so subsequent rungs can still close out cleanly). Without this,
+        # theses pile up status='open' forever (the May 2026 AAPL/XLE/
+        # GLD/AMZN cleanup is the canonical example). Postgres only — the
+        # thesis row was written alongside the Postgres trade row.
+        if closed_ok and not is_partial and thesis_id is not None:
+            try:
+                from trading_agent.store.postgres import cursor
+                with cursor() as cur:
+                    cur.execute(
+                        "UPDATE journal_theses SET status='triggered' "
+                        "WHERE id = %s AND status='open'",
+                        (thesis_id,),
                     )
+                log.info(
+                    "[route_exit_or_hold] thesis %s closed via postgres",
+                    thesis_id,
+                )
+            except Exception as e:
+                log.warning(
+                    "[route_exit_or_hold] postgres close_thesis(%s) failed: %s",
+                    thesis_id, e,
+                )
 
         if exit_pending:
             emit(
