@@ -1,0 +1,14 @@
+[Unit]
+Description=trading-agent — daily option-chain snapshot @ 21:15 UTC weekdays
+Requires=trading-agent-chain-cache.service
+
+[Timer]
+# US close: 16:00 ET = 21:00 UTC (winter). Snap chains 15 min after close so
+# closing rotation quotes have settled, and BEFORE the 21:30 eod_review —
+# the snapshot must capture the chain the review reasons about.
+OnCalendar=Mon..Fri *-*-* 21:15:00 UTC
+Persistent=true
+Unit=trading-agent-chain-cache.service
+
+[Install]
+WantedBy=timers.target
