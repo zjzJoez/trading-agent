@@ -10,12 +10,20 @@ Decisions for a CANARY param_version row are made daily by
 
   2. **Promotion** — only considered after ``N_canary_min = 20`` trades, AND
      only when BOTH canary and control have ≥ ``N_canary_min`` closed outcomes
-     in ``trade_outcome_features`` (empty aggregates pass every comparison
-     vacuously — 0 ≥ 0, 0 ≥ 0×0.95, 0 ≤ 0×1.1 — so thin evidence fails safe
-     to RETAIN).  Gates:
-       - Wilson 95% CI lower bound on win rate ≥ control's mean win rate
+     in ``trade_outcome_features`` (thin evidence fails safe to RETAIN — see
+     the comment at the evidence gate).  Gates:
+       - PRIMARY (Phase 2 item 10): LB95(mean realized R) of the canary ≥
+         max(0, control's mean-R point estimate) — the canary must be
+         credibly non-negative AND not credibly worse than control
+         (one-sided Student-t bound, ``_stats.lcb_mean``)
        - profit factor ≥ control × 0.95
        - max drawdown ≤ control × 1.1
+     Win rate and its Wilson LB are DIAGNOSTICS only: still computed and
+     reported in the rationale, never gating.  Re-keyed from the old
+     Wilson-LB-on-win-rate gate because win rate is not expectancy — the
+     convexity track's declared shape (strategy_specs.py) is 30–45% WR with
+     fat winners, which a win-rate gate structurally rejects while letting
+     high-WR books that bleed R per trade promote.
      If all three pass → status = ACTIVE; old ACTIVE → RETIRED;
      ``params_history`` snapshot row written; ``learning_events.canary_promoted``.
 
@@ -35,6 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
+from trading_agent.learning._stats import lcb_mean
 from trading_agent.learning.canary import (
     N_CANARY_MIN,
     n_trades_for_canary,
@@ -53,7 +62,8 @@ DecisionStr = Literal["PROMOTE", "RETAIN", "REJECT"]
 
 
 # ---------------------------------------------------------------------------
-# Wilson interval
+# Wilson interval — DIAGNOSTIC only since the item-10 re-key.  Win rate is
+# not expectancy; this is reported in rationale but never gates promotion.
 # ---------------------------------------------------------------------------
 
 def wilson_lb(wins: int, n: int, z: float = WILSON_Z_95) -> float:
@@ -80,13 +90,15 @@ class OutcomeStats:
     n: int
     wins: int
     losses: int
-    win_rate: float
-    wilson_lb: float
+    win_rate: float          # diagnostic — never gates (item-10 re-key)
+    wilson_lb: float         # diagnostic — never gates (item-10 re-key)
     gross_win: float
     gross_loss: float
     profit_factor: float
     cum_R: float
     max_drawdown_R: float
+    mean_R: float            # point estimate of expectancy per trade
+    lcb_mean_R: float | None  # LB95(mean R); None when n < 2 (no evidence)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -98,6 +110,9 @@ class OutcomeStats:
             "profit_factor": round(self.profit_factor, 4),
             "cum_R": round(self.cum_R, 4),
             "max_drawdown_R": round(self.max_drawdown_R, 4),
+            "mean_R": round(self.mean_R, 4),
+            "lcb_mean_R": (round(self.lcb_mean_R, 4)
+                           if self.lcb_mean_R is not None else None),
         }
 
 
@@ -149,6 +164,8 @@ def _aggregate(rs: list[float]) -> OutcomeStats:
         gross_win=gross_win, gross_loss=gross_loss,
         profit_factor=pf,
         cum_R=cum, max_drawdown_R=mdd,
+        mean_R=(cum / n) if n > 0 else 0.0,
+        lcb_mean_R=lcb_mean(rs),
     )
 
 
@@ -298,9 +315,13 @@ def evaluate_canary(canary_version_id: int) -> PromoteDecision:
         )
 
     # 3. Stats compare — gates are only meaningful with closed-outcome
-    #    evidence on BOTH sides.  Empty aggregates pass every comparison
-    #    vacuously (0 >= 0, 0 >= 0×0.95, 0 <= 0×1.1), so missing or thin
-    #    trade_outcome_features data must fail safe to RETAIN, never PROMOTE.
+    #    evidence on BOTH sides, so missing or thin trade_outcome_features
+    #    data must fail safe to RETAIN, never PROMOTE.  The expectancy gate
+    #    already fails on an empty canary (lcb_mean_R is None), but the
+    #    PF/MDD comparisons still pass vacuously against an empty CONTROL
+    #    (x >= 0×0.95, y <= 0×1.1 only when y=0) — keep the explicit n>=20
+    #    both-sides gate so thin evidence is named in the rationale instead
+    #    of silently surviving whichever comparisons happen to be vacuous.
     #    (n_trades_for_canary above counts routed journal rows, which can hit
     #    20 while enrichment lags or breaks — it is not outcome evidence.)
     canary_stats = _stats_for_version(canary_version_id)
@@ -321,10 +342,31 @@ def evaluate_canary(canary_version_id: int) -> PromoteDecision:
         )
 
     rationale: list[str] = []
-    pass_wilson = canary_stats.wilson_lb >= control_stats.win_rate
+
+    # PRIMARY gate (item 10): expectancy, not win rate.  LB95(mean R) must
+    # clear max(0, control mean R) — credibly non-negative AND not credibly
+    # worse than control.  A high-WR canary that bleeds R per trade can no
+    # longer promote, and a 35%-WR convexity canary with fat winners no
+    # longer needs a win-rate gate its spec never declared it would pass.
+    control_floor = max(0.0, control_stats.mean_R)
+    pass_expectancy = (
+        canary_stats.lcb_mean_R is not None
+        and canary_stats.lcb_mean_R >= control_floor
+    )
+    lb_txt = ("None" if canary_stats.lcb_mean_R is None
+              else f"{canary_stats.lcb_mean_R:.4f}")
     rationale.append(
-        f"wilson_lb={canary_stats.wilson_lb:.4f} vs control_win_rate="
-        f"{control_stats.win_rate:.4f} → {'pass' if pass_wilson else 'fail'}"
+        f"LB95(mean R)={lb_txt} vs floor=max(0, control mean R="
+        f"{control_stats.mean_R:.4f})={control_floor:.4f} → "
+        f"{'pass' if pass_expectancy else 'fail'}"
+    )
+
+    # DIAGNOSTIC only — reported for the post-mortem narrative, never
+    # gating: win rate is not expectancy (item-10 re-key).
+    rationale.append(
+        f"diagnostic (non-gating): win_rate={canary_stats.win_rate:.4f} "
+        f"(wilson_lb={canary_stats.wilson_lb:.4f}) vs control win_rate="
+        f"{control_stats.win_rate:.4f}"
     )
 
     pass_pf = canary_stats.profit_factor >= control_stats.profit_factor * PROFIT_FACTOR_FRAC
@@ -343,7 +385,7 @@ def evaluate_canary(canary_version_id: int) -> PromoteDecision:
         f"{'pass' if pass_mdd else 'fail'}"
     )
 
-    if pass_wilson and pass_pf and pass_mdd:
+    if pass_expectancy and pass_pf and pass_mdd:
         return PromoteDecision(
             canary_version_id=canary_version_id, decision="PROMOTE",
             rationale=rationale,
