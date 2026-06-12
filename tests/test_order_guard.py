@@ -58,9 +58,19 @@ def _insert_open_trade(symbol: str, asset_type: str = "OPT", qty: float = 1,
         return int(cur.lastrowid)
 
 
-def _eval(kind, params, equity=100_000.0, cash=100_000.0):
+def _eval(kind, params, equity=100_000.0, cash=100_000.0, **kw):
     from trading_agent.order_guard import evaluate_order
-    return evaluate_order(kind, params, equity=equity, cash=cash)
+    return evaluate_order(kind, params, equity=equity, cash=cash, **kw)
+
+
+# A snapshot row that clears R5d: spread 2/101 ≈ 2.0% of mid, OI 1200.
+GOOD_QUOTE = {"bid_price": 1.00, "ask_price": 1.02, "option_open_interest": 1200}
+
+
+def _patch_quote(monkeypatch, row):
+    """Stub the R5d live-snapshot fetch — tests must never touch OpenD."""
+    from trading_agent import order_guard as og
+    monkeypatch.setattr(og, "fetch_option_quote", lambda code, timeout_s=5.0: row)
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +128,9 @@ def test_stale_thesis_blocked(guard_db):
     assert "no open thesis" in d.reason
 
 
-def test_fresh_thesis_buy_option_allowed(guard_db):
+def test_fresh_thesis_buy_option_allowed(guard_db, monkeypatch):
     tid = _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, GOOD_QUOTE)
     d = _eval("option", {
         "option_symbol": "US.MRVL260702C00290000", "side": "BUY",
         "contracts": 1, "price": 1.00, "delta": 0.40,
@@ -159,11 +170,12 @@ def test_r1_oversize_stock_blocked(guard_db):
 # ---------------------------------------------------------------------------
 
 
-def test_audit_decision_writes_db_and_jsonl(guard_db, tmp_path):
+def test_audit_decision_writes_db_and_jsonl(guard_db, tmp_path, monkeypatch):
     from trading_agent import order_guard as og
     from trading_agent.db import connection
 
     _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, GOOD_QUOTE)
     d = _eval("option", {
         "option_symbol": "US.MRVL260702C00290000", "side": "BUY",
         "contracts": 1, "price": 1.00,
@@ -200,6 +212,205 @@ def test_audit_block_recorded(guard_db):
         row = conn.execute("SELECT decision, payload FROM hook_audit_log").fetchone()
     assert row["decision"] == "block"
     assert json.loads(row["payload"])["symbol"] == "US.AAPL260720P00300000"
+
+
+# ---------------------------------------------------------------------------
+# R5d option liquidity gate — opening orders only, closes always exempt.
+# The skill prose (spread < 10% of mid, OI > 100) was the ONLY screening
+# until 2026-06; the autonomous synthesizer bought at the ask unchecked.
+# ---------------------------------------------------------------------------
+
+
+def _buy_open_option(**over):
+    params = {
+        "option_symbol": "US.MRVL260702C00290000", "side": "BUY",
+        "contracts": 1, "price": 1.00, "delta": 0.40,
+    }
+    params.update(over)
+    return params
+
+
+def test_r5d_wide_spread_blocked(guard_db, monkeypatch):
+    from trading_agent.order_guard import R5D
+    _insert_thesis("MRVL")
+    # spread 0.20 on mid 1.10 = 18.2% of mid — way past the 5% cap.
+    _patch_quote(monkeypatch, {"bid_price": 1.00, "ask_price": 1.20,
+                               "option_open_interest": 1200})
+    d = _eval("option", _buy_open_option())
+    assert not d.allowed
+    assert d.reason == "option liquidity gate failed (R5d)"
+    assert any(v.rule == R5D and v.severity == "block" and "spread" in v.message
+               for v in d.violations)
+
+
+def test_r5d_low_open_interest_blocked(guard_db, monkeypatch):
+    """OI 120 cleared the old prose threshold (>100) — R5d demands >= 500."""
+    from trading_agent.order_guard import R5D
+    _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, {"bid_price": 1.00, "ask_price": 1.02,
+                               "option_open_interest": 120})
+    d = _eval("option", _buy_open_option())
+    assert not d.allowed
+    assert any(v.rule == R5D and "open interest" in v.message
+               for v in d.violations)
+
+
+def test_r5d_alternate_field_spellings_handled(guard_db, monkeypatch):
+    """Some snapshot payloads spell the fields 'bid'/'ask'/'open_interest'."""
+    from trading_agent.order_guard import R5D
+    _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, {"bid": 1.00, "ask": 1.02, "open_interest": 3})
+    d = _eval("option", _buy_open_option())
+    assert not d.allowed
+    assert any(v.rule == R5D for v in d.violations)
+
+
+def test_r5d_liquid_contract_allowed(guard_db, monkeypatch):
+    _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, GOOD_QUOTE)
+    d = _eval("option", _buy_open_option())
+    assert d.allowed, d.violations_json()
+    assert not any(v.rule.startswith("R5d") for v in d.violations)
+
+
+def test_r5d_quote_fetch_failure_blocks_unquotable(guard_db, monkeypatch):
+    """Fetch raising (OpenD down, timeout) → fail-closed for OPENS: an entry
+    you can't price honestly is an entry you skip."""
+    from trading_agent.order_guard import R5D_UNQUOTABLE
+
+    def _boom(code, timeout_s=5.0):
+        raise RuntimeError("OpenD unreachable")
+
+    _insert_thesis("MRVL")
+    monkeypatch.setattr("trading_agent.order_guard.fetch_option_quote", _boom)
+    d = _eval("option", _buy_open_option())
+    assert not d.allowed
+    assert any(v.rule == R5D_UNQUOTABLE for v in d.violations)
+
+
+def test_r5d_zero_bid_blocks_unquotable(guard_db, monkeypatch):
+    """A 0 bid means no one is on that side — unquotable, not 'spread=ask'."""
+    from trading_agent.order_guard import R5D_UNQUOTABLE
+    _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, {"bid_price": 0, "ask_price": 1.02,
+                               "option_open_interest": 1200})
+    d = _eval("option", _buy_open_option())
+    assert not d.allowed
+    assert any(v.rule == R5D_UNQUOTABLE for v in d.violations)
+
+
+def test_r5d_oi_missing_warns_not_blocks(guard_db, monkeypatch):
+    """Some snapshots omit OI entirely; spread is the primary protection,
+    so a tight-spread contract passes with a warn."""
+    from trading_agent.order_guard import R5D_OI_UNKNOWN
+    _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, {"bid_price": 1.00, "ask_price": 1.02})
+    d = _eval("option", _buy_open_option())
+    assert d.allowed, d.violations_json()
+    assert any(w.startswith(R5D_OI_UNKNOWN) for w in d.warns)
+
+
+def test_r5d_sell_to_close_exempt_even_with_terrible_quote(guard_db, monkeypatch):
+    """Closes are NEVER liquidity-gated — blocking an exit is the d089349
+    failure mode. The gate must not even fetch a quote for a close."""
+    sym = "US.AAPL260720C00200000"
+    _insert_open_trade(sym, qty=6, entry_price=9.0)
+
+    def _must_not_fetch(code, timeout_s=5.0):
+        raise AssertionError("R5d fetched a quote for a CLOSING order")
+
+    monkeypatch.setattr(
+        "trading_agent.order_guard.fetch_option_quote", _must_not_fetch)
+    d = _eval("option", {
+        "option_symbol": sym, "side": "SELL", "contracts": 6, "price": 9.55,
+    })
+    assert d.allowed, d.violations_json()
+    assert d.intent == "close"
+
+
+def test_r5d_stock_orders_unaffected(guard_db, monkeypatch):
+    _insert_thesis("NVDA")
+
+    def _must_not_fetch(code, timeout_s=5.0):
+        raise AssertionError("R5d fetched a quote for a stock order")
+
+    monkeypatch.setattr(
+        "trading_agent.order_guard.fetch_option_quote", _must_not_fetch)
+    d = _eval("stock", {
+        "symbol": "US.NVDA", "side": "BUY", "qty": 10, "price": 100.0,
+        "stop": 95.0, "target": 115.0,
+    })
+    assert d.allowed, d.violations_json()
+
+
+def test_r5d_caller_supplied_quote_skips_fetch(guard_db, monkeypatch):
+    """A caller that already holds a fresh snapshot passes it through via
+    option_quote= — evaluate_order must not double-fetch."""
+    _insert_thesis("MRVL")
+
+    def _must_not_fetch(code, timeout_s=5.0):
+        raise AssertionError("fetched despite option_quote in scope")
+
+    monkeypatch.setattr(
+        "trading_agent.order_guard.fetch_option_quote", _must_not_fetch)
+    d = _eval("option", _buy_open_option(), option_quote=dict(GOOD_QUOTE))
+    assert d.allowed, d.violations_json()
+
+
+def test_r5d_block_lands_in_audit_log(guard_db, monkeypatch):
+    """R5d must be auditable like every other rule — the nightly reconcile
+    joins fills against these rows."""
+    import json as _json
+    from trading_agent import order_guard as og
+    from trading_agent.db import connection
+    from trading_agent.order_guard import R5D
+
+    _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, {"bid_price": 1.00, "ask_price": 1.40,
+                               "option_open_interest": 1200})
+    d = _eval("option", _buy_open_option(price=1.40))
+    og.audit_decision(d, guard_name="server_order_guard",
+                      tool_name="place_paper_option_order")
+    with connection() as conn:
+        row = conn.execute("SELECT decision, payload FROM hook_audit_log").fetchone()
+    assert row["decision"] == "block"
+    rules = {v["rule"] for v in _json.loads(row["payload"])["violations"]}
+    assert R5D in rules
+
+
+# ---- fetch_option_quote: lazy moomoo-server import, swallow-all ----
+
+
+def _stub_server_module(monkeypatch, get_quote):
+    import sys
+    import types
+    monkeypatch.setitem(
+        sys.modules, "trading_agent.mcp_servers.moomoo.server",
+        types.SimpleNamespace(get_quote=get_quote),
+    )
+
+
+def test_fetch_option_quote_swallows_server_errors(monkeypatch):
+    from trading_agent.order_guard import fetch_option_quote
+
+    def _boom(symbols):
+        raise RuntimeError("get_market_snapshot failed")
+
+    _stub_server_module(monkeypatch, _boom)
+    assert fetch_option_quote("US.MRVL260702C00290000") is None
+
+
+def test_fetch_option_quote_empty_rows_is_none(monkeypatch):
+    from trading_agent.order_guard import fetch_option_quote
+    _stub_server_module(monkeypatch, lambda symbols: {"rows": []})
+    assert fetch_option_quote("US.MRVL260702C00290000") is None
+
+
+def test_fetch_option_quote_returns_first_row(monkeypatch):
+    from trading_agent.order_guard import fetch_option_quote
+    row = {"bid_price": 1.0, "ask_price": 1.02, "option_open_interest": 900}
+    _stub_server_module(monkeypatch, lambda symbols: {"rows": [row]})
+    assert fetch_option_quote("US.MRVL260702C00290000") == row
 
 
 # ---- dual-store close-intent (post-merge regression: Postgres journal) ----

@@ -548,8 +548,9 @@ def _run_order_guard(
         "warns": list(decision.warns),
         "thesis_id": decision.thesis_id,
         "hint": "Order refused by the server-side risk gate (thesis freshness "
-                "+ R1-R7 + no SELL-to-open option legs). Fix the violation and "
-                "retry; see data/trader.db hook_audit_log for the full record.",
+                "+ R1-R7 + no SELL-to-open option legs + R5d option liquidity). "
+                "Fix the violation and retry; see data/trader.db "
+                "hook_audit_log for the full record.",
     }
 
 @mcp.tool()
@@ -641,7 +642,10 @@ def place_paper_option_order(
     before reaching the broker. SELL-to-OPEN (any short option leg,
     including the short leg of a would-be spread) is hard-blocked until
     multi-leg combos get atomic sizing; SELL-to-close an existing long
-    is allowed. On violation the tool returns
+    is allowed. OPENING orders also pass the R5d liquidity gate against
+    a live snapshot: quoted spread <= 5% of mid AND open interest >= 500
+    at the strike; an unquotable contract (no live bid/ask) is refused
+    outright. Closes are exempt from R5d. On violation the tool returns
     `{"order_blocked": True, "violations": [...]}` and places nothing.
 
     Falls back to a virtual fill (recorded directly in the journal) if

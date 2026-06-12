@@ -122,6 +122,51 @@ def test_valid_order_places_and_audits(stub_ctx):
     assert row["decision"] == "allow"
 
 
+def test_illiquid_option_open_refused_before_broker(stub_ctx, monkeypatch):
+    """R5d wired through the order tool: the autonomous synthesizer's
+    buy-at-the-ask path gets a live spread/OI check at the choke point,
+    and the violation surfaces in the tool's response."""
+    from trading_agent import order_guard as og
+    from trading_agent.mcp_servers.moomoo import server
+
+    _insert_thesis("MRVL")
+    monkeypatch.setattr(
+        og, "fetch_option_quote",
+        lambda code, timeout_s=5.0: {
+            "bid_price": 1.00, "ask_price": 1.40, "option_open_interest": 50,
+        },
+    )
+    resp = server.place_paper_option_order(
+        option_symbol="US.MRVL260702C00290000", side="BUY",
+        contracts=1, price=1.40, thesis_id=1,
+    )
+    assert resp["order_blocked"] is True
+    assert "rows" not in resp
+    assert stub_ctx.place_order_calls == []
+    rules = {v["rule"] for v in resp["violations"]}
+    assert "R5d_illiquid" in rules
+
+
+def test_liquid_option_open_places(stub_ctx, monkeypatch):
+    from trading_agent import order_guard as og
+    from trading_agent.mcp_servers.moomoo import server
+
+    _insert_thesis("MRVL")
+    monkeypatch.setattr(
+        og, "fetch_option_quote",
+        lambda code, timeout_s=5.0: {
+            "bid_price": 1.00, "ask_price": 1.02, "option_open_interest": 1200,
+        },
+    )
+    resp = server.place_paper_option_order(
+        option_symbol="US.MRVL260702C00290000", side="BUY",
+        contracts=1, price=1.02, thesis_id=1, delta=0.40,
+    )
+    assert "order_blocked" not in resp
+    assert len(stub_ctx.place_order_calls) == 1
+    assert stub_ctx.place_order_calls[0]["code"] == "US.MRVL260702C00290000"
+
+
 def test_equity_lookup_failure_fails_closed(guard_db, monkeypatch):
     from trading_agent.mcp_servers.moomoo import server
     ctx = _StubTradeCtx(fail_accinfo=True)

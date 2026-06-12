@@ -29,8 +29,8 @@ Don't use options when:
 1. **Expiry**: DTE in `[14, 60]`. Sweet spot for directional plays is ~30 DTE.
 2. **Delta**: `|delta|` in `[0.25, 0.65]`. Below 0.25 is a lottery ticket; above 0.65 you're paying too much intrinsic.
 3. **IV**: check `list_option_expiries` and inspect chain IV. If IV rank > 70, consider stock instead.
-4. **Spread**: bid/ask < 10% of mid. Wider spreads = instant drawdown.
-5. **Open interest**: > 100 contracts at your strike. Thin OI = roach motel (easy to get in, hard to get out).
+4. **Spread**: quoted bid/ask spread ≤ 5% of mid — **enforced in code (rule R5d)**, no longer just prose. The order tools fetch a live snapshot for every OPENING option order and refuse wider spreads (`R5d_illiquid`); a contract with no obtainable bid/ask is refused outright (`R5d_unquotable` — an entry you can't price honestly is an entry you skip). Wider spreads = instant drawdown.
+5. **Open interest**: ≥ 500 contracts at your strike — **enforced in code (rule R5d)**, same gate (`R5d_illiquid`). If the snapshot omits OI the order passes with an `R5d_oi_unknown` warn (spread is the primary protection). Thin OI = roach motel (easy to get in, hard to get out). Closes/SELL-to-close are always exempt from R5d — you are never blocked from exiting. Thresholds are `LIQ_MAX_SPREAD_PCT_OF_MID` / `LIQ_MIN_OPEN_INTEREST` in `src/trading_agent/order_guard.py`; if this doc ever disagrees, order_guard.py wins.
 6. **Strike selection**: ATM-to-slightly-OTM on a directional play; avoid deep OTM unless the move is binary and near-term.
 
 ## MVP strategies, by label

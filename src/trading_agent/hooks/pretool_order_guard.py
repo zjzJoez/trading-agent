@@ -7,7 +7,11 @@ Runs on every invocation of moomoo-mcp's order-placing tools. Blocks
      (see order_guard.THESIS_FRESHNESS_MIN). Thesis table is source of truth.
   2. The order would OPEN a short option position (SELL-to-open hard block;
      SELL-to-close is exempt).
-  3. Any sizing rule in trading_agent.sizing returns a "block"-severity
+  3. An OPENING option order fails the R5d liquidity gate against a live
+     snapshot: quoted spread <= 5% of mid AND open interest >= 500 at the
+     strike; no obtainable bid/ask blocks as R5d_unquotable. Closes are
+     exempt — the gate never traps an exit.
+  4. Any sizing rule in trading_agent.sizing returns a "block"-severity
      violation (R1-R7; warns pass through).
 
 All evaluation logic lives in ``trading_agent.order_guard`` — the SAME
@@ -147,7 +151,21 @@ def main() -> int:
         )
         return 2
 
-    decision = evaluate_order(kind, tool_input, equity=equity, cash=cash)
+    try:
+        decision = evaluate_order(kind, tool_input, equity=equity, cash=cash)
+    finally:
+        # R5d's quote fetch lazily imports the moomoo server and creates its
+        # singleton OpenQuoteContext. That SDK context starts NON-DAEMON
+        # threads, and without close() they keep this hook process alive
+        # past sys.exit (the same hang server.shutdown()'s docstring cites
+        # from a py-spy dump of the orchestrator). Only touch the module if
+        # the fetch actually imported it — keep cold start fast otherwise.
+        srv = sys.modules.get("trading_agent.mcp_servers.moomoo.server")
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
     audit_decision(decision, guard_name=GUARD_NAME, tool_name=tool_name)
 
     if not decision.allowed:

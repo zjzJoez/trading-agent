@@ -24,13 +24,27 @@ Also owned here:
     open an option position. SELL-to-close stays exempt (intent='close',
     same journal-lookup logic d089349 relies on).
 
+  - R5d OPTION LIQUIDITY GATE: an OPENING option order must trade a liquid
+    contract (quoted spread <= 5% of mid, OI >= 500 at the strike, checked
+    against a live snapshot fetched at order time). Until 2026-06 the only
+    spread/OI screening was prose in the options-strategy skill — nothing
+    deterministic — so the autonomous synthesizer bought at the ask with
+    zero spread check. Closes are ALWAYS exempt: the guard must never trap
+    an exit (the d089349 failure mode); a wide spread on the way out is a
+    cost the journal measures, not a reason to hold.
+
   - AUDIT: every evaluation writes a row to the ``hook_audit_log`` table in
     trader.db (and a JSONL line in data/hook_audit.log). The nightly
     ``jobs/reconcile_order_guard.py`` joins opening fills against these rows
     and alerts on any fill that no guard layer evaluated.
 
 Import-light by design: trading_agent.{config,db,sizing} only — no moomoo
-SDK, no FastMCP — so the PreToolUse hook keeps its fast cold start.
+SDK, no FastMCP — so the PreToolUse hook keeps its fast cold start. The one
+exception is R5d's quote fetch, which lazily imports the moomoo server
+INSIDE the function and only for OPENING option orders; module import stays
+cheap. (Hook processes that trigger it must call the server's shutdown() —
+the SDK's quote context starts non-daemon threads that otherwise outlive
+sys.exit; see mcp_servers/moomoo/server.py shutdown docstring.)
 """
 from __future__ import annotations
 
@@ -60,6 +74,19 @@ THESIS_FRESHNESS_MIN = 10
 # option position until multi-leg combos get atomic sizing. Grep-able rule
 # code, same shape as the R* codes in sizing.py.
 R_NO_SHORT_OPEN = "R_short_option_open_blocked"
+
+# Rule R5d — liquidity gate for OPENING option orders. The options-strategy
+# skill carried these as prose only (spread < 10% of mid, OI > 100), which
+# the autonomous synthesizer never read at order time: it bought at the ask
+# with zero spread check, and wide-spread entries are the instant drawdown
+# execution_costs.py now measures but nothing prevented. Tighter-than-prose
+# thresholds, enforced here so every layer (hook, server, graph) gets them.
+# Closing option orders are ALWAYS exempt — never block an exit.
+LIQ_MAX_SPREAD_PCT_OF_MID = 0.05   # quoted (ask − bid) must be <= 5% of mid
+LIQ_MIN_OPEN_INTEREST = 500        # contracts of OI required at the strike
+R5D = "R5d_illiquid"               # spread or OI failed the thresholds
+R5D_UNQUOTABLE = "R5d_unquotable"  # no usable live bid/ask → block (fail-closed)
+R5D_OI_UNKNOWN = "R5d_oi_unknown"  # snapshot omits OI → warn (spread is primary)
 
 AUDIT_PATH = CONFIG.data_dir / "hook_audit.log"
 SECTORS_CSV = CONFIG.data_dir / "sectors.csv"
@@ -272,6 +299,131 @@ def has_existing_open_for(broker_symbol: str) -> bool:
     return True
 
 
+# ---- R5d option liquidity ----
+
+_QUOTE_FETCH_TIMEOUT_S = 5.0
+
+
+def fetch_option_quote(option_code: str,
+                       timeout_s: float = _QUOTE_FETCH_TIMEOUT_S) -> dict | None:
+    """Live snapshot row for one option code, or None on ANY failure.
+
+    Lazy import keeps this module import-light for the PreToolUse hook's
+    cold start (see module docstring); the moomoo SDK loads only when an
+    OPENING option order actually needs a liquidity read — and the broker
+    order itself needs OpenD anyway, so this adds no availability
+    dependency the order didn't already have. The thread+timeout mirrors
+    learning/excursion.py: get_market_snapshot can hang on option
+    contracts that aren't subscribed (no auto-subscribe on the free OpenD
+    path), and a hang here would stall the order tool itself.
+    """
+    import concurrent.futures
+    try:
+        from trading_agent.mcp_servers.moomoo.server import get_quote
+    except Exception:
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(get_quote, [option_code])
+        try:
+            result = future.result(timeout=timeout_s)
+        except Exception:
+            return None
+    rows = (result or {}).get("rows") or []
+    return rows[0] if rows else None
+
+
+def _pos_float(*vals) -> float | None:
+    """First value that parses to a float > 0, else None. Zero is None on
+    purpose: a 0 bid/ask in a snapshot means 'no quote on that side'."""
+    for v in vals:
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f > 0:
+            return f
+    return None
+
+
+def check_option_liquidity(option_code: str,
+                           quote: dict | None) -> list[SizingViolation]:
+    """Rule R5d for one OPENING option order, given a live snapshot row.
+
+    Returns SizingViolation entries (same shape as R1-R7) so the caller
+    folds them into the standard blockers/warns flow and every outcome
+    lands in hook_audit_log like any other rule.
+
+    Field spellings vary across moomoo snapshot payloads: bid/ask arrive
+    as 'bid_price'/'ask_price' or 'bid'/'ask'; open interest as
+    'option_open_interest' or 'open_interest' (graph/nodes/trade_nodes.py
+    and learning/excursion.py handle the same dual spellings). Failure
+    semantics: no quote at all, or a missing/zero bid or ask, is
+    unquotable → BLOCK — an entry you can't price honestly is an entry
+    you skip. A payload that quotes a tight spread but omits OI is a
+    warn only — some snapshots omit OI, and spread is the primary
+    protection.
+    """
+    if quote is None:
+        return [SizingViolation(
+            R5D_UNQUOTABLE,
+            f"no live quote for {option_code} (fetch failed, timed out, or "
+            f"returned no rows). An opening option order you cannot price "
+            f"honestly is an order you skip; closes are exempt from R5d.",
+            "block",
+        )]
+    bid = _pos_float(quote.get("bid_price"), quote.get("bid"))
+    ask = _pos_float(quote.get("ask_price"), quote.get("ask"))
+    if bid is None or ask is None:
+        return [SizingViolation(
+            R5D_UNQUOTABLE,
+            f"{option_code} has no two-sided market (bid={bid}, ask={ask} "
+            f"after parsing; missing/zero side = unquotable). Opening order "
+            f"refused; closes are exempt from R5d.",
+            "block",
+        )]
+    out: list[SizingViolation] = []
+    mid = (bid + ask) / 2.0
+    spread = max(0.0, ask - bid)  # crossed quotes (ask < bid) count as zero
+    spread_pct = spread / mid
+    if spread_pct > LIQ_MAX_SPREAD_PCT_OF_MID:
+        out.append(SizingViolation(
+            R5D,
+            f"quoted spread ${spread:.2f} is {spread_pct:.1%} of mid "
+            f"${mid:.2f} on {option_code}; R5d cap is "
+            f"{LIQ_MAX_SPREAD_PCT_OF_MID:.0%}. Crossing a wide spread is an "
+            f"instant, certain drawdown — pick a more liquid strike/expiry.",
+            "block",
+        ))
+    oi: int | None = None
+    for key in ("option_open_interest", "open_interest"):
+        v = quote.get(key)
+        if v is None:
+            continue
+        try:
+            oi = int(float(v))
+            break
+        except (TypeError, ValueError):
+            continue
+    if oi is None:
+        out.append(SizingViolation(
+            R5D_OI_UNKNOWN,
+            f"snapshot for {option_code} omits open interest; spread check "
+            f"is the primary protection, so allowing with a warn.",
+            "warn",
+        ))
+    elif oi < LIQ_MIN_OPEN_INTEREST:
+        out.append(SizingViolation(
+            R5D,
+            f"open interest {oi} < {LIQ_MIN_OPEN_INTEREST} at this strike "
+            f"({option_code}); thin OI is a roach motel — easy to get in, "
+            f"hard to get out.",
+            "block",
+        ))
+    return out
+
+
 # ---- proposed-trade construction ----
 
 def build_proposed(
@@ -392,10 +544,15 @@ def evaluate_order(
     *,
     equity: float,
     cash: float | None,
+    option_quote: dict | None = None,
 ) -> GuardDecision:
     """Run the full order gate: parse → intent → thesis freshness →
-    short-option-open hard block → R1-R7 sizing. Pure DB reads; the caller
-    supplies live equity/cash (each layer has its own broker transport).
+    short-option-open hard block → R5d liquidity → R1-R7 sizing. DB reads
+    plus, for OPENING option orders only, one live snapshot fetch (R5d);
+    the caller supplies live equity/cash (each layer has its own broker
+    transport). ``option_quote`` lets a caller that already holds a fresh
+    snapshot row for the option pass it through instead of triggering a
+    second fetch.
     """
     symbol = str(params.get("option_symbol") or params.get("symbol") or "")
     sector_map = load_sector_map()
@@ -461,6 +618,22 @@ def evaluate_order(
             proposed=proposed_summary,
         )
 
+    # ---- R5d option liquidity (OPENING option orders only) ----
+    # Closes are ALWAYS exempt: the guard must never trap an exit, and a
+    # wide spread on the way out is a cost to pay, not a reason to hold.
+    # SELL-to-open never reaches here (hard-blocked above), so in practice
+    # this gates BUY-to-open.
+    liq_vs: list[SizingViolation] = []
+    if proposed.asset_type == "OPT" and proposed.intent == "open":
+        if option_quote is not None:
+            quote = option_quote
+        else:
+            try:
+                quote = fetch_option_quote(symbol)
+            except Exception:
+                quote = None  # belt-and-suspenders; fetch already swallows
+        liq_vs = check_option_liquidity(symbol, quote)
+
     # ---- sizing (R1-R7) ----
     opens = load_open_positions(sector_map)
     ctx = SizingContext(
@@ -469,14 +642,21 @@ def evaluate_order(
         opens=tuple(opens),
         sector_lookup_available=bool(sector_map),
     )
-    vs = check(ctx, proposed)
+    vs = liq_vs + check(ctx, proposed)
     bs = blockers(vs)
     warns = tuple(f"{v.rule}: {v.message}" for v in vs if v.severity == "warn")
 
     if bs:
+        # Distinct reason when ONLY liquidity blocked — hook_audit_log
+        # greps for it; mixed violations keep the generic sizing reason.
+        liq_rules = {R5D, R5D_UNQUOTABLE}
         return GuardDecision(
             allowed=False,
-            reason="sizing rules violated",
+            reason=(
+                "option liquidity gate failed (R5d)"
+                if all(v.rule in liq_rules for v in bs)
+                else "sizing rules violated"
+            ),
             symbol=symbol,
             ticker=proposed.ticker,
             intent=proposed.intent,
