@@ -27,18 +27,21 @@ Non-qty families keep promote.py's traffic-split evaluation — their effects
 (different stops, different entries) are NOT post-hoc computable from the
 realized fills, so the split is the only unbiased estimator there.
 
-NOTE for the merger: ``_mean_ci_95`` deliberately duplicates the
-lcb-of-mean math a sibling cluster is adding to ``learning/_stats.py``
-(``lcb_mean``) — consolidate the two after both branches land.
+CI consolidation (2026-06-12 merge): ``_mean_ci_95`` delegates to
+``_stats.lcb_mean`` — the SAME one-sided 95% Student-t statistic the
+traffic-split promotion gate uses, so "LB95(mean R)" means one thing across
+both evaluation paths. This replaced an interim two-sided z constant
+(1.96 → t_{0.95,df}, e.g. 1.729 at n=20): marginally less conservative per
+tail, but spec-exact and t-corrected at small n.
 """
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from trading_agent.learning._stats import lcb_mean
 from trading_agent.learning.params import (
     PARAM_BOUNDS,
     ParamFamily,
@@ -65,9 +68,6 @@ QTY_ONLY_FAMILIES: frozenset[ParamFamily] = frozenset({
 # — not routed journal rows.
 N_PAIRED_MIN = 20
 
-Z_95 = 1.959963984540054  # two-sided 95%, same constant as promote.WILSON_Z_95
-
-
 def is_qty_only_params(params: dict[str, Any]) -> bool:
     """True iff every recognised key sits in a qty-only family.
 
@@ -82,9 +82,10 @@ def is_qty_only_params(params: dict[str, Any]) -> bool:
 
 
 def _mean_ci_95(ds: list[float]) -> tuple[float, float, float]:
-    """(mean, lb95, ub95) of the paired differences, normal approximation.
+    """(mean, lb95, ub95) of the paired differences via _stats.lcb_mean.
 
-    Sample sd (ddof=1).  With sd == 0 the CI collapses onto the mean —
+    One-sided 95% Student-t per tail (the t interval is symmetric, so
+    ub = 2·mean − lb). With sd == 0 the CI collapses onto the mean —
     correct behavior: identical candidate ⇒ d ≡ 0 ⇒ lb = ub = 0 ⇒ RETAIN
     (no evidence either way), never PROMOTE.
     """
@@ -92,11 +93,10 @@ def _mean_ci_95(ds: list[float]) -> tuple[float, float, float]:
     if n == 0:
         return 0.0, float("-inf"), float("inf")
     mean = sum(ds) / n
-    if n < 2:
+    lb = lcb_mean(ds, confidence=0.95)
+    if lb is None:  # n < 2 — no defensible bound in either direction
         return mean, float("-inf"), float("inf")
-    var = sum((d - mean) ** 2 for d in ds) / (n - 1)
-    half = Z_95 * math.sqrt(var / n)
-    return mean, mean - half, mean + half
+    return mean, lb, 2.0 * mean - lb
 
 
 @dataclass
