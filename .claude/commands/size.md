@@ -1,5 +1,5 @@
 ---
-description: Propose a sized order (qty, stop, target) that passes R1-R6. Returns numbers, not orders.
+description: Propose a sized order (qty, stop, target) that passes R1-R7. Returns numbers, not orders.
 argument-hint: SYMBOL DIRECTION
 ---
 
@@ -9,7 +9,7 @@ Compute a sized order proposal for `$ARGUMENTS` (format: `TICKER LONG` or `TICKE
 
 If the argument is malformed or missing, ask the user for `<TICKER> <DIRECTION>`.
 
-Directions accepted: `LONG`, `SHORT`, `LONG_CALL`, `LONG_PUT`, `VERTICAL_CALL_DEBIT`, `VERTICAL_PUT_DEBIT`. MVP hook rejects `SHORT_CALL` / `SHORT_PUT` at order time.
+Directions accepted: `LONG`, `SHORT`, `LONG_CALL`, `LONG_PUT`, `SHORT_PUT` (cash-secured put), `SHORT_CALL` (naked call), `VERTICAL_CALL_DEBIT`, `VERTICAL_PUT_DEBIT`. Short-premium opens must also satisfy R5b (CSP fully cash-collateralized) and R5c (naked call requires an explicit stop > entry).
 
 ## Procedure
 
@@ -25,32 +25,44 @@ Reconcile any mismatch between broker positions and journal — flag to the user
 
 - `mcp__moomoo-mcp__get_quote(["US.<TICKER>"])` for spot.
 - For stock: compute 14-day ATR from 30 days of daily K (use `get_historical_kline`). Propose stop at `spot - 1.5 × ATR` for LONG, `spot + 1.5 × ATR` for SHORT.
-- For options (LONG_CALL / LONG_PUT): use the pre-researched option contract (debit, delta, DTE) from `/research`. If the user hasn't run `/research` yet, ask them to, or call `get_option_chain_snapshot` ourselves.
+- For options (LONG_CALL / LONG_PUT / SHORT_PUT / SHORT_CALL): use the pre-researched option contract (premium, strike, delta, DTE) from `/research`. If the user hasn't run `/research` yet, ask them to, or call `get_option_chain_snapshot` ourselves.
 
-**3. Apply R1-R6 sizing math.**
+**3. Apply R1-R7 sizing math.**
+
+The numbers below mirror the canonical constants in `src/trading_agent/sizing.py` (`MAX_SINGLE_RISK_PCT`, `MAX_OPTION_NOTIONAL_PCT`, …) — if this doc and the constants disagree, sizing.py wins.
 
 For stock:
 
 ```
 risk_per_share = |entry - proposed_stop|
-qty_R1   = floor(0.02 * equity / risk_per_share)
-qty_R3   = floor(0.10 * equity / entry)
+qty_R1   = floor(0.025 * equity / risk_per_share)
+qty_R3   = floor(0.12 * equity / entry)
 qty      = min(qty_R1, qty_R3)
 ```
 
 For long option:
 
 ```
-max_contracts_R5   = floor(0.01 * equity / (debit * 100))
-max_contracts_R1   = floor(0.02 * equity / (debit * 100))
+max_contracts_R5   = floor(0.015 * equity / (debit * 100))
+max_contracts_R1   = floor(0.025 * equity / (debit * 100))
 max_contracts      = min(max_contracts_R5, max_contracts_R1)
+```
+
+For short premium (R5 notional cap of 1.5% equity still applies):
+
+```
+# Short put (CSP): risk_R1 = strike × 100 × qty − premium collected
+#                  R5b also requires cash ≥ that same amount.
+# Naked short call: risk_R1 = 1.5 × (stop − entry) × qty × 100
+#                  (stress-buffered; R5c blocks without an explicit stop > entry)
 ```
 
 Also check:
 
-- R2: `open_count < 5` — if ≥ 5, propose `qty=0` and tell the user to close something first.
+- R2: `open_count < 6` — if ≥ 6, propose `qty=0` and tell the user to close something first.
 - R4: look up proposed ticker in `data/sectors.csv` (read the file directly). Count opens in that sector. If ≥ 2, propose `qty=0`.
 - R6: if within 2 trading days of earnings AND direction is long premium without `earnings_` label, propose `qty=0` or switch to `earnings_directional_debit_spread`.
+- R7: opening LONG trades need `R:R = |target − entry| / |entry − stop| ≥ 1.3`. The default 2:1 target passes; if you override the target, re-check. Short-premium opens are exempt.
 
 **4. Propose a target.**
 
@@ -69,7 +81,7 @@ For options, target = 2 × debit (100% on debit) for single-leg. Override if the
 # /size $ARGUMENTS
 
 Equity: $XXX,XXX
-Open positions: N / 5
+Open positions: N / 6
 Same-sector opens: M / 2 (sector: ...)
 Earnings DTE: ... (or unknown)
 
@@ -80,16 +92,19 @@ Proposed order:
   entry         $X.XX  (limit)
   stop          $Y.YY  (implied risk: $X per share)
   target        $Z.ZZ  (R:R 2:1)
-  max loss      $X.XX  (<= 2% equity = $EQUITY * 0.02)
+  max loss      $X.XX  (<= 2.5% equity = $EQUITY * 0.025)
   strategy_label <label>
 
 Rule checks:
   R1  single-trade risk: PASS (risk $X ≤ $Y budget)
-  R2  concurrent opens:  PASS (N < 5)
+  R2  concurrent opens:  PASS (N < 6)
   R3  ticker exposure:   PASS ($A < $B budget)
   R4  sector concent.:   PASS (M < 2 in sector)
   R5  option policy:     N/A  (stock trade)
+  R5b CSP collateral:    N/A  (not a short put)
+  R5c naked-call stop:   N/A  (not a short call)
   R6  earnings lock:     PASS (DTE > 2)
+  R7  risk:reward:       PASS (2.0 ≥ 1.3)
 
 Ready for /enter with thesis_id=<TBD>.
 ```
