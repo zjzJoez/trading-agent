@@ -84,6 +84,9 @@ idempotent — you can run db_sync every 15 min safely.
 ## Hardening later (Phase 2)
 
 - Move cron to systemd timers for cleaner logging.
+- `trading-agent-chain-cache.timer` (21:15 UTC weekdays, in `ec2/systemd/`)
+  snapshots EOD option chains into Postgres `option_chain_snapshots` so traded
+  strategies stay backtestable — installed by `install_timers.sh`.
 - Gzip filings_cache/ weekly to keep disk usage bounded.
 - Add a CloudWatch alarm on "job hasn't completed in 60 min."
 - Run db_sync via a SSH bastion instead of direct port 22 exposure.
