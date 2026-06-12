@@ -51,7 +51,18 @@ class ParamFamily(str, Enum):
 
 @dataclass(frozen=True)
 class ParamBound:
-    """Allow-list entry: one mutable parameter."""
+    """Allow-list entry: one mutable parameter.
+
+    ``canary_eligible`` — True only when LIVE decision code outside learning/
+    consumes the key.  Background (ITEM 11): every Phase-2.7 canary before
+    this flag existed was an A/A test — params_version_id changed on the
+    journal row but no decision path read the value, so the promotion gates
+    were comparing two identical treatments and any PROMOTE was pure noise.
+    ``canary.route_canary`` skips ineligible keys so traffic is never spent
+    on a canary whose only effect is a label; the CI guard in
+    tests/learning/test_param_consumers.py greps the src tree to keep the
+    flag honest (eligible key with no consumer outside learning/ = red).
+    """
 
     family: ParamFamily
     default: float | int
@@ -59,6 +70,7 @@ class ParamBound:
     max: float | int
     description: str
     integer: bool = False
+    canary_eligible: bool = True
 
     def clamp(self, value: float | int) -> float | int:
         v = max(self.min, min(self.max, value))
@@ -81,10 +93,11 @@ class ParamBound:
 
 PARAM_BOUNDS: dict[str, ParamBound] = {
     # -- sizing_aggression -------------------------------------------------
-    # Note: R1 hard cap (MAX_SINGLE_RISK_PCT=0.02) and R5 hard cap
-    # (MAX_OPTION_NOTIONAL_PCT=0.01) live in sizing.py and are NOT mutable.
-    # The keys below are *additional, more conservative* knobs the learner
-    # may tighten further, never loosen past the Phase-1 floor.
+    # Note: R1/R5 hard caps (MAX_SINGLE_RISK_PCT / MAX_OPTION_NOTIONAL_PCT)
+    # live in sizing.py and are NOT mutable.  The keys below are
+    # *additional, more conservative* knobs the learner may tighten
+    # further, never loosen past the Phase-1 floor.
+    # Live consumer: trade_nodes.deterministic_sizing (_apply_soft_sizing_caps).
     "r1_soft_cap_pct": ParamBound(
         family=ParamFamily.SIZING_AGGRESSION,
         default=0.020, min=0.005, max=0.020,
@@ -102,6 +115,9 @@ PARAM_BOUNDS: dict[str, ParamBound] = {
     ),
 
     # -- stop_distances ----------------------------------------------------
+    # Live consumer: trade_nodes.persist_trade_event's default-exit-plan
+    # fallback (_stop_distance_fallback) — used only when the trader omits
+    # an explicit stop, so the resolver can never override a chosen stop.
     "implicit_stop_frac": ParamBound(
         family=ParamFamily.STOP_DISTANCES,
         default=0.05, min=0.025, max=0.10,
@@ -116,64 +132,92 @@ PARAM_BOUNDS: dict[str, ParamBound] = {
         family=ParamFamily.STOP_DISTANCES,
         default=1.50, min=0.75, max=3.00,
         description="ATR-multiple stop for equity-direction proxies.",
+        # Missing consumer: an ATR series is not available anywhere in the
+        # trade path at exit-plan-build time (persist_trade_event sees only
+        # entry/stop/target).  Until ATR is threaded into the proposal, a
+        # canary on this key is an A/A test.
+        canary_eligible=False,
     ),
 
     # -- entry_filters -----------------------------------------------------
+    # Missing consumer (all three): these gate which candidates the scout /
+    # trader LLMs even produce — upstream of assign_canary_node, so routing
+    # them live would mis-attribute outcomes (candidates were already chosen
+    # under control values).  Shadow-only until the node ordering moves
+    # canary assignment ahead of the scout.
     "min_setup_quality": ParamBound(
         family=ParamFamily.ENTRY_FILTERS,
         default=0.60, min=0.40, max=0.85,
         description="Trader setup-quality score floor (0..1).",
+        canary_eligible=False,
     ),
     "max_iv_percentile_long_premium": ParamBound(
         family=ParamFamily.ENTRY_FILTERS,
         default=70.0, min=40.0, max=90.0,
         description="Skip new long-premium entries if IV percentile above this.",
+        canary_eligible=False,
     ),
     "min_dte": ParamBound(
         family=ParamFamily.ENTRY_FILTERS,
         default=7, min=3, max=21, integer=True,
         description="Minimum days-to-expiry on new option entries.",
+        canary_eligible=False,
     ),
 
     # -- regime_thresholds -------------------------------------------------
     # v3 §6.2: VIX≥35, VIX 5d Δ≥+10, SPY 5d ≤−7%, corr≥0.80 + RV≥30, HYG ≤−5%
     # Two flags trip CRISIS.  These knobs let the learner tune sensitivity
     # within the published envelope.
+    # Missing consumer (all five): the live regime classifier
+    # (graph/nodes/regime_nodes.py) runs on its own schedule with
+    # DEFAULT_CRISIS_PARAMS / hardcoded confidence thresholds and never sees
+    # a per-ticker resolver — only learning/shadow.py and learning/replay.py
+    # read these keys, which makes any canary on them an A/A test.
     "crisis_vix_level": ParamBound(
         family=ParamFamily.REGIME_THRESHOLDS,
         default=35.0, min=30.0, max=45.0,
         description="VIX absolute-level crisis flag.",
+        canary_eligible=False,
     ),
     "crisis_vix_delta_5d": ParamBound(
         family=ParamFamily.REGIME_THRESHOLDS,
         default=10.0, min=7.0, max=15.0,
         description="VIX 5-day delta crisis flag.",
+        canary_eligible=False,
     ),
     "crisis_spy_5d_drop_pct": ParamBound(
         family=ParamFamily.REGIME_THRESHOLDS,
         default=-7.0, min=-10.0, max=-5.0,
         description="SPY 5-day return crisis flag (negative pct).",
+        canary_eligible=False,
     ),
     "regime_confidence_transition": ParamBound(
         family=ParamFamily.REGIME_THRESHOLDS,
         default=0.55, min=0.45, max=0.65,
         description="Below this HMM confidence → force VOLATILE_TRANSITION.",
+        canary_eligible=False,
     ),
     "regime_confidence_llm_review": ParamBound(
         family=ParamFamily.REGIME_THRESHOLDS,
         default=0.65, min=0.55, max=0.75,
         description="Below this HMM confidence → request LLM second opinion.",
+        canary_eligible=False,
     ),
 
     # -- candidate_count ---------------------------------------------------
+    # Missing consumer: scout output cap is applied upstream of
+    # assign_canary_node (same mis-attribution problem as entry_filters).
     "max_candidates_per_scout": ParamBound(
         family=ParamFamily.CANDIDATE_COUNT,
         default=5, min=1, max=12, integer=True,
         description="Scout output cap fed to candidate_entry per run.",
+        canary_eligible=False,
     ),
 
     # -- regime_size_multipliers ------------------------------------------
     # CRISIS multiplier is INTENTIONALLY ABSENT — it is a hard zero.
+    # Live consumer: trade_nodes.regime_execution_gate — effective multiplier
+    # is min(persisted gate multiplier, resolver value), tighten-only.
     "size_mult_bull_trend": ParamBound(
         family=ParamFamily.REGIME_SIZE_MULTIPLIERS,
         default=1.00, min=0.50, max=1.00,

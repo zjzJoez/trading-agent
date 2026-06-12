@@ -19,6 +19,10 @@ from typing import Any
 from trading_agent.events import emit
 from trading_agent.graph.state import TradingGraphState
 from trading_agent.sizing import (
+    IMPLICIT_STOP_FRAC,
+    MAX_OPTION_NOTIONAL_PCT,
+    MAX_SINGLE_RISK_PCT,
+    MAX_TICKER_EXPOSURE_PCT,
     OpenPosition as SizingOpenPosition,
     ProposedTrade,
     SizingContext,
@@ -27,6 +31,204 @@ from trading_agent.sizing import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Learning-resolver consumption (ITEM 11)
+# ---------------------------------------------------------------------------
+#
+# Before this block existed, NONE of the mutable keys in
+# learning/params.py PARAM_BOUNDS were read by live decision code — every
+# canary was an A/A test (params_version_id varied on journal rows but
+# both arms traded identically, so promotion gates measured pure noise).
+# The three consumers below are the deterministic chokepoints that have
+# BOTH the resolver snapshot (state["learning"]["params"]) and the value
+# they modulate:
+#
+#   sizing_aggression       → deterministic_sizing (_apply_soft_sizing_caps)
+#   stop_distances          → persist_trade_event (_stop_distance_fallback)
+#   regime_size_multipliers → regime_execution_gate (min() vs gate mult)
+#
+# Each node emits at most ONE agent_events row (event_type='param_consumed')
+# per invocation, and only when a resolver value actually ALTERED the
+# outcome — so the audit trail answers "did this canary do anything?"
+# without flooding agent_events on every run.
+
+
+# Regime label → resolver key for the regime_size_multipliers family.
+# Key literals live HERE (not in learning/) on purpose: the CI guard in
+# tests/learning/test_param_consumers.py greps for each canary-eligible key
+# outside learning/ to pin the consumer's existence.
+# CRISIS maps to None — its multiplier is a hard zero, never learnable.
+_REGIME_SIZE_MULT_PARAM_KEY: dict[str, str | None] = {
+    "BULL_TREND": "size_mult_bull_trend",
+    "RANGE_LOW_VOL": "size_mult_range_low_vol",
+    "VOLATILE_TRANSITION": "size_mult_volatile_transition",
+    "BEAR_TREND": "size_mult_bear_trend",
+    "CRISIS": None,
+}
+
+
+def _learning_param_values(state: dict) -> dict[str, float | int]:
+    """Resolver values snapshot from ``state["learning"]["params"]``.
+
+    Returns {} when load_active_params hasn't run, the row resolved to code
+    defaults, or the shape is unexpected.  Consumers MUST treat {} as "leave
+    behavior exactly as before" — a degraded learning store must never
+    change live sizing/stops (same fail-open contract as load_active_params).
+    """
+    learning = state.get("learning") or {}
+    params = learning.get("params") or {}
+    if not isinstance(params, dict):
+        return {}
+    values = params.get("values") or {}
+    return values if isinstance(values, dict) else {}
+
+
+def _emit_param_consumed(
+    state: dict, *, agent: str, effects: list[dict],
+) -> None:
+    """One ``param_consumed`` agent_events row per node invocation.
+
+    Only called when ``effects`` is non-empty, i.e. a resolver value
+    actually altered an outcome (cap bound qty, stop differed from the
+    code default, multiplier tightened).  Deduped per run by construction:
+    each consuming node batches its effects and calls this exactly once.
+    """
+    learning = state.get("learning") or {}
+    emit(
+        run_id=state["run_id"], trigger=state["trigger"], agent=agent,
+        event_type="param_consumed",
+        payload={
+            "params_version_id": learning.get("params_version_id"),
+            "effects": effects,
+        },
+    )
+
+
+def _apply_soft_sizing_caps(
+    *,
+    values: dict[str, float | int],
+    equity: float,
+    proposal: dict,
+    qty: float,
+    positions: list[dict],
+    effects: list[dict],
+) -> float:
+    """Tighten qty under the resolver's sizing_aggression soft caps.
+
+    effective_cap = min(hard_cap, resolver_value) for each of R1/R3/R5.
+    params.py bounds already forbid values above the hard caps, but min()
+    is enforced here anyway so a bad row / future bounds edit can never
+    LOOSEN a Phase-1 cap from the learning store — the learner may only
+    tighten.
+
+    Only keys explicitly present in ``values`` apply; a defaults-only
+    resolver ({}) leaves the qty byte-identical to the pre-learning path.
+    Binding caps append an audit entry to ``effects`` (consumed by the
+    single param_consumed emit in deterministic_sizing).
+    """
+    if not values or qty <= 0:
+        return qty
+
+    entry = float(proposal.get("entry_price") or 0.0)
+    if entry <= 0:
+        return qty
+    asset_type = proposal.get("asset_type", "OPT")
+    unit_mult = 100.0 if asset_type == "OPT" else 1.0
+    notional_per_unit = entry * unit_mult
+    # Per-unit worst-case loss, mirroring sizing.ProposedTrade.max_loss for
+    # the BUY-to-open cases this node sizes (long premium = full debit;
+    # stock = stop distance with the same implicit-stop fallback R1 uses).
+    stop_v = proposal.get("stop")
+    if asset_type == "OPT":
+        loss_per_unit = notional_per_unit
+    elif stop_v is not None:
+        loss_per_unit = abs(entry - float(stop_v))
+    else:
+        loss_per_unit = IMPLICIT_STOP_FRAC * entry
+
+    def _soft_pct(key: str, hard: float) -> float | None:
+        """Resolver pct iff present AND strictly tighter than the hard cap.
+
+        min() semantics with one refinement: at >= hard the soft knob adds
+        nothing (the R1-R6 candidate loop below enforces the hard rule
+        regardless), so applying it would emit a param_consumed row for an
+        outcome the resolver did NOT cause — false audit.
+        """
+        if key not in values:
+            return None
+        pct = min(hard, float(values[key]))
+        return pct if pct < hard else None
+
+    def _bind(key: str, cap_qty: int, detail: str) -> float:
+        nonlocal qty
+        if cap_qty < qty:
+            effects.append({
+                "key": key,
+                "value": float(values[key]),
+                "effect": f"qty {qty:g} -> {cap_qty} ({detail})",
+            })
+            qty = float(max(0, cap_qty))
+        return qty
+
+    r1_pct = _soft_pct("r1_soft_cap_pct", MAX_SINGLE_RISK_PCT)
+    if r1_pct is not None and loss_per_unit > 0:
+        budget = r1_pct * equity
+        _bind("r1_soft_cap_pct", int(budget / loss_per_unit),
+              f"soft R1 risk budget ${budget:,.2f}")
+
+    r5_pct = _soft_pct("r5_soft_notional_pct", MAX_OPTION_NOTIONAL_PCT)
+    if asset_type == "OPT" and r5_pct is not None and notional_per_unit > 0:
+        cap = r5_pct * equity
+        _bind("r5_soft_notional_pct", int(cap / notional_per_unit),
+              f"soft R5 notional cap ${cap:,.2f}")
+
+    r3_pct = _soft_pct("r3_ticker_exposure_pct", MAX_TICKER_EXPOSURE_PCT)
+    if r3_pct is not None and notional_per_unit > 0:
+        ticker_u = str(proposal.get("ticker") or "").upper()
+        existing = 0.0
+        for p in positions:
+            if _bare_ticker(p.get("symbol", "")).upper() == ticker_u:
+                p_mult = 100.0 if p.get("asset_type") == "OPT" else 1.0
+                existing += float(p.get("qty") or 0.0) * float(p.get("entry_price") or 0.0) * p_mult
+        cap = r3_pct * equity
+        _bind("r3_ticker_exposure_pct", int(max(0.0, cap - existing) / notional_per_unit),
+              f"soft R3 ticker cap ${cap:,.2f} (existing ${existing:,.2f})")
+
+    return qty
+
+
+def _stop_distance_fallback(
+    *, values: dict[str, float | int], entry: float, asset_type: str,
+) -> tuple[float, str, float] | None:
+    """Derive a fallback stop from the stop_distances resolver keys.
+
+    Only used by persist_trade_event when the proposal has NO explicit stop
+    — the resolver never overrides a stop the trader chose.  Returns
+    (stop_price, consumed_key, default_stop_price) or None when the
+    relevant key is absent from the resolver (defaults preserved: today a
+    stopless proposal gets no default exit plan, and that must not change
+    when the learning store is empty/degraded).
+
+    Conventions (literal per PARAM_BOUNDS descriptions):
+      * option_premium_stop_pct — the stop level IS this fraction of the
+        entry premium (0.50 → exit after a 50% premium burn).
+      * implicit_stop_frac — stop distance as a fraction of entry
+        (0.05 → stop 5% below entry), matching sizing.IMPLICIT_STOP_FRAC.
+    """
+    from trading_agent.learning.params import PARAM_BOUNDS
+
+    if entry <= 0:
+        return None
+    key = "option_premium_stop_pct" if asset_type == "OPT" else "implicit_stop_frac"
+    if key not in values:
+        return None
+    frac = float(values[key])
+    default_frac = float(PARAM_BOUNDS[key].default)
+    if asset_type == "OPT":
+        return entry * frac, key, entry * default_frac
+    return entry * (1.0 - frac), key, entry * (1.0 - default_frac)
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +1132,7 @@ def persist_trade_event(state: TradingGraphState) -> dict:
     # (entry, stop, target, asset_type). The plan is stored as JSONB in
     # journal_trades.exit_plan and read by hard_executor.hard_exit_decision.
     exit_plan_json: str | None = None
+    param_effects: list[dict] = []
     try:
         from trading_agent.llm.schemas import ExitPlan, default_exit_plan
 
@@ -941,6 +1144,44 @@ def persist_trade_event(state: TradingGraphState) -> dict:
             plan = ExitPlan.model_validate(prop_plan)
         elif isinstance(prop_plan, ExitPlan):
             plan = prop_plan
+        elif (
+            stop_v is None
+            and target_v is not None
+            and entry_price > 0
+        ):
+            # Learning consumer (stop_distances family, ITEM 11): the
+            # trader omitted a stop, so the resolver supplies the fallback
+            # stop the default plan is built from.  Resolver-gated: with no
+            # resolver values in state this stays a no-op (plan stays NULL
+            # and the hard executor keeps its legacy stop/target fallback)
+            # — defaults preserved when the learning store is empty.
+            derived = _stop_distance_fallback(
+                values=_learning_param_values(state),
+                entry=float(entry_price),
+                asset_type=str(asset_type),
+            )
+            if derived is not None:
+                derived_stop, consumed_key, default_stop = derived
+                if 0 < derived_stop < float(target_v):
+                    plan = default_exit_plan(
+                        entry=float(entry_price),
+                        stop=float(derived_stop),
+                        target=float(target_v),
+                        asset_type=str(asset_type),
+                    )
+                    if abs(derived_stop - default_stop) > 1e-9:
+                        # Stop differs from what the code default would
+                        # produce — the resolver altered the outcome.
+                        param_effects.append({
+                            "key": consumed_key,
+                            "value": float(
+                                _learning_param_values(state)[consumed_key]
+                            ),
+                            "effect": (
+                                f"fallback stop {default_stop:.4f} -> "
+                                f"{derived_stop:.4f} (entry {entry_price:.4f})"
+                            ),
+                        })
         elif (
             stop_v is not None
             and target_v is not None
@@ -955,6 +1196,9 @@ def persist_trade_event(state: TradingGraphState) -> dict:
         if plan is not None:
             import json as _json2
             exit_plan_json = _json2.dumps(plan.model_dump(), default=str)
+        if param_effects:
+            _emit_param_consumed(state, agent="persist_trade_event",
+                                 effects=param_effects)
     except Exception as e:
         # Never block trade recording on plan-construction failure — the
         # hard executor falls back to journal_trades.stop / .target when
@@ -1565,6 +1809,65 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
     except Exception as e:
         log.warning("[deterministic_sizing] soak cap check failed: %s", e)
 
+    # Learning soft caps (sizing_aggression family): min(hard, resolver) —
+    # the resolver can only TIGHTEN below the R1/R3/R5 hard rules that the
+    # candidate loop below still enforces.  This is the live consumer that
+    # turns a sizing canary into a real treatment (ITEM 11).
+    param_effects: list[dict] = []
+    try:
+        requested_qty = _apply_soft_sizing_caps(
+            values=_learning_param_values(state),
+            equity=equity,
+            proposal=proposal,
+            qty=requested_qty,
+            positions=positions,
+            effects=param_effects,
+        )
+    except Exception as e:
+        # Fail open to the hard rules — a malformed resolver value must
+        # never block sizing (mirrors load_active_params' contract).
+        log.warning("[deterministic_sizing] soft-cap application failed: %s", e)
+
+    if requested_qty <= 0:
+        # Soft caps zeroed the trade: even 1 unit busts the learner's
+        # budget.  Return infeasible HERE — the candidate loop below
+        # re-tries max(1, ...) qtys and would silently resurrect qty=1,
+        # undoing the cap.
+        if param_effects:
+            _emit_param_consumed(state, agent="deterministic_sizing",
+                                 effects=param_effects)
+        thesis_id = proposal.get("thesis_id")
+        if thesis_id:
+            _mark_thesis_rejected(
+                int(thesis_id), reason="sizing_infeasible: learning soft caps"
+            )
+        emit(
+            run_id=run_id, trigger=trigger, agent="deterministic_sizing",
+            event_type="infeasible", severity=1,
+            payload={
+                "ticker": proposal.get("ticker", "?"),
+                "thesis_id": thesis_id,
+                "blockers": [e["key"] for e in param_effects],
+                "violations": [
+                    {"rule": f"soft_{e['key']}", "severity": "block",
+                     "message": e["effect"][:240]}
+                    for e in param_effects
+                ],
+            },
+        )
+        return {
+            "proposal": {**proposal, "qty": 0.0},
+            "sizing": {
+                "r1_r6_violations": [
+                    {"rule": f"soft_{e['key']}", "severity": "block",
+                     "message": e["effect"][:200]}
+                    for e in param_effects
+                ],
+                "approved_qty": 0.0,
+                "infeasible": True,
+            },
+        }
+
     # Try requested qty, then 75%, 50%, 25%, 10% — coarse but sufficient for R1
     candidate_qtys = [
         requested_qty,
@@ -1604,6 +1907,12 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
             final_violations = violations
             break
         final_violations = violations  # keep last for reporting
+
+    # Audit-trail: a resolver value actually altered the outcome (soft cap
+    # bound below the requested qty).  One emit per node invocation.
+    if param_effects:
+        _emit_param_consumed(state, agent="deterministic_sizing",
+                             effects=param_effects)
 
     new_proposal = {**proposal, "qty": final_qty}
     if final_qty == 0:
@@ -1758,7 +2067,33 @@ def regime_execution_gate(state: TradingGraphState) -> dict:
         return {"proposal": {**proposal, "qty": 0.0}}
 
     mult = float(gate.get("size_multiplier", 1.0))
+
+    # Learning consumer (regime_size_multipliers family, ITEM 11): the gate
+    # multiplier was computed at regime-classification time from the static
+    # gates.SIZE_MULTIPLIERS table; here — the chokepoint that has both the
+    # resolver and the qty — the resolver may TIGHTEN it.  min() (never the
+    # raw resolver value) so a bad row can't loosen the persisted gate, and
+    # CRISIS stays a hard zero (its key maps to None by design).
+    values = _learning_param_values(state)
+    mult_key = _REGIME_SIZE_MULT_PARAM_KEY.get(str(regime.get("label") or ""))
     qty = float(proposal.get("qty", 0))
+    if mult_key and mult_key in values and qty > 0:
+        try:
+            resolver_mult = float(values[mult_key])
+        except (TypeError, ValueError):
+            resolver_mult = mult
+        effective = min(mult, resolver_mult)
+        if effective < mult:
+            _emit_param_consumed(
+                state, agent="regime_execution_gate",
+                effects=[{
+                    "key": mult_key,
+                    "value": resolver_mult,
+                    "effect": f"size_multiplier {mult:g} -> {effective:g}",
+                }],
+            )
+            mult = effective
+
     new_qty = qty * mult
     if proposal.get("asset_type") == "OPT":
         # Round half-away-from-zero so 0.5 → 1 (preserve trade) but 0.4 → 0
