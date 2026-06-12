@@ -20,6 +20,9 @@ Rules (from plan, canonical form):
                                 strategy_labels starting with "earnings_" are allowed
   R7  risk:reward floor (LONG) — every opening LONG trade must have reward/risk >= 1.3.
                                 SHORT premium is exempt (R:R structurally capped).
+                                Strategy specs may TIGHTEN the floor per label
+                                (strategy_specs.spec_for_label); the global 1.3
+                                stays the absolute minimum for unmapped labels.
 
 Risk calc for R1:
   stock trade: risk = |entry - stop| * qty                      (if stop supplied)
@@ -392,6 +395,24 @@ def check(ctx: SizingContext, proposed: ProposedTrade) -> list[SizingViolation]:
     # because the hook layer may not know it; in that case we warn rather
     # than block.
     if is_opening and not proposed.is_opening_option_short:
+        # Per-spec R:R floor (Phase 2 item 9): when the strategy_label maps
+        # to a declared StrategySpec, the spec's floor governs. Specs may
+        # only TIGHTEN — max() keeps the global 1.3 as the absolute minimum
+        # for unmapped/legacy labels. Lazy + guarded import: this code runs
+        # inside the pretool hook and the moomoo MCP guard, so a registry
+        # bug must degrade to the global floor, never crash validation.
+        rr_floor = MIN_RISK_REWARD
+        rr_floor_origin = "global floor"
+        try:
+            from trading_agent.strategy_specs import spec_for_label
+            spec = spec_for_label(proposed.strategy_label)
+            if (spec is not None and spec.min_risk_reward is not None
+                    and spec.min_risk_reward > rr_floor):
+                rr_floor = spec.min_risk_reward
+                rr_floor_origin = f"spec '{spec.name}'"
+        except Exception:
+            pass  # registry unavailable — fall back to the global floor
+
         if proposed.target is None:
             violations.append(SizingViolation(
                 R_TARGET_MISSING,
@@ -418,10 +439,11 @@ def check(ctx: SizingContext, proposed: ProposedTrade) -> list[SizingViolation]:
                 ))
             else:
                 rr = reward / risk
-                if rr < MIN_RISK_REWARD:
+                if rr < rr_floor:
                     violations.append(SizingViolation(
                         R7,
-                        f"R:R {rr:.2f} below floor {MIN_RISK_REWARD} "
+                        f"R:R {rr:.2f} below floor {rr_floor} "
+                        f"({rr_floor_origin}) "
                         f"(risk=${risk:.2f}, reward=${reward:.2f}). "
                         f"Tighten stop OR widen target.",
                         "block",

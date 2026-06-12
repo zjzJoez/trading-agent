@@ -1,9 +1,16 @@
-"""Phase 2.7 follow-up — drawdown helpers extracted from archive/promote/replay."""
+"""Phase 2.7 follow-up — drawdown helpers extracted from archive/promote/replay.
+
+Plus the item-10 expectancy statistic ``lcb_mean`` (one-sided Student-t
+lower bound on the mean) the promotion gate is keyed on.
+"""
 from __future__ import annotations
 
 import math
 
+import pytest
+
 from trading_agent.learning._stats import (
+    lcb_mean,
     running_drawdown_step,
     series_max_drawdown,
 )
@@ -67,3 +74,62 @@ def test_series_matches_running_step_walk():
         peak, mdd = running_drawdown_step(peak, mdd, cum)
     assert math.isclose(cum, expected_cum)
     assert math.isclose(mdd, expected_mdd)
+
+
+# -- lcb_mean (item 10 — expectancy lower bound) ------------------------------
+
+
+def test_lcb_mean_constant_series_returns_mean():
+    """Zero spread → zero margin: the bound IS the mean."""
+    assert lcb_mean([0.5] * 10) == 0.5
+    assert lcb_mean([-1.0, -1.0, -1.0]) == -1.0
+
+
+def test_lcb_mean_no_evidence_is_none_not_zero():
+    """n < 2 → None: a single sample has df=0 and NO defensible bound.
+    Returning 0 here would let a one-trade canary look exactly breakeven."""
+    assert lcb_mean([]) is None
+    assert lcb_mean([3.0]) is None
+
+
+def test_lcb_mean_known_textbook_value():
+    # [1..5]: mean 3, s = sqrt(2.5), n=5, one-sided t(df=4, 95%) = 2.132
+    expected = 3.0 - 2.132 * math.sqrt(2.5) / math.sqrt(5)
+    assert lcb_mean([1.0, 2.0, 3.0, 4.0, 5.0]) == pytest.approx(
+        expected, abs=1e-9)
+
+
+def test_lcb_mean_symmetric_series_sanity():
+    """Symmetric around 0: mean 0, bound strictly negative by exactly the
+    t-margin (same spread as the [1..5] series, shifted)."""
+    vs = [-2.0, -1.0, 0.0, 1.0, 2.0]
+    lb = lcb_mean(vs)
+    assert lb == pytest.approx(-2.132 * math.sqrt(2.5) / math.sqrt(5),
+                               abs=1e-9)
+    assert lb < 0
+
+
+def test_lcb_mean_tightens_with_n():
+    """Same distribution, more samples → bound closes toward the mean."""
+    base = [1.0, -1.0]
+    a = lcb_mean(base * 5)     # n=10
+    b = lcb_mean(base * 50)    # n=100 (z branch)
+    assert a < b < 0           # mean is 0; both bounds below it
+
+
+def test_lcb_mean_df_above_30_uses_z():
+    # n=100 alternating ±1: mean 0, s = sqrt(100/99); z(95%) = 1.6449
+    vs = [1.0, -1.0] * 50
+    expected = -1.6449 * math.sqrt(100.0 / 99.0) / 10.0
+    assert lcb_mean(vs) == pytest.approx(expected, abs=1e-9)
+
+
+def test_lcb_mean_99_is_stricter_than_95():
+    vs = [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert lcb_mean(vs, confidence=0.99) < lcb_mean(vs, confidence=0.95)
+
+
+def test_lcb_mean_unsupported_confidence_raises():
+    """No silent interpolation between tabled confidences."""
+    with pytest.raises(ValueError):
+        lcb_mean([1.0, 2.0, 3.0], confidence=0.90)

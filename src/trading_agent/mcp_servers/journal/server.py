@@ -35,6 +35,7 @@ from mcp.server.fastmcp import FastMCP
 
 from trading_agent.config import CONFIG
 from trading_agent.db import connection
+from trading_agent.strategy_specs import spec_for_label
 
 # Lazy imports for heavyweight deps. SentenceTransformer load is ~500MB,
 # so we only import when the first embedding is needed.
@@ -612,14 +613,31 @@ def search_notes(query: str, source: str | None = None, k: int = 10) -> dict:
     return {"query": query, "count": len(rows), "rows": rows}
 
 
+def _realized_r(t: dict, pnl: float) -> float | None:
+    """One closed trade's pnl in R units: pnl / (|entry − stop| × qty × mult).
+
+    None when the trade carries no stop (legacy rows) — we refuse to invent
+    a risk denominator, the same posture as sizing's implicit-stop WARN.
+    """
+    entry, stop, qty = t.get("entry_price"), t.get("stop"), t.get("qty")
+    if entry is None or stop is None or not qty:
+        return None
+    risk_per_unit = abs(float(entry) - float(stop))
+    if risk_per_unit < 1e-9:
+        return None
+    mult = 100.0 if t.get("asset_type") == "OPT" else 1.0
+    return pnl / (risk_per_unit * float(qty) * mult)
+
+
 @mcp.tool()
 def generate_post_mortem_prompt(since_date: str) -> dict:
     """Return a structured prompt payload for the weekly post-mortem.
 
     `since_date` is ISO YYYY-MM-DD. Collects all trades closed at/after
     that date, their theses, and any snapshots. The post-mortem skill uses
-    this payload to compute win rates per strategy_label and produce 3–8
-    lessons — which are then written back via `append_note`.
+    this payload to grade each strategy_label against its declared
+    StrategySpec (expectancy, not raw win rate) and produce 3–8 lessons —
+    which are then written back via `append_note`.
     """
     with connection() as conn:
         trades = _rowdicts(conn.execute(
@@ -647,6 +665,10 @@ def generate_post_mortem_prompt(since_date: str) -> dict:
     # trades, so the post-mortem "learned" from losses the agent never took.
     by_strategy: dict[str, dict[str, Any]] = {}
     by_strategy_shadow: dict[str, dict[str, Any]] = {}
+    # Per-agent-strategy raw series for the spec_comparison block: dollar
+    # pnl (for avg win / avg loss) and realized R (for mean R).
+    realized_pnls: dict[str, list[float]] = {}
+    realized_rs: dict[str, list[float]] = {}
     agent_trades = 0
     for t in trades:
         s = t["strategy_label"] or "(none)"
@@ -667,7 +689,63 @@ def generate_post_mortem_prompt(since_date: str) -> dict:
         # Prefer the leg-arithmetic figure over self-reported pnl when they
         # disagree — the recomputed value is the auditable one.
         pnl_val = t["pnl_recomputed"] if t["pnl_mismatch"] else t["pnl"]
-        b["pnl"] += float(pnl_val or t["pnl"] or 0.0)
+        pnl_used = float(pnl_val or t["pnl"] or 0.0)
+        b["pnl"] += pnl_used
+        if is_agent:
+            realized_pnls.setdefault(s, []).append(pnl_used)
+            r = _realized_r(t, pnl_used)
+            if r is not None:
+                realized_rs.setdefault(s, []).append(r)
+
+    # Declared-vs-realized (Phase 2 item 9): grade each agent strategy
+    # bucket against its declared StrategySpec so the post-mortem judges
+    # SHAPE (WR envelope + payoff ratio + expectancy) instead of raw win
+    # rate. Legacy labels with no governing spec are skipped — we don't
+    # grade a trade against a spec it never declared.
+    spec_comparison: dict[str, Any] = {}
+    for s, b in by_strategy.items():
+        spec = spec_for_label(s)
+        if spec is None or spec.expectancy_profile is None:
+            continue
+        n = b["n"]
+        wr = (b["wins"] / n) if n else 0.0
+        rs = realized_rs.get(s, [])
+        pnls = realized_pnls.get(s, [])
+        win_pnls = [p for p in pnls if p > 0]
+        loss_pnls = [abs(p) for p in pnls if p < 0]
+        lo, hi = spec.expectancy_profile.expected_wr_range
+        # verdict_hint grades the WR envelope only — expectancy verdicts
+        # need LB95(mean R) at n >= min_trades_for_eval, which the
+        # moratorium instruction below leaves to the LLM + promote gates.
+        if n < spec.min_trades_for_eval:
+            verdict = "INSUFFICIENT_N"
+        elif lo <= wr <= hi:
+            verdict = "WITHIN_DECLARED"
+        else:
+            verdict = "OUTSIDE_DECLARED"
+        spec_comparison[s] = {
+            "spec": spec.name,
+            "spec_status": spec.status,
+            "declared": {
+                "expected_wr_range": [lo, hi],
+                "breakeven_wr_net": round(
+                    spec.expectancy_profile.breakeven_wr_net, 4),
+                "min_risk_reward": spec.min_risk_reward,
+                "min_trades_for_eval": spec.min_trades_for_eval,
+                "falsification": spec.falsification,
+            },
+            "realized": {
+                "n": n,
+                "win_rate": round(wr, 4),
+                "mean_r": (round(sum(rs) / len(rs), 4) if rs else None),
+                "n_with_r": len(rs),  # rows with a stop → R computable
+                "avg_win": (round(sum(win_pnls) / len(win_pnls), 2)
+                            if win_pnls else None),
+                "avg_loss": (round(sum(loss_pnls) / len(loss_pnls), 2)
+                             if loss_pnls else None),
+            },
+            "verdict_hint": verdict,
+        }
 
     return {
         "since_date": since_date,
@@ -675,16 +753,25 @@ def generate_post_mortem_prompt(since_date: str) -> dict:
         "agent_trade_count": agent_trades,
         "by_strategy": by_strategy,
         "by_strategy_shadow": by_strategy_shadow,
+        "spec_comparison": spec_comparison,
         "trades": trades,
         "instructions": (
             "Analyze the closed trades above. by_strategy covers ONLY "
             "provenance='agent' rows — the system's own record; "
             "by_strategy_shadow holds mirrored/backfilled operator trades for "
             "context and must NOT be merged into the system's statistics. "
-            "For each agent strategy_label, compute win rate and avg pnl; flag "
-            "strategies with <40% win rate or net-negative pnl as candidates "
-            "for moratorium. Rows with pnl_mismatch=1 have self-reported pnl "
-            "contradicting leg arithmetic — trust pnl_recomputed. Check "
+            "spec_comparison grades each agent strategy bucket against its "
+            "DECLARED StrategySpec (strategy_specs.py is canonical): compare "
+            "realized win rate / mean R / avg win / avg loss against the "
+            "declared envelope and explicitly flag any strategy with "
+            "verdict_hint=OUTSIDE_DECLARED — outside the declared envelope "
+            "in EITHER direction needs a lesson. Flag as moratorium "
+            "candidates ONLY strategies whose realized mean R is credibly "
+            "negative (LB95(mean R) < 0 with n >= spec.min_trades_for_eval, "
+            "or net-negative pnl with n >= 10); win rate alone is NEVER a "
+            "moratorium reason — low-WR/high-payoff is the declared shape of "
+            "the convexity track. Rows with pnl_mismatch=1 have self-reported "
+            "pnl contradicting leg arithmetic — trust pnl_recomputed. Check "
             "thesis_text vs outcome — was the thesis right but sizing wrong, "
             "or was the thesis wrong to begin with? Produce 3–8 concrete "
             "lessons (each 1–2 sentences, with tags like "
