@@ -114,6 +114,11 @@ class _FakeLearningDB:
         self._params = params or ()
 
     def fetchone(self):
+        # Counterfactual dispatch row (ITEM 11) — None means "row not
+        # found" so maybe_evaluate_qty_only falls through to the
+        # traffic-split path these tests exercise.
+        if "params, created_at" in self._sql:
+            return None
         if "SELECT status, parent_version_id" in self._sql:
             return self.status_row
         if "count(*)" in self._sql.lower():
@@ -137,7 +142,8 @@ def _patched_db(db: _FakeLearningDB):
     ctx.__enter__ = MagicMock(return_value=db)
     ctx.__exit__ = MagicMock(return_value=False)
     with patch("trading_agent.learning.promote.cursor", return_value=ctx), \
-         patch("trading_agent.learning.canary.cursor", return_value=ctx):
+         patch("trading_agent.learning.canary.cursor", return_value=ctx), \
+         patch("trading_agent.learning.counterfactual.cursor", return_value=ctx):
         yield
 
 

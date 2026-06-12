@@ -90,6 +90,20 @@ def family_of_params(params: dict[str, Any]) -> ParamFamily:
     return next(iter(families))
 
 
+def ineligible_keys(params: dict[str, Any]) -> list[str]:
+    """Recognised keys in ``params`` that have NO live consumer.
+
+    ``ParamBound.canary_eligible`` is the per-key source of truth (ITEM 11):
+    a canary touching any ineligible key would be an A/A test — the journal
+    rows get a different params_version_id but the decision path never reads
+    the value, so promotion gates compare two identical treatments.
+    """
+    return sorted(
+        k for k in params
+        if k in PARAM_BOUNDS and not PARAM_BOUNDS[k].canary_eligible
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bucket math
 # ---------------------------------------------------------------------------
@@ -191,17 +205,25 @@ class RouteDecision:
 
 @dataclass
 class RoutedResolver:
-    """Output of `route_canary` — final resolver + audit trail."""
+    """Output of `route_canary` — final resolver + audit trail.
+
+    ``skipped_ineligible`` rows received NO traffic and NO
+    learning_assignments record (assign_canary_node only iterates the two
+    routed lists) — they're surfaced in the audit dict so an operator can
+    see a mis-created canary is being ignored rather than silently 50/50'd.
+    """
 
     resolver: ParamResolver
     routed_to_canary: list[RouteDecision] = field(default_factory=list)
     routed_to_control: list[RouteDecision] = field(default_factory=list)
+    skipped_ineligible: list[dict[str, Any]] = field(default_factory=list)
 
     def to_audit_dict(self) -> dict[str, Any]:
         return {
             "resolver_version_id": self.resolver.version_id,
             "resolver_status": self.resolver.status,
             "n_canary_routes_taken": len(self.routed_to_canary),
+            "skipped_ineligible": list(self.skipped_ineligible),
             "decisions": [
                 {
                     "family": d.family.value,
@@ -238,8 +260,25 @@ def route_canary(
     final_status = control.status
     final_version_id = control.version_id
     d_str = date_key(ts)
+    skipped_ineligible: list[dict[str, Any]] = []
 
     for c in canaries:
+        # ITEM 11 guard: never route traffic to a canary whose only effect
+        # is a label.  A row touching any key without a live consumer is an
+        # A/A test by construction — burn zero traffic on it.
+        bad_keys = ineligible_keys(c.params)
+        if bad_keys:
+            log.warning(
+                "route_canary: skipping CANARY id=%s — keys %s have no live "
+                "consumer (canary_eligible=False)",
+                c.version_id, bad_keys,
+            )
+            skipped_ineligible.append({
+                "canary_version_id": c.version_id,
+                "family": c.family.value,
+                "ineligible_keys": bad_keys,
+            })
+            continue
         b = bucket_for(ticker, d_str, c.family)
         decision = RouteDecision(
             family=c.family,
@@ -271,6 +310,7 @@ def route_canary(
         resolver=final,
         routed_to_canary=routed_to_canary,
         routed_to_control=routed_to_control,
+        skipped_ineligible=skipped_ineligible,
     )
 
 
@@ -391,15 +431,25 @@ def maybe_ramp_traffic(canary_version_id: int) -> bool:
 # Insertion helper for Phase 2.7.5 (LLM Critic creates CANARYs)
 # ---------------------------------------------------------------------------
 
-CANARY_INELIGIBLE_FAMILIES: frozenset[ParamFamily] = frozenset({
-    # ENTRY_FILTERS and CANDIDATE_COUNT take effect upstream of
-    # assign_canary_node (in scout / research_ticker / build_trade_proposal).
-    # Routing them at sizing time would mis-attribute outcomes to the
-    # canary version since the candidates were already chosen under control.
-    # Keep them in shadow-only mode until the node ordering is rearchitected.
-    ParamFamily.ENTRY_FILTERS,
-    ParamFamily.CANDIDATE_COUNT,
-})
+# Derived from the per-key ``ParamBound.canary_eligible`` flags so there is
+# ONE source of truth (params.py) for "does this knob have a live consumer".
+# A family lands here when NO key in it is eligible:
+#   * ENTRY_FILTERS / CANDIDATE_COUNT — take effect upstream of
+#     assign_canary_node (scout / research_ticker / build_trade_proposal);
+#     routing them at sizing time would mis-attribute outcomes since the
+#     candidates were already chosen under control.
+#   * REGIME_THRESHOLDS — the live classifier runs on its own schedule with
+#     DEFAULT_CRISIS_PARAMS and never sees a resolver; only shadow/replay
+#     read these keys (see params.py per-key comments).
+# Families with a MIX of eligible/ineligible keys (stop_distances:
+# default_stop_atr_mult has no ATR consumer) are caught by the per-key
+# checks in ``insert_canary`` and ``route_canary`` instead.
+CANARY_INELIGIBLE_FAMILIES: frozenset[ParamFamily] = frozenset(
+    fam for fam in ParamFamily
+    if not any(
+        b.canary_eligible for b in PARAM_BOUNDS.values() if b.family is fam
+    )
+)
 
 
 class CanaryFamilyIneligible(RuntimeError):
@@ -421,6 +471,16 @@ def insert_canary(
         raise CanaryFamilyIneligible(
             f"family {fam.value} cannot be routed live yet — "
             "use SHADOW status until node-ordering rearchitect lands"
+        )
+    # Per-key check for mixed families (e.g. stop_distances where
+    # default_stop_atr_mult has no consumer): refuse at creation time so
+    # the caller learns immediately instead of route_canary silently
+    # skipping the row forever.
+    bad = ineligible_keys(params)
+    if bad:
+        raise CanaryFamilyIneligible(
+            f"keys {bad} have no live consumer (canary_eligible=False) — "
+            "a canary on them is an A/A test; use SHADOW status instead"
         )
     actives = list_active_canaries()
     for a in actives:
@@ -461,6 +521,7 @@ __all__ = [
     "bucket_for",
     "date_key",
     "family_of_params",
+    "ineligible_keys",
     "insert_canary",
     "list_active_canaries",
     "maybe_ramp_traffic",

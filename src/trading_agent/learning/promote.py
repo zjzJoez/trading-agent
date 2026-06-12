@@ -39,6 +39,7 @@ from trading_agent.learning.canary import (
     N_CANARY_MIN,
     n_trades_for_canary,
 )
+from trading_agent.learning.counterfactual import maybe_evaluate_qty_only
 from trading_agent.store.postgres import cursor
 
 log = logging.getLogger(__name__)
@@ -255,6 +256,25 @@ class PromoteDecision:
 
 def evaluate_canary(canary_version_id: int) -> PromoteDecision:
     """Decide whether to promote, retain, or reject a canary row."""
+    # ITEM 11 dispatch — canaries whose changed keys are ALL qty-only
+    # (sizing_aggression / regime_size_multipliers) are evaluated by exact
+    # paired counterfactual replay over every closed trade, NOT by the
+    # traffic-split stats below: their effect is a deterministic qty rescale,
+    # so the paired design uses 100% of the sample with no attribution
+    # problem (full rationale in learning/counterfactual.py).  Returns None
+    # for non-qty families or on any read failure → fall through.
+    cf = maybe_evaluate_qty_only(canary_version_id)
+    if cf is not None:
+        return PromoteDecision(
+            canary_version_id=canary_version_id,
+            decision=cf.decision,
+            rationale=cf.rationale,
+            rollback_reason=(
+                "counterfactual_ub95_negative" if cf.decision == "REJECT"
+                else None
+            ),
+        )
+
     # 0. Sanity — only consider rows still flagged CANARY
     with cursor() as cur:
         cur.execute(

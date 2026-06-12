@@ -146,13 +146,16 @@ def test_route_zero_traffic_never_routes_canary():
 
 def test_ineligible_families_documented():
     """Codex review 🔴 — ENTRY_FILTERS and CANDIDATE_COUNT take effect upstream
-    of assign_canary_node and would mis-attribute outcomes if routed live."""
+    of assign_canary_node and would mis-attribute outcomes if routed live.
+    ITEM 11 added REGIME_THRESHOLDS: the live classifier runs with
+    DEFAULT_CRISIS_PARAMS and never sees a resolver, so a thresholds canary
+    is an A/A test (only learning/shadow + replay read those keys)."""
     assert ParamFamily.ENTRY_FILTERS in CANARY_INELIGIBLE_FAMILIES
     assert ParamFamily.CANDIDATE_COUNT in CANARY_INELIGIBLE_FAMILIES
-    # The deterministic-replay families MUST stay eligible
+    assert ParamFamily.REGIME_THRESHOLDS in CANARY_INELIGIBLE_FAMILIES
+    # The families with live consumers (trade_nodes) MUST stay eligible
     assert ParamFamily.SIZING_AGGRESSION not in CANARY_INELIGIBLE_FAMILIES
     assert ParamFamily.STOP_DISTANCES not in CANARY_INELIGIBLE_FAMILIES
-    assert ParamFamily.REGIME_THRESHOLDS not in CANARY_INELIGIBLE_FAMILIES
     assert ParamFamily.REGIME_SIZE_MULTIPLIERS not in CANARY_INELIGIBLE_FAMILIES
 
 
