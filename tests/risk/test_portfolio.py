@@ -94,6 +94,81 @@ def test_heat_aggregates_per_underlying():
     assert math.isclose(snap.heat_metrics["max_per_underlying_pct"], 0.015)
 
 
+def test_heat_short_put_uses_assignment_exposure():
+    """Short put heat = strike × 100 × qty − premium collected (CSP assignment).
+
+    Regression: short legs used to contribute ZERO heat — the open AAPL 8x
+    short 300P (journal id 12) carried ~$235k assignment exposure invisible
+    to every heat guardrail.
+    """
+    p = _opt(
+        symbol="US.AAPL260710P300000", underlying="US.AAPL",
+        side="SELL", qty=8, entry_price=0.60, strategy_label="csp",
+    )
+    snap = build_snapshot(equity=1_000_000, cash=1_000_000, open_positions=[p])
+    # at_risk = 300 × 100 × 8 − 0.60 × 100 × 8 = 240,000 − 480 = 239,520
+    assert math.isclose(snap.heat_metrics["total_at_risk_usd"], 239_520.0)
+    assert math.isclose(snap.heat_metrics["heat_pct"], 0.23952)
+    assert math.isclose(snap.heat_metrics["max_per_underlying_pct"], 0.23952)
+
+
+def test_heat_short_call_uses_stress_buffered_stop_distance():
+    """Short call with stop: NAKED_CALL_STRESS_MULT × (stop − entry) × 100 × qty."""
+    p = _opt(
+        symbol="US.SPY260710C600000", underlying="US.SPY",
+        side="SELL", qty=4, entry_price=2.0, stop=5.0,
+    )
+    snap = build_snapshot(equity=100_000, cash=100_000, open_positions=[p])
+    # at_risk = 1.5 × (5.0 − 2.0) × 4 × 100 = 1,800
+    assert math.isclose(snap.heat_metrics["total_at_risk_usd"], 1_800.0)
+    assert math.isclose(snap.heat_metrics["heat_pct"], 0.018)
+
+
+def test_heat_short_call_without_stop_falls_back_to_strike_notional():
+    """No usable stop on a short call → full strike notional, not zero.
+
+    A stop at/below entry is a take-profit, not a loss cap, so it must hit
+    the same conservative fallback as a missing stop.
+    """
+    no_stop = _opt(
+        symbol="US.SPY260710C600000", underlying="US.SPY",
+        side="SELL", qty=4, entry_price=2.0, stop=None,
+    )
+    snap = build_snapshot(equity=1_000_000, cash=1_000_000, open_positions=[no_stop])
+    # at_risk = 600 × 100 × 4 = 240,000
+    assert math.isclose(snap.heat_metrics["total_at_risk_usd"], 240_000.0)
+
+    profit_stop = _opt(
+        symbol="US.SPY260710C600000", underlying="US.SPY",
+        side="SELL", qty=4, entry_price=2.0, stop=1.0,
+    )
+    snap2 = build_snapshot(equity=1_000_000, cash=1_000_000, open_positions=[profit_stop])
+    assert math.isclose(snap2.heat_metrics["total_at_risk_usd"], 240_000.0)
+
+
+def test_heat_unparseable_short_option_charges_premium_multiple():
+    """Short option whose symbol won't parse still contributes heat (10× premium)."""
+    p = _opt(symbol="US.WEIRD_SYMBOL", underlying="US.WEIRD", side="SELL",
+             qty=2, entry_price=3.0)
+    snap = build_snapshot(equity=100_000, cash=100_000, open_positions=[p])
+    # at_risk = 3.0 × 2 × 100 × 10 = 6,000
+    assert math.isclose(snap.heat_metrics["total_at_risk_usd"], 6_000.0)
+
+
+def test_heat_mixed_long_and_short_legs_aggregate_per_underlying():
+    """Long premium and short assignment exposure sum into the same underlying."""
+    long_leg = _opt(symbol="US.AAPL260710C320000", underlying="US.AAPL",
+                    entry_price=2.0, qty=8)
+    short_leg = _opt(symbol="US.AAPL260710P300000", underlying="US.AAPL",
+                     side="SELL", qty=8, entry_price=0.60)
+    snap = build_snapshot(
+        equity=1_000_000, cash=1_000_000, open_positions=[long_leg, short_leg]
+    )
+    # long: 2.0 × 8 × 100 = 1,600; short put: 239,520. AAPL total = 241,120.
+    assert math.isclose(snap.heat_metrics["total_at_risk_usd"], 241_120.0)
+    assert math.isclose(snap.heat_metrics["per_underlying_usd"]["US.AAPL"], 241_120.0)
+
+
 def test_factor_exposure_aggregates_by_sector_bucket():
     tech = _opt(underlying="US.AAPL", sector="Information Technology", delta=0.4, qty=10, mark=2.0)
     fin = _opt(symbol="US.XLF_C", underlying="US.XLF", sector="Financials", delta=0.4, qty=10, mark=2.0)

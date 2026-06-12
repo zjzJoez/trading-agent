@@ -14,11 +14,24 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from trading_agent.sizing import NAKED_CALL_STRESS_MULT
+
 log = logging.getLogger(__name__)
+
+# Moomoo option code: <TICKER><YYMMDD><C|P><strike*1000>. Same shape the
+# order-guard hook parses; here we only need right + strike for heat.
+_OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{4,8})$")
+
+# Heat fallback for a short option leg whose worst case can't be computed
+# (symbol won't parse, so neither right nor strike is known): charge 10×
+# the premium collected. Deliberately punitive so the leg inflates heat
+# until it can be priced properly, instead of silently registering zero.
+SHORT_OPT_UNPARSEABLE_PREMIUM_MULT = 10.0
 
 
 @dataclass
@@ -285,27 +298,77 @@ def _pearson(xs: list[float], ys: list[float]) -> float:
 # -----------------------------------------------------------------------------
 
 
+def _occ_right_strike(symbol: str) -> tuple[str, float] | None:
+    """US.AAPL260710P300000 → ("P", 300.0). None if not an option code."""
+    s = (symbol or "").strip().upper()
+    if s.startswith("US."):
+        s = s[3:]
+    m = _OCC_RE.match(s)
+    if not m:
+        return None
+    return m.group(3), int(m.group(4)) / 1000.0
+
+
+def _short_option_at_risk(p: OpenPosition) -> float:
+    """Worst-case $ exposure of a short option leg.
+
+    Mirrors ProposedTrade.max_loss routing in sizing.py:
+      * short put  → strike × 100 × qty − premium collected (CSP assignment)
+      * short call → NAKED_CALL_STRESS_MULT × (stop − entry) × 100 × qty,
+        requiring stop > entry (a stop at/below entry is a take-profit, not
+        a loss cap). No usable stop → full strike notional: sizing returns
+        inf there, but heat_metrics lands in Postgres jsonb, so we charge a
+        large *finite* stand-in (a 100%-of-strike adverse move) instead.
+    """
+    premium_collected = p.entry_price * p.qty * 100.0
+    parsed = _occ_right_strike(p.symbol)
+    if parsed is None:
+        log.warning(
+            "heat: cannot parse short option symbol %s — charging %.0fx premium",
+            p.symbol, SHORT_OPT_UNPARSEABLE_PREMIUM_MULT,
+        )
+        return premium_collected * SHORT_OPT_UNPARSEABLE_PREMIUM_MULT
+    right, strike = parsed
+    strike_notional = strike * 100.0 * p.qty
+    if right == "P":
+        return max(0.0, strike_notional - premium_collected)
+    if p.stop is not None and p.stop > p.entry_price:
+        return NAKED_CALL_STRESS_MULT * (p.stop - p.entry_price) * p.qty * 100.0
+    return strike_notional
+
+
 def _heat_metrics(
     positions: list[OpenPosition], equity: float
 ) -> dict[str, float]:
-    """Heat = aggregate $ at risk (entry → stop or option premium) / equity."""
+    """Heat = aggregate $ at risk / equity.
+
+    Long stock: loss to stop. Long options: full premium paid. Short option
+    legs: assignment / stress exposure (see _short_option_at_risk) — they
+    used to contribute zero, which let a CSP with six-figure assignment
+    exposure sail under every heat guardrail.
+    """
     total_at_risk = 0.0
     per_underlying: dict[str, float] = {}
 
     for p in positions:
-        if p.asset_type == "OPT":
+        if p.asset_type == "OPT" and p.side == "SELL":
+            at_risk = _short_option_at_risk(p)
+        elif p.asset_type == "OPT":
             # Long premium: max loss = entry × contracts × 100
             at_risk = p.entry_price * p.qty * 100
-        else:
+        elif p.side == "BUY":
             # Stock: at_risk = (entry - stop) × qty
             if p.stop and p.stop > 0 and p.stop < p.entry_price:
                 at_risk = (p.entry_price - p.stop) * p.qty
             else:
                 at_risk = p.entry_price * p.qty * 0.05  # 5% implicit stop
+        else:
+            # Short stock — not traded by this system, but never let a
+            # position register zero heat: 5% implicit stop as a floor.
+            at_risk = p.entry_price * p.qty * 0.05
 
-        if p.side == "BUY":
-            total_at_risk += at_risk
-            per_underlying[p.underlying] = per_underlying.get(p.underlying, 0.0) + at_risk
+        total_at_risk += at_risk
+        per_underlying[p.underlying] = per_underlying.get(p.underlying, 0.0) + at_risk
 
     heat_pct = total_at_risk / equity if equity > 0 else 0.0
     max_per_underlying_pct = (
