@@ -202,6 +202,8 @@ Five labels: `BULL_TREND` · `RANGE_LOW_VOL` · `VOLATILE_TRANSITION` · `BEAR_T
 
 The asymmetry is the point. **The LLM can only loosen the regime call, never tighten the position-sizing posture beyond what the math allowed.** Hard floors in Python silently reject upgrade attempts and emit an ops alert.
 
+**What the regime layer is evidence-backed to be: a drawdown-control overlay, not an alpha source.** The walk-forward record (2017 → 2026-06-12 OOS, 5 seeds) shows overlay Sharpe 0.908 ± 0.029 vs SPY 0.837 — a +0.071 difference at roughly 0.2 standard errors, i.e. statistically indistinguishable from zero — while *trailing buy-and-hold by ~142pp cumulatively* (the overlay averages 0.69× exposure). What the same record shows clearly is the defensive behavior: +9–10pp protection in the 2022 bear and a max drawdown of ~−14–15% vs SPY's ~−25%. Two honesty caveats are load-bearing: that single overlapping OOS window was reused across the v3–v5 design iterations, so it is burned for model selection (`regime/holdout.py` freezes 2026-06-13+ as the untouched v6+ holdout and the walk-forward scripts refuse to evaluate into it without `--break-glass`); and the rolling walk-forward validates an auto-calibrated architecture, while production runs a human-calibrated artifact — `scripts/validate_production_hmm.py` exists to measure the deployed model itself.
+
 ### 3 · Asymmetric LLM authority — the council can veto, never approve
 
 The same asymmetry shows up everywhere a model touches a risk decision.

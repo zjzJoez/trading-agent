@@ -114,13 +114,22 @@ regime/classifier.py   3-layer: crisis_overlay → Gaussian HMM (4 states) → r
 regime/llm_review.py   real_llm_review — Claude Sonnet 4.6, may CONFIRM / DOWNGRADE / DEFER only
 regime/gates.py        regime_size_multiplier + gate_trade_for_regime
 regime/persist.py      writers for regime_feature_snapshots / regime_states / regime_llm_reviews
+regime/holdout.py      v6+ holdout freeze (HOLDOUT_START=2026-06-13) + require_holdout_intact guard
+regime/evaluation.py   shared walk-forward math: forward returns, Newey-West variance, overlay headline
 ```
 
 5 labels: `BULL_TREND` (mult 1.00) · `RANGE_LOW_VOL` (0.75) · `VOLATILE_TRANSITION` (0.50) ·
 `BEAR_TREND` (0.50) · `CRISIS` (0.00, hard floor).
 
-The HMM is not yet trained on labeled history — the rule-based fallback is the
-active path. HMM training is a Phase 2.6.5 / 2.7 follow-up.
+The active HMM is `regime_model_versions` id=5 (trained 2007→2026-05, human-calibrated
+state→label mapping via `scripts/promote_hmm.py`). Scope of the evidence: the regime
+layer is a **drawdown-control overlay, not an alpha source** — walk-forward Sharpe
+0.908 ± 0.029 vs SPY 0.837 (+0.071, ~0.2 SE, single overlapping 2017-2026 OOS window
+reused across design iterations; trails buy-and-hold by ~142pp cumulatively). The
+2017 → 2026-06-12 window is burned for model selection; 2026-06-13+ is a frozen
+holdout enforced by `regime/holdout.py`. `scripts/validate_production_hmm.py`
+measures the deployed artifact (the rolling walk-forward validates an
+auto-calibrated architecture, which is not what production runs).
 
 ### `risk/`
 
