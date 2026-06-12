@@ -208,13 +208,21 @@ def has_fresh_open_thesis(ticker: str) -> tuple[bool, int | None]:
 
 
 def has_existing_open_for(broker_symbol: str) -> bool:
-    """True iff the local journal already has an OPEN trade for the
+    """True iff a journal (SQLite OR Postgres) has an OPEN trade for the
     given broker symbol. Used to compute ``intent`` on the ProposedTrade:
     SELL of an option we don't already hold = opening a SHORT; SELL of
     one we do hold = closing the LONG.
+
+    BOTH stores must be consulted: interactive /enter fills land in the
+    SQLite journal, but autonomous-graph entries are journaled ONLY in
+    Postgres journal_trades (persist_trade_event). With the SQLite-only
+    lookup, every autonomous position's SELL-to-close was classified as
+    SELL-to-open and hard-blocked by R_short_option_open_blocked — i.e.
+    the guard would have prevented the system from exiting its own trades.
     """
     if not broker_symbol:
         return False
+    sqlite_says_no = False
     try:
         with connection() as conn:
             row = conn.execute(
@@ -222,11 +230,34 @@ def has_existing_open_for(broker_symbol: str) -> bool:
                 "LIMIT 1",
                 (broker_symbol,),
             ).fetchone()
-            return row is not None
+            if row is not None:
+                return True
+            sqlite_says_no = True
     except Exception:
-        # Fail-open on lookup error: assume close (more conservative —
-        # SHORT-specific R5b/R5c won't fire spuriously on a real close).
-        return True
+        pass  # SQLite unknown — fall through to Postgres, then fail open
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM journal_trades "
+                "WHERE symbol = %s AND outcome = 'OPEN' LIMIT 1",
+                (broker_symbol,),
+            )
+            if cur.fetchone() is not None:
+                return True
+    except Exception:
+        # Postgres unreachable is NORMAL on the Phase-1 Mac (no PG server).
+        # If SQLite answered definitively "no open trade", trust it and
+        # classify as opening — returning True here would mark every SELL
+        # as a close and silently disable the SELL-to-open block in exactly
+        # the environment the operator trades interactively.
+        pass
+    if sqlite_says_no:
+        return False
+    # SQLite errored and Postgres found nothing / errored: fail open to
+    # close (more conservative — SHORT-specific R5b/R5c won't fire
+    # spuriously on a real close).
+    return True
 
 
 # ---- proposed-trade construction ----

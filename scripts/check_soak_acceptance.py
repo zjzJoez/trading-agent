@@ -29,6 +29,7 @@ import logging
 import sys
 from datetime import datetime, timedelta, timezone
 
+from trading_agent.learning.outcome import CLOSED_OUTCOMES
 from trading_agent.store.postgres import cursor
 
 log = logging.getLogger(__name__)
@@ -206,12 +207,12 @@ def check_exit_fills_confirmed(since) -> dict:
                 """
                 SELECT COUNT(*) FROM journal_trades
                 WHERE closed_at >= %s
-                  AND outcome IN ('WIN', 'LOSS', 'SCRATCH')
+                  AND outcome = ANY(%s)
                   AND COALESCE(broker_order_id, '') NOT LIKE 'VIRTUAL-%%'
                   AND (broker_fill_json IS NULL
                        OR NOT broker_fill_json ? 'exit_dealt_avg_price')
                 """,
-                (since,),
+                (since, list(CLOSED_OUTCOMES)),
             )
             unconfirmed = int(cur.fetchone()[0])
     except Exception as e:

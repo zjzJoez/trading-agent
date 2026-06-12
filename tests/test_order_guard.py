@@ -200,3 +200,49 @@ def test_audit_block_recorded(guard_db):
         row = conn.execute("SELECT decision, payload FROM hook_audit_log").fetchone()
     assert row["decision"] == "block"
     assert json.loads(row["payload"])["symbol"] == "US.AAPL260720P00300000"
+
+
+# ---- dual-store close-intent (post-merge regression: Postgres journal) ----
+
+class _PgCtx:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        import unittest.mock as m
+        cur = m.MagicMock()
+        cur.fetchone.return_value = self._rows[0] if self._rows else None
+        return cur
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_sell_intent_close_when_open_trade_lives_only_in_postgres(guard_db, monkeypatch):
+    """Autonomous-graph entries are journaled ONLY in Postgres journal_trades.
+    With the SQLite-only lookup, every autonomous SELL-to-close was classified
+    as SELL-to-open and hard-blocked — the guard would have prevented the
+    system from exiting its own positions."""
+    from trading_agent import order_guard as og
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.cursor", lambda: _PgCtx([(1,)]))
+    assert og.has_existing_open_for("US.QQQ260626C734000") is True
+
+
+def test_sell_intent_open_when_both_stores_say_no(guard_db, monkeypatch):
+    from trading_agent import order_guard as og
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.cursor", lambda: _PgCtx([]))
+    assert og.has_existing_open_for("US.QQQ260626C734000") is False
+
+
+def test_sell_intent_open_when_sqlite_says_no_and_postgres_unreachable(guard_db, monkeypatch):
+    """Phase-1 Mac has no Postgres server. SQLite's definitive 'no open
+    trade' must classify as OPENING — failing open to 'close' here would
+    silently disable the SELL-to-open block in interactive trading."""
+    from trading_agent import order_guard as og
+
+    def _boom():
+        raise ConnectionError("no postgres on this box")
+    monkeypatch.setattr("trading_agent.store.postgres.cursor", _boom)
+    assert og.has_existing_open_for("US.QQQ260626C734000") is False
