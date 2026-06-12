@@ -59,15 +59,16 @@ import json
 import logging
 import math
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from trading_agent.regime.classifier import classify
+from trading_agent.regime.evaluation import fwd_return, yfinance_spy_returns
 from trading_agent.regime.features import FeatureSnapshot
 from trading_agent.regime.gates import SIZE_MULTIPLIERS, regime_size_multiplier
+from trading_agent.regime.holdout import HoldoutViolation, require_holdout_intact
 from trading_agent.regime.persist import get_model_by_id
 from trading_agent.store.postgres import cursor
 
@@ -106,67 +107,19 @@ def load_test_snapshots(test_start: str, test_end: str) -> list[tuple[datetime, 
     return out
 
 
-def build_spy_price_series(snaps: list[tuple[datetime, FeatureSnapshot]]) -> pd.Series:
-    """Reconstruct SPY close-to-close return path from successive snapshots.
-
-    Strategy: from each snapshot we KNOW spy_ret_5. So forward returns can be
-    computed from the *snapshot sequence itself*: if snapshot at day d has
-    spy_ret_5, that's already SPY's 5-day return ending d. For forward
-    returns we shift: forward_5d at day d = spy_ret_5 measured at day d+5.
-
-    More robust: derive 1-day SPY returns from successive spy_ret_5 differences,
-    but that compounds drift. Cleanest: hit yfinance once and cache. To keep
-    this script self-contained, we fall back to using the next snapshot's
-    spy_ret_5 / spy_ret_20 values as the realized forward return.
-
-    Returns a pd.Series indexed by DATE (not datetime) of "approximate next-
-    day forward log return", reconstructed from the snapshot diff.
-    """
-    # We approximate: forward_1d_ret(d) ≈ spy_ret_5(d+1) - spy_ret_5(d) * 0.8
-    # This is fragile. Better: just pull yfinance SPY directly.
-    return _yfinance_spy_returns(snaps[0][0].date(), snaps[-1][0].date())
-
-
-def _yfinance_spy_returns(start_dt, end_dt) -> pd.Series:
-    """Daily SPY simple returns from yfinance. Returns pd.Series indexed by date."""
-    try:
-        import yfinance as yf
-    except ImportError:
-        log.error("yfinance not available; cannot compute forward returns")
-        sys.exit(1)
-
-    # Pad by 30 days each side to ensure we have data for forward windows
-    pad_start = (start_dt - timedelta(days=10)).isoformat()
-    pad_end = (end_dt + timedelta(days=40)).isoformat()
-
-    df = yf.download("SPY", start=pad_start, end=pad_end, progress=False, auto_adjust=True)
-    if df.empty:
-        log.error("yfinance returned no SPY data for %s → %s", pad_start, pad_end)
-        sys.exit(1)
-    close = df["Close"]
-    # When yfinance returns a MultiIndex (Ticker, Field), squeeze it.
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-    rets = close.pct_change()
-    rets.index = pd.to_datetime(rets.index).date
-    return rets
+# SPY forward-return helpers moved to trading_agent.regime.evaluation
+# (shared with rolling_walkforward.py + validate_production_hmm.py — three
+# scripts, one copy of the math). yfinance_spy_returns raises RuntimeError
+# instead of sys.exit'ing; main() wraps it.
 
 
 def forward_returns(spy_rets: pd.Series, as_of_date, horizon_days: int) -> float:
     """Compound SPY simple returns over [d+1, d+horizon_days], inclusive.
 
-    Returns NaN if any required day is missing (e.g. test window ends inside
-    the forward horizon and we don't have the future data).
+    Thin alias for the shared helper — kept so existing callers/notebooks
+    that import scripts.walkforward_backtest.forward_returns keep working.
     """
-    target_dates = []
-    cur = as_of_date
-    # Skip non-business days: advance until we have `horizon_days` entries
-    needed = horizon_days
-    idx = spy_rets.index.searchsorted(as_of_date, side="right")
-    take = spy_rets.iloc[idx : idx + horizon_days]
-    if len(take) < horizon_days:
-        return float("nan")
-    return float((1.0 + take).prod() - 1.0)
+    return fwd_return(spy_rets, as_of_date, horizon_days)
 
 
 def main():
@@ -181,6 +134,10 @@ def main():
     p.add_argument("--allow-overlap", action="store_true",
                    help="Override the train/test overlap safety check. Use only "
                         "when you know what you're doing (sanity-check runs).")
+    p.add_argument("--break-glass", action="store_true",
+                   help="Evaluate into the frozen v6+ holdout window "
+                        "(>= holdout.HOLDOUT_START). Doing so BURNS the "
+                        "holdout for model selection — see regime/holdout.py.")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
@@ -188,6 +145,19 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # ----- Holdout freeze (separate concern from train/test overlap) -----
+    # --allow-overlap guards against IN-SAMPLE evaluation; this guards
+    # against CONSUMING the v6+ holdout. Neither flag implies the other.
+    try:
+        require_holdout_intact(
+            args.test_end,
+            break_glass=args.break_glass,
+            context=f"walkforward_backtest --test-end {args.test_end}",
+        )
+    except HoldoutViolation as e:
+        log.error("%s", e)
+        sys.exit(5)
 
     # ----- Load HMM + sanity check train/test gap -----
     loaded = get_model_by_id(args.hmm_id)
@@ -220,7 +190,11 @@ def main():
 
     # ----- Forward SPY returns -----
     log.info("Fetching SPY price series from yfinance for forward-return calc...")
-    spy_rets = _yfinance_spy_returns(snaps[0][0].date(), snaps[-1][0].date())
+    try:
+        spy_rets = yfinance_spy_returns(snaps[0][0].date(), snaps[-1][0].date())
+    except (ImportError, RuntimeError) as e:
+        log.error("Cannot compute forward returns: %s", e)
+        sys.exit(1)
     log.info("SPY return series: %d days from %s to %s",
              len(spy_rets), spy_rets.index[0], spy_rets.index[-1])
 

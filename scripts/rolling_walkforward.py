@@ -34,6 +34,19 @@ Same caveat as walkforward_backtest.py: this tests Layer 0 + Layer 1 +
 gate sizing on a SPY-long proxy. The LLM trader, debate, risk council,
 and actual options pricing are not tested here.
 
+It also does NOT validate the deployed production model: production runs
+a HUMAN-calibrated state→label mapping (scripts/promote_hmm.py), while
+this script auto-calibrates per refit. The auto-cal ARCHITECTURE and the
+deployed ARTIFACT are different objects — use
+scripts/validate_production_hmm.py for the artifact.
+
+HOLDOUT FREEZE
+--------------
+The 2017 → 2026-06-12 OOS window was reused across the v3-v5 design
+iterations and is burned for model selection (regime/holdout.py).
+Evaluating any year that reaches >= HOLDOUT_START requires an explicit
+--break-glass, which burns the v6+ holdout.
+
 USAGE
 -----
     python -m scripts.rolling_walkforward \\
@@ -48,15 +61,17 @@ import json
 import logging
 import math
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from trading_agent.regime.classifier import HMMModel, classify
+from trading_agent.regime.evaluation import fwd_return, yfinance_spy_returns
 from trading_agent.regime.features import HMM_FEATURE_ORDER, FeatureSnapshot
 from trading_agent.regime.gates import SIZE_MULTIPLIERS, regime_size_multiplier
+from trading_agent.regime.holdout import HoldoutViolation, require_holdout_intact
 from trading_agent.store.postgres import cursor
 
 log = logging.getLogger(__name__)
@@ -221,25 +236,10 @@ def train_hmm_for_year(training_snaps: list[tuple[datetime, FeatureSnapshot]],
     return hmm, audit
 
 
-def yfinance_spy_returns(start_dt, end_dt) -> pd.Series:
-    import yfinance as yf
-    pad_start = (start_dt - timedelta(days=10)).isoformat()
-    pad_end = (end_dt + timedelta(days=40)).isoformat()
-    df = yf.download("SPY", start=pad_start, end=pad_end, progress=False, auto_adjust=True)
-    close = df["Close"]
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-    rets = close.pct_change()
-    rets.index = pd.to_datetime(rets.index).date
-    return rets
-
-
-def fwd_return(rets: pd.Series, day, horizon: int) -> float:
-    idx = rets.index.searchsorted(day, side="right")
-    take = rets.iloc[idx : idx + horizon]
-    if len(take) < horizon:
-        return float("nan")
-    return float((1.0 + take).prod() - 1.0)
+# yfinance_spy_returns / fwd_return moved to trading_agent.regime.evaluation
+# so validate_production_hmm.py shares the exact same forward-return math
+# instead of a third copy (the v1-v3 era had per-script copies and per-script
+# bugs). Imported above; names kept for callers within this module.
 
 
 def run_one_seed(args, seed: int, out_dir: Path, spy_rets_cache: pd.Series | None) -> dict:
@@ -435,6 +435,10 @@ def main():
     p.add_argument("--cov-type", default="diag", choices=["diag", "full", "spherical", "tied"])
     p.add_argument("--min-covar", type=float, default=1e-3)
     p.add_argument("--out-dir", required=True)
+    p.add_argument("--break-glass", action="store_true",
+                   help="Evaluate into the frozen v6+ holdout window "
+                        "(>= holdout.HOLDOUT_START). Doing so BURNS the "
+                        "holdout for model selection — see regime/holdout.py.")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
@@ -442,6 +446,20 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # --last-year Y consumes snapshots through Y-12-31. Guard on that, not on
+    # "data that happens to exist today" — the same command re-run after the
+    # holdout starts accumulating data would otherwise silently consume it.
+    from datetime import date as _date
+    try:
+        require_holdout_intact(
+            _date(args.last_year, 12, 31),
+            break_glass=args.break_glass,
+            context=f"rolling_walkforward --last-year {args.last_year}",
+        )
+    except HoldoutViolation as e:
+        log.error("%s", e)
+        sys.exit(5)
 
     base_out = Path(args.out_dir)
     base_out.mkdir(parents=True, exist_ok=True)

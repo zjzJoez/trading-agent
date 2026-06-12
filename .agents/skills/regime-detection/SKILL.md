@@ -36,3 +36,25 @@ Confidence rises slowly: a regime change to a more risk-on tier requires 3 conse
 
 - LLMs CANNOT re-classify the regime upward. They can only DOWNGRADE confidence or DEFER.
 - Every analyst report prefaces its read with the current regime so the chain stays consistent.
+
+## What the evidence supports (and what it doesn't)
+
+Treat the regime layer as **drawdown control, not alpha**. The walk-forward
+record (2017 → 2026-06-12, 5 seeds): overlay Sharpe 0.908 ± 0.029 vs SPY
+0.837. The +0.071 difference is ~0.2 standard errors — not distinguishable
+from zero — and the overlay trails SPY buy-and-hold by ~142pp cumulatively
+(avg 0.69× exposure). What IS demonstrated: 2022-bear protection (+9–10pp)
+and max drawdown ~−14–15% vs SPY's ~−25%.
+
+Two caveats when reasoning about regime output:
+
+- That OOS window was reused across the v3–v5 design iterations, so it's
+  burned for model selection. Data from 2026-06-13 forward is a frozen
+  holdout for v6+ (`src/trading_agent/regime/holdout.py`) — never run a
+  model-selection evaluation into it without `--break-glass`.
+- The walk-forward validated an auto-calibrated architecture; production
+  runs a human-calibrated artifact (`scripts/promote_hmm.py`). To measure
+  the deployed model itself, use `scripts/validate_production_hmm.py`.
+
+Practical implication: lean on the regime label to SIZE DOWN and to block
+entries (CRISIS/BEAR gates), not as a directional return forecast.

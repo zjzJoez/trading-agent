@@ -1,5 +1,25 @@
 # HMM v6 research — framework + open questions
 
+> **Re-scoped 2026-06-12:** the "+0.071 Sharpe edge" language below is
+> superseded. That number is real but it is **~0.2 SE on a single
+> overlapping OOS window (2017 → 2026-06-12) that v1-v5 design iterations
+> reused at least seven times** — treat the regime layer as a
+> drawdown-control overlay (2022: +9-10pp protection; max DD ~−14% vs SPY
+> ~−25%), not an alpha source. It also trails SPY buy-and-hold by ~142pp
+> cumulatively. Consequences for this research plan:
+>
+> 1. The 2017-2026 window is **burned for v6 selection**. Ablation /
+>    feature sweeps below may still rank candidates on it, but the FINAL
+>    v6-vs-v5 decision evaluates once on the frozen holdout
+>    (data ≥ 2026-06-13, enforced by `src/trading_agent/regime/holdout.py`
+>    — the walk-forward scripts refuse to cross it without `--break-glass`).
+> 2. The decision gates below compare auto-calibrated architectures; the
+>    deployed model is a human-calibrated artifact. Validate it with
+>    `scripts/validate_production_hmm.py`, which reports drawdown / IR
+>    with Newey-West (lag 20) standard errors.
+> 3. Re-read the gate thresholds ("≥ v5 + 0.04 Sharpe") as *candidate
+>    screening* criteria, not promotion evidence.
+
 ## Where we are (v5 baseline)
 
 Per `reports/walkforward_v5_longhistory/REPORT.md`:
