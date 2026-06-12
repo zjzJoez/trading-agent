@@ -64,12 +64,40 @@ def connection(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+# Columns added after the original CREATE TABLE shipped. CREATE TABLE IF NOT
+# EXISTS cannot retrofit them onto existing databases, so migrate() ALTERs
+# any that are missing. Keep in sync with schema.sql's trades definition.
+_TRADE_COLUMN_ADDS: dict[str, str] = {
+    "provenance": "TEXT NOT NULL DEFAULT 'agent'",
+    "fees": "REAL",
+    "pnl_recomputed": "REAL",
+    "pnl_mismatch": "INTEGER DEFAULT 0",
+    "exit_order_id": "TEXT",
+    "exit_state_json": "TEXT",
+}
+
+
+def _ensure_trade_columns(conn: sqlite3.Connection) -> list[str]:
+    """ALTER TABLE trades to add any missing post-v1 columns. Idempotent."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+    added: list[str] = []
+    for name, decl in _TRADE_COLUMN_ADDS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {decl}")
+            added.append(name)
+    return added
+
+
 def migrate(db_path: Path | None = None) -> None:
-    """Apply schema.sql. Idempotent — uses IF NOT EXISTS throughout."""
+    """Apply schema.sql + column retrofits. Idempotent."""
     sql = SCHEMA_PATH.read_text()
     conn = connect(db_path)
     try:
         conn.executescript(sql)
+        added = _ensure_trade_columns(conn)
+        if added:
+            print(f"[db.migrate] trades columns added: {', '.join(added)}",
+                  file=sys.stderr)
         conn.commit()
     finally:
         conn.close()

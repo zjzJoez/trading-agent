@@ -777,6 +777,22 @@ class TestDetectExitTriggers:
 
 
 class TestRouteExitOrHold:
+    @pytest.fixture(autouse=True)
+    def _no_real_broker_order_scan(self):
+        """route_exit_or_hold scans live broker orders for orphan adoption
+        and consults the pending-close guard (Phase 0.3). Without OpenD the
+        moomoo SDK blocks on connect retries, and without a journal DB the
+        guard fails CLOSED (None → exits deferred) — stub both to the clean
+        empty state for every test in this class; adoption and fail-closed
+        behavior have their own dedicated tests."""
+        with patch("trading_agent.mcp_servers.moomoo.server.get_orders",
+                   return_value={"rows": []}), \
+             patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_sqlite",
+                   return_value=set()), \
+             patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_pg",
+                   return_value=set()):
+            yield
+
     def test_all_hold_returns_empty(self):
         state = _base_state(
             trigger="intraday_monitor",
@@ -837,12 +853,62 @@ class TestRouteExitOrHold:
                        return_value={"rows": [{"symbol": opt_sym, "trade_id": 15}]}):
                 with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
                            return_value=mock_order) as mock_place_opt:
-                    with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
-                        with patch("trading_agent.notify.send"):
-                            from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
-                            route_exit_or_hold(state)
+                    with patch("trading_agent.exits.fill_confirm.write_pending_close",
+                               return_value=True) as mock_pending:
+                        with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_sqlite",
+                                   return_value=set()):
+                            with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_pg",
+                                       return_value=set()):
+                                with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
+                                    with patch("trading_agent.notify.send"):
+                                        from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                        route_exit_or_hold(state)
             mock_place_opt.assert_called_once()
-            mock_close.assert_called_once_with(trade_id=15, exit_price=6.5, outcome="WIN", pnl=pytest.approx(700.0))
+            # Phase 0.3: SELL closes price toward the executable side —
+            # no live bid in the position, so mark 6.5 × 0.98 = 6.37.
+            assert mock_place_opt.call_args[1].get("price") == pytest.approx(6.37)
+            # The journal must NOT close at placement — close happens in
+            # sync_fill_status once the broker confirms the dealt price.
+            mock_close.assert_not_called()
+            mock_pending.assert_called_once()
+
+    def test_exit_option_fallback_close_is_cost_honest(self):
+        """When the pending-close state cannot be written, the legacy
+        immediate close fires — at the executable-side limit, net of fees."""
+        opt_sym = "US.AAPL260117C00200000"
+        state = _base_state(
+            trigger="intraday_monitor",
+            journal={"exit_decisions": [
+                {"symbol": opt_sym, "action": "EXIT_TARGET",
+                 "exit_qty_factor": 1.0, "reason": "target hit"},
+            ]},
+            positions=[{
+                "symbol": opt_sym, "asset_type": "OPT",
+                "qty": 2, "entry_price": 3.0, "mark": 6.5,
+                "thesis_id": 9, "strategy_label": "earnings_long_call",
+                "delta": 0.52, "dte": 20,
+            }],
+        )
+        mock_order = {"thesis_id": 15, "rows": [{"order_id": "OPT456", "order_status": "SUBMITTED"}]}
+        with _patch_all_emits():
+            with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
+                       return_value={"rows": [{"symbol": opt_sym, "trade_id": 15}]}):
+                with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
+                           return_value=mock_order):
+                    with patch("trading_agent.exits.fill_confirm.write_pending_close",
+                               return_value=False):
+                        with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_sqlite",
+                                   return_value=set()):
+                            with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_pg",
+                                       return_value=set()):
+                                with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
+                                    with patch("trading_agent.notify.send"):
+                                        from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                        route_exit_or_hold(state)
+            # gross (6.37-3.0)×2×100 = 674; round-trip fees 2×$1×2 = $4 → 670
+            mock_close.assert_called_once_with(
+                trade_id=15, exit_price=pytest.approx(6.37),
+                outcome="WIN", pnl=pytest.approx(670.0))
 
     def test_order_failure_does_not_journal(self):
         state = _base_state(
@@ -932,12 +998,16 @@ class TestRouteExitOrHold:
             with patch("trading_agent.mcp_servers.journal.server.get_open_positions_with_thesis",
                        return_value={"rows": []}):  # SQLite empty
                 with patch("trading_agent.store.postgres.cursor", return_value=pg_cursor):
-                    with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
-                               return_value=mock_order) as mock_place_opt:
-                        with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_sqlite_close:
-                            with patch("trading_agent.notify.send"):
-                                from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
-                                route_exit_or_hold(state)
+                    with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_sqlite",
+                               return_value=set()):
+                        with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_pg",
+                                   return_value=set()):
+                            with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
+                                       return_value=mock_order) as mock_place_opt:
+                                with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_sqlite_close:
+                                    with patch("trading_agent.notify.send"):
+                                        from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                        route_exit_or_hold(state)
 
         # Order placed with the Postgres-resolved trade_id (42)
         mock_place_opt.assert_called_once()
@@ -947,10 +1017,14 @@ class TestRouteExitOrHold:
         # SQLite close_trade should NOT be called (trade not in SQLite)
         mock_sqlite_close.assert_not_called()
 
-        # Postgres cursor should have received an UPDATE journal_trades call
+        # Phase 0.3: the Postgres write is now the PENDING-CLOSE state stamp
+        # (UPDATE journal_trades ... broker_fill_json), not an outcome close —
+        # the close lands in sync_fill_status at the broker's dealt price.
         executes = [c.args[0] for c in pg_cursor.execute.call_args_list if c.args]
         update_called = any("UPDATE journal_trades" in q for q in executes)
         assert update_called, f"expected UPDATE journal_trades in executes: {executes!r}"
+        outcome_closed = any("SET exit_price" in q for q in executes)
+        assert not outcome_closed, "journal must not close at placement time"
 
 
 # ---------------------------------------------------------------------------

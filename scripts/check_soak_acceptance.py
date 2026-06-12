@@ -193,6 +193,36 @@ def check_critical_events_notified(since) -> dict:
     )
 
 
+def check_exit_fills_confirmed(since) -> dict:
+    """Measurement-integrity gate: every closed trade in the window must have
+    a broker-confirmed exit (broker_fill_json.exit_dealt_avg_price) unless it
+    is a virtual fill. Closes journaled without fill confirmation are the
+    exact accounting fiction Phase 0 removed — paper statistics built on them
+    are inadmissible, so the soak window fails rather than reporting them.
+    """
+    try:
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM journal_trades
+                WHERE closed_at >= %s
+                  AND outcome IN ('WIN', 'LOSS', 'SCRATCH')
+                  AND COALESCE(broker_order_id, '') NOT LIKE 'VIRTUAL-%%'
+                  AND (broker_fill_json IS NULL
+                       OR NOT broker_fill_json ? 'exit_dealt_avg_price')
+                """,
+                (since,),
+            )
+            unconfirmed = int(cur.fetchone()[0])
+    except Exception as e:
+        return _gate("exit_fills_confirmed", False, f"db read failed: {e}")
+    return _gate(
+        "exit_fills_confirmed",
+        unconfirmed == 0,
+        f"{unconfirmed} closed trades without broker-confirmed exit price",
+    )
+
+
 def check_paper_sharpe_vs_spy(since) -> dict:
     """Compute paper-account daily-return Sharpe vs SPY over the window.
 
@@ -249,6 +279,7 @@ def main() -> int:
         check_no_duplicate_orders(since),
         check_no_missed_fills(since),
         check_critical_events_notified(since),
+        check_exit_fills_confirmed(since),
         check_paper_sharpe_vs_spy(since),
     ]
     all_pass = all(g["pass"] for g in gates)

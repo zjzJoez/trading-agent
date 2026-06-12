@@ -68,14 +68,26 @@ def sync_fill_status(state: TradingGraphState) -> dict:
     trigger = state["trigger"]
     log.info("[intraday/sync_fill_status] run_id=%s", run_id)
 
+    # 1. Live broker order map first — shared by the entry-price sync AND the
+    # exit-fill finalize pass below. Broker down → nothing can settle this tick.
+    order_map: dict[str, dict] = {}
     try:
-        from trading_agent.store.postgres import cursor
+        from trading_agent.mcp_servers.moomoo.server import get_orders
+        for r in (get_orders().get("rows") or []):
+            oid = str(r.get("order_id") or r.get("orderID") or "").strip()
+            if oid:
+                order_map[oid] = r
     except Exception as e:
-        log.warning("[sync_fill_status] postgres import failed: %s", e)
+        log.warning("[sync_fill_status] broker get_orders failed: %s — skip tick", e)
         return {}
 
-    # 1. OPEN journal trades that have a broker order id
+    # 2. OPEN journal trades that have a broker order id (entry-side sync).
+    # Postgres being down must not skip the exit finalize pass — the SQLite
+    # side of finalize_pending_exits works without it.
+    open_trades: list = []
+    cursor = None
     try:
+        from trading_agent.store.postgres import cursor
         with cursor() as cur:
             cur.execute(
                 """
@@ -88,21 +100,6 @@ def sync_fill_status(state: TradingGraphState) -> dict:
             open_trades = cur.fetchall()
     except Exception as e:
         log.warning("[sync_fill_status] open-trades read failed: %s", e)
-        return {}
-    if not open_trades:
-        return {}
-
-    # 2. Live broker order map: order_id → (status, dealt_qty, dealt_avg_price)
-    order_map: dict[str, dict] = {}
-    try:
-        from trading_agent.mcp_servers.moomoo.server import get_orders
-        for r in (get_orders().get("rows") or []):
-            oid = str(r.get("order_id") or r.get("orderID") or "").strip()
-            if oid:
-                order_map[oid] = r
-    except Exception as e:
-        log.warning("[sync_fill_status] broker get_orders failed: %s — skip tick", e)
-        return {}
 
     synced_filled = 0
     marked_unfilled = 0
@@ -167,6 +164,21 @@ def sync_fill_status(state: TradingGraphState) -> dict:
                      "n_open_checked": len(open_trades)},
         )
         log.info("[sync_fill_status] filled=%d unfilled=%d", synced_filled, marked_unfilled)
+
+    # 3. Exit-fill confirmation: settle every in-flight close placed by
+    # route_exit_or_hold against the live order map — journal closes happen
+    # HERE, at the broker's dealt price, never at placement time.
+    try:
+        from trading_agent.exits.fill_confirm import finalize_pending_exits
+        stats = finalize_pending_exits(order_map, run_id, trigger)
+        if any(stats.values()):
+            emit(
+                run_id=run_id, trigger=trigger, agent="sync_fill_status",
+                event_type="pending_exits_finalized", payload=stats,
+            )
+            log.info("[sync_fill_status] pending exits: %s", stats)
+    except Exception as e:
+        log.warning("[sync_fill_status] finalize_pending_exits failed: %s", e)
     return {}
 
 
@@ -263,6 +275,16 @@ def refresh_quotes_and_greeks(state: TradingGraphState) -> dict:
             mark = float(row.get("last_price") or pos.get("mark") or 0)
             if mark > 0:
                 updated["mark"] = mark
+
+            # Live bid/ask: route_exit_or_hold prices SELL closes off the BID
+            # (the side you can actually hit), and the quoted spread feeds the
+            # execution-cost audit trail.
+            bid_raw = row.get("bid_price") or row.get("bid")
+            ask_raw = row.get("ask_price") or row.get("ask")
+            if bid_raw is not None and float(bid_raw) > 0:
+                updated["bid"] = float(bid_raw)
+            if ask_raw is not None and float(ask_raw) > 0:
+                updated["ask"] = float(ask_raw)
 
             if _is_option_code(symbol):
                 # Options: greeks/iv/expiry come back in the same row per docstring
@@ -675,7 +697,43 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
         except Exception as e:
             log.warning("[route_exit_or_hold] postgres journal fallback failed: %s", e)
 
+    # In-flight closes (pending fill confirmation) — placing a second close
+    # order for the same trade would over-close the position at the broker.
+    # The lookups return None on store error; that means "unknown", and
+    # unknown must FAIL CLOSED (skip exits resolved from that store this
+    # tick) — forgetting an in-flight close and placing a second one is
+    # unrecoverable, a one-tick delay is not.
+    try:
+        from trading_agent.exits.fill_confirm import (
+            find_adoptable_close_order,
+            pending_close_trade_ids_pg,
+            pending_close_trade_ids_sqlite,
+        )
+        pending_by_source: dict[str, set[int] | None] = {
+            "sqlite": pending_close_trade_ids_sqlite(),
+            "postgres": pending_close_trade_ids_pg(),
+        }
+    except Exception as e:
+        log.warning("[route_exit_or_hold] pending-close lookup failed: %s", e)
+        find_adoptable_close_order = None  # type: ignore[assignment]
+        pending_by_source = {"sqlite": None, "postgres": None}
+
+    # Live broker orders, for orphan adoption: a crash between a previous
+    # run's order placement and its pending-state write leaves a resting
+    # close order nothing tracks — adopting it beats double-placing.
+    broker_order_rows: dict[str, dict] = {}
+    if moomoo_available:
+        try:
+            from trading_agent.mcp_servers.moomoo.server import get_orders
+            for _r in (get_orders().get("rows") or []):
+                _oid = str(_r.get("order_id") or _r.get("orderID") or "").strip()
+                if _oid:
+                    broker_order_rows[_oid] = _r
+        except Exception as e:
+            log.warning("[route_exit_or_hold] broker order scan failed: %s", e)
+
     closed_symbols: list[str] = []
+    pending_symbols: list[str] = []
     failed_symbols: list[str] = []
     skipped_no_journal: list[str] = []
 
@@ -710,6 +768,29 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             continue
         trade_id, thesis_id, trade_id_source = resolved
 
+        pending_ids = pending_by_source.get(trade_id_source)
+        if pending_ids is None:
+            log.warning(
+                "[route_exit_or_hold] %s: pending-close state for store %s "
+                "unreadable — failing closed, exit deferred one tick",
+                symbol, trade_id_source,
+            )
+            emit(
+                run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                event_type="exit_deferred_pending_unknown", severity=1,
+                payload={"symbol": symbol, "store": trade_id_source},
+            )
+            failed_symbols.append(symbol)
+            continue
+        if trade_id in pending_ids:
+            log.info(
+                "[route_exit_or_hold] %s trade %s already has an exit in "
+                "flight — awaiting fill confirmation, skipping",
+                symbol, trade_id,
+            )
+            pending_symbols.append(symbol)
+            continue
+
         full_qty = float(pos.get("qty") or 0)
         close_qty = max(1, round(full_qty * qty_factor)) if qty_factor < 1.0 else full_qty
         if close_qty <= 0:
@@ -726,9 +807,52 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             plan_dir = ep.get("direction") or "LONG"
         side_close = "BUY" if plan_dir == "SHORT" else "SELL"
         placed_order_id: str | None = None
-        exit_price = float(pos.get("mark") or pos.get("entry_price") or 0)
 
-        if moomoo_available:
+        # Marketable limit toward the EXECUTABLE side. The old code priced at
+        # the last mark — for a SELL that's ~half a spread above what the
+        # market pays, so journaled exits were systematically inflated and
+        # wide-spread orders could rest unfilled while the journal said
+        # "closed". Mirrors the entry side's fresh-ask×1.02 convention.
+        from trading_agent.exits.fill_confirm import (
+            BUY_CROSS_BUF,
+            SELL_CROSS_BUF,
+            build_pending_state,
+            write_pending_close,
+        )
+        mark_px = float(pos.get("mark") or pos.get("entry_price") or 0)
+        quoted_bid = pos.get("bid")
+        quoted_ask = pos.get("ask")
+        if side_close == "SELL":
+            base_px = float(quoted_bid) if quoted_bid else mark_px
+            exit_price = round(base_px * SELL_CROSS_BUF, 2)
+        else:
+            base_px = float(quoted_ask) if quoted_ask else mark_px
+            exit_price = round(base_px * BUY_CROSS_BUF, 2)
+
+        is_partial = (action == "EXIT_TARGET" and 0.0 < qty_factor < 1.0)
+
+        # Orphan adoption (full closes only): a live same-symbol same-side
+        # order means a previous run placed this close and died before the
+        # pending-state write — track THAT order instead of doubling it.
+        adopted = None
+        if (not is_partial and broker_order_rows
+                and find_adoptable_close_order is not None):
+            adopted = find_adoptable_close_order(
+                broker_order_rows, symbol, side_close)
+            if adopted:
+                placed_order_id = adopted[0]
+                log.warning(
+                    "[route_exit_or_hold] %s adopting orphan close order %s "
+                    "(crash-window leftover) — no new order placed",
+                    symbol, placed_order_id,
+                )
+                emit(
+                    run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                    event_type="exit_order_adopted", severity=1,
+                    payload={"symbol": symbol, "order_id": placed_order_id},
+                )
+
+        if moomoo_available and not adopted:
             try:
                 if asset_type == "OPT":
                     result = place_paper_option_order(
@@ -797,9 +921,8 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
         # Full closes (factor=1.0 OR any non-EXIT_TARGET action) flow
         # through close_trade + close_thesis as before.
         # ------------------------------------------------------------------
-        is_partial = (action == "EXIT_TARGET" and 0.0 < qty_factor < 1.0)
-
         closed_ok = False
+        exit_pending = False
         if is_partial:
             try:
                 from trading_agent.store.postgres import cursor
@@ -827,48 +950,85 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                 # Don't fail the whole loop; the next tick re-evaluates.
                 closed_ok = True
         else:
-            # Full close — journal close (trade row + thesis row).
-            entry_price_j = float(pos.get("entry_price") or 0)
-            mult_j = 100 if asset_type == "OPT" else 1
-            # SHORT positions invert PnL sign: you collect premium on entry
-            # (cash IN), pay to close (cash OUT). So profit = entry - exit.
-            if plan_dir == "SHORT":
-                pnl_j = round((entry_price_j - exit_price) * close_qty * mult_j, 2)
+            # Full close — the journal is NOT closed here anymore. The close
+            # order just placed must be CONFIRMED at the broker's dealt price
+            # before any P&L is recorded; the old place-and-journal-at-mark
+            # flow inflated exits by ~half the spread and could mark unfilled
+            # positions closed. sync_fill_status finalizes next tick.
+            pending = build_pending_state(
+                order_id=placed_order_id,
+                symbol=symbol,
+                action=action,
+                reason=reason,
+                qty=close_qty,
+                side=side_close,
+                asset_type=asset_type,
+                requested_exit_price=exit_price,
+                quoted_bid=float(quoted_bid) if quoted_bid else None,
+                quoted_ask=float(quoted_ask) if quoted_ask else None,
+                thesis_id=thesis_id,
+                source=trade_id_source,
+            )
+            if write_pending_close(trade_id, pending):
+                exit_pending = True
+                log.info(
+                    "[route_exit_or_hold] %s exit order %s pending fill "
+                    "confirmation (limit=%.2f, trade_id=%s)",
+                    symbol, placed_order_id, exit_price, trade_id,
+                )
             else:
-                pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
-            outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
+                # Pending-state write failed — we can't track the order, so
+                # fall back to the legacy immediate close rather than strand
+                # the position. Cost-honest: round-trip fees charged, exit at
+                # the executable-side limit, and flagged unconfirmed.
+                entry_price_j = float(pos.get("entry_price") or 0)
+                mult_j = 100 if asset_type == "OPT" else 1
+                # SHORT positions invert PnL sign: you collect premium on
+                # entry (cash IN), pay to close (cash OUT) → profit = entry - exit.
+                if plan_dir == "SHORT":
+                    gross_j = (entry_price_j - exit_price) * close_qty * mult_j
+                else:
+                    gross_j = (exit_price - entry_price_j) * close_qty * mult_j
+                try:
+                    from trading_agent.execution_costs import fees_per_side
+                    pnl_j = round(gross_j - 2 * fees_per_side(close_qty, asset_type), 2)
+                except Exception as e:
+                    log.warning("[route_exit_or_hold] fee model failed: %s", e)
+                    pnl_j = round(gross_j, 2)
+                outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
+                close_reason_j = f"{action} [exit fill UNCONFIRMED — pending-state write failed]"
 
-            if trade_id_source == "sqlite" and journal_close_trade is not None:
-                try:
-                    journal_close_trade(
-                        trade_id=trade_id,
-                        exit_price=exit_price,
-                        outcome=outcome_j,
-                        pnl=pnl_j,
-                    )
-                    closed_ok = True
-                except Exception as e:
-                    log.warning("[route_exit_or_hold] sqlite close_trade %s failed: %s", symbol, e)
-            if not closed_ok:
-                # Either source was postgres, or sqlite path raised — write directly to Postgres.
-                try:
-                    from trading_agent.store.postgres import cursor
-                    with cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE journal_trades
-                            SET exit_price = %s,
-                                outcome = %s,
-                                closed_at = COALESCE(closed_at, NOW()),
-                                close_reason = COALESCE(close_reason, %s)
-                            WHERE id = %s AND outcome = 'OPEN'
-                            """,
-                            (exit_price, outcome_j, action, trade_id),
+                if trade_id_source == "sqlite" and journal_close_trade is not None:
+                    try:
+                        journal_close_trade(
+                            trade_id=trade_id,
+                            exit_price=exit_price,
+                            outcome=outcome_j,
+                            pnl=pnl_j,
                         )
-                    closed_ok = True
-                    log.info("[route_exit_or_hold] %s journal closed via postgres trade_id=%s", symbol, trade_id)
-                except Exception as e:
-                    log.warning("[route_exit_or_hold] postgres close %s failed: %s", symbol, e)
+                        closed_ok = True
+                    except Exception as e:
+                        log.warning("[route_exit_or_hold] sqlite close_trade %s failed: %s", symbol, e)
+                if not closed_ok:
+                    # Either source was postgres, or sqlite path raised — write directly to Postgres.
+                    try:
+                        from trading_agent.store.postgres import cursor
+                        with cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE journal_trades
+                                SET exit_price = %s,
+                                    outcome = %s,
+                                    closed_at = COALESCE(closed_at, NOW()),
+                                    close_reason = COALESCE(close_reason, %s)
+                                WHERE id = %s AND outcome = 'OPEN'
+                                """,
+                                (exit_price, outcome_j, close_reason_j, trade_id),
+                            )
+                        closed_ok = True
+                        log.info("[route_exit_or_hold] %s journal closed via postgres trade_id=%s", symbol, trade_id)
+                    except Exception as e:
+                        log.warning("[route_exit_or_hold] postgres close %s failed: %s", symbol, e)
 
         # Thesis flip (only on full closes — partial closes leave it open
         # so subsequent rungs can still close out cleanly). Without this,
@@ -917,18 +1077,36 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                         thesis_id, e,
                     )
 
-        emit(
-            run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
-            event_type="position_closed",
-            payload={
-                "symbol": symbol,
-                "action": action,
-                "qty_closed": close_qty,
-                "exit_price": exit_price,
-                "reason": reason,
-                "order_id": placed_order_id,
-            },
-        )
+        if exit_pending:
+            emit(
+                run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                event_type="exit_order_placed",
+                payload={
+                    "symbol": symbol,
+                    "action": action,
+                    "qty": close_qty,
+                    "limit_price": exit_price,
+                    "reason": reason,
+                    "order_id": placed_order_id,
+                    "trade_id": trade_id,
+                },
+            )
+            pending_symbols.append(symbol)
+        else:
+            emit(
+                run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                event_type="position_closed",
+                payload={
+                    "symbol": symbol,
+                    "action": action,
+                    "qty_closed": close_qty,
+                    "exit_price": exit_price,
+                    "reason": reason,
+                    "order_id": placed_order_id,
+                    "fill_confirmed": False,
+                },
+            )
+            closed_symbols.append(symbol)
 
         if ntfy_available:
             try:
@@ -938,15 +1116,18 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                     pnl_pct = ((entry - exit_price) / entry * 100) if entry else 0.0
                 else:
                     pnl_pct = ((exit_price - entry) / entry * 100) if entry else 0.0
+                verb = "EXIT ORDER" if exit_pending else "EXIT"
                 ntfy_send(
                     topic="trades",
-                    title=f"EXIT {action.replace('EXIT_', '')} — {_bare_ticker(symbol)}",
+                    title=f"{verb} {action.replace('EXIT_', '')} — {_bare_ticker(symbol)}",
                     body=(
                         f"Symbol: {symbol}\n"
-                        f"Qty closed: {int(close_qty)}\n"
-                        f"Exit @ {exit_price:.2f}  Entry @ {entry:.2f}  "
-                        f"({pnl_pct:+.1f}%)\n"
-                        f"Reason: {reason}"
+                        f"Qty: {int(close_qty)}\n"
+                        f"Limit @ {exit_price:.2f}  Entry @ {entry:.2f}  "
+                        f"(~{pnl_pct:+.1f}% to limit)\n"
+                        + ("Awaiting broker fill — P&L records on confirmation\n"
+                           if exit_pending else "")
+                        + f"Reason: {reason}"
                     ),
                     priority=4,
                     tags=["rotating_light", "chart_with_downwards_trend"],
@@ -954,13 +1135,12 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             except Exception as e:
                 log.warning("[route_exit_or_hold] ntfy failed: %s", e)
 
-        closed_symbols.append(symbol)
-
     emit(
         run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
         event_type="exit_pass_complete",
         payload={
             "closed": closed_symbols,
+            "pending_fill": pending_symbols,
             "failed": failed_symbols,
             "held": [d["symbol"] for d in decisions if d.get("action") == "HOLD"],
         },

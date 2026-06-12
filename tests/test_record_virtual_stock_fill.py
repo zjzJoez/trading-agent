@@ -159,4 +159,6 @@ def test_post_mortem_aggregates_stock_by_strategy(tmp_journal_db):
     assert bucket is not None, f"missing shadow_real_account in {pm['by_strategy']}"
     assert bucket["n"] >= 1
     assert bucket["wins"] >= 1
-    assert bucket["pnl"] >= 60.0
+    # Phase 0 cost model: virtual fills charge half-spread + fees, so the
+    # aggregate is NET of friction (gross $60 − ~$1.38), not the raw $60.
+    assert 57.0 <= bucket["pnl"] <= 60.0

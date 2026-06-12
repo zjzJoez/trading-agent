@@ -155,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
             thesis_id=thesis_id,
             strategy_label=MIRROR_LABEL,
             reasoning=f"real-account mirror; real_order_id={oid}; filled {when}",
+            provenance="real_mirror",
         )
         # Keep the shadow thesis out of the 'open' set (and the order gate).
         close_thesis(thesis_id=thesis_id, status="triggered")
