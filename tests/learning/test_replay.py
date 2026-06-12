@@ -56,3 +56,26 @@ def test_composite_penalizes_drawdown():
     assert a.max_drawdown_R == 0
     assert b.max_drawdown_R > 0
     assert a.composite_score > b.composite_score
+
+
+def test_replay_reader_filters_on_writer_literals():
+    """Regression: fetch_closed_trades filtered on CLOSED/STOPPED/TARGET_HIT,
+    which no writer produces — replay always saw zero trades.  The reader
+    must parameterize on CLOSED_OUTCOMES (WIN/LOSS/SCRATCH)."""
+    from unittest.mock import MagicMock, patch
+
+    from trading_agent.learning.outcome import CLOSED_OUTCOMES
+    from trading_agent.learning.replay import fetch_closed_trades
+
+    cur = MagicMock()
+    cur.fetchall.return_value = []
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=cur)
+    ctx.__exit__ = MagicMock(return_value=False)
+    with patch("trading_agent.learning.replay.cursor", return_value=ctx):
+        assert fetch_closed_trades() == []
+    sql, params = cur.execute.call_args[0]
+    assert "= ANY(%s)" in sql
+    assert params[0] == list(CLOSED_OUTCOMES)
+    for dead in ("'CLOSED'", "'STOPPED'", "'TARGET_HIT'"):
+        assert dead not in sql

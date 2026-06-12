@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
 from trading_agent.learning.promote import (
     MDD_FRAC,
     PROFIT_FACTOR_FRAC,
     _aggregate,
+    evaluate_canary,
     wilson_lb,
 )
 
@@ -85,3 +88,107 @@ def test_aggregate_drawdown_after_recovery():
 def test_promotion_thresholds_documented():
     assert PROFIT_FACTOR_FRAC == 0.95
     assert MDD_FRAC == 1.10
+
+
+# -- evaluate_canary fail-safe evidence gate ----------------------------------
+
+class _FakeLearningDB:
+    """Scripted stand-in for the Postgres cursor used by evaluate_canary.
+
+    Dispatches on the SQL of the last execute() so one object can serve every
+    query the promotion path issues: canary status, rollback triggers,
+    routed-trade count, and per-version outcome series.
+    """
+
+    def __init__(self, *, status_row=("CANARY", 1), n_routed=25,
+                 outcomes_by_version=None, daily_rows=None):
+        self.status_row = status_row
+        self.n_routed = n_routed
+        self.outcomes_by_version = outcomes_by_version or {}
+        self.daily_rows = daily_rows or []
+        self._sql = ""
+        self._params = ()
+
+    def execute(self, sql, params=()):
+        self._sql = sql
+        self._params = params or ()
+
+    def fetchone(self):
+        if "SELECT status, parent_version_id" in self._sql:
+            return self.status_row
+        if "count(*)" in self._sql.lower():
+            return (self.n_routed,)
+        return None
+
+    def fetchall(self):
+        if "GROUP BY DATE" in self._sql:
+            return list(self.daily_rows)
+        if "trade_outcome_features" in self._sql:
+            rs = [(r,) for r in self.outcomes_by_version.get(self._params[0], [])]
+            if "LIMIT" in self._sql:
+                return rs[: int(self._params[1])]
+            return rs
+        return []
+
+
+@contextmanager
+def _patched_db(db: _FakeLearningDB):
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=db)
+    ctx.__exit__ = MagicMock(return_value=False)
+    with patch("trading_agent.learning.promote.cursor", return_value=ctx), \
+         patch("trading_agent.learning.canary.cursor", return_value=ctx):
+        yield
+
+
+def test_evaluate_canary_empty_outcomes_retains_never_promotes():
+    """Regression: 20+ routed journal rows but an EMPTY trade_outcome_features
+    table must RETAIN.  Before the evidence gate, empty aggregates passed all
+    three comparisons vacuously (0 >= 0, 0 >= 0×0.95, 0 <= 0×1.1) and the
+    first canary to accumulate 20 routed rows auto-promoted on zero data."""
+    db = _FakeLearningDB(status_row=("CANARY", 1), n_routed=25,
+                         outcomes_by_version={})
+    with _patched_db(db):
+        d = evaluate_canary(42)
+    assert d.decision == "RETAIN"
+    assert "insufficient closed-outcome evidence" in d.rationale[0]
+    assert d.canary_stats is not None and d.canary_stats.n == 0
+    assert d.control_stats is not None and d.control_stats.n == 0
+
+
+def test_evaluate_canary_thin_control_retains():
+    """Canary has 20 closed outcomes but control only 3 — still RETAIN.
+    Both sides need >= N_CANARY_MIN before any gate comparison runs."""
+    db = _FakeLearningDB(
+        status_row=("CANARY", 1), n_routed=25,
+        outcomes_by_version={
+            42: [1.0] * 16 + [-0.5] * 4,
+            1: [1.0, -1.0, 0.5],
+        },
+    )
+    with _patched_db(db):
+        d = evaluate_canary(42)
+    assert d.decision == "RETAIN"
+    assert "insufficient closed-outcome evidence" in d.rationale[0]
+
+
+def test_evaluate_canary_promotes_with_full_evidence_on_both_sides():
+    """The evidence gate must not block a genuinely better canary: 20 closed
+    outcomes each side, canary clearly stronger on all three gates."""
+    db = _FakeLearningDB(
+        status_row=("CANARY", 1), n_routed=25,
+        outcomes_by_version={
+            42: [1.0, 1.0, 1.0, 1.0, -0.5] * 4,   # wr .8, pf 8, mdd .5
+            1: [1.0, -1.0] * 10,                  # wr .5, pf 1, mdd 1
+        },
+    )
+    with _patched_db(db):
+        d = evaluate_canary(42)
+    assert d.decision == "PROMOTE"
+
+
+def test_evaluate_canary_non_canary_status_retains():
+    db = _FakeLearningDB(status_row=("ACTIVE", None))
+    with _patched_db(db):
+        d = evaluate_canary(42)
+    assert d.decision == "RETAIN"

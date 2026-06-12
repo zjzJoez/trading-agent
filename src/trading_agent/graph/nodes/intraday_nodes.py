@@ -836,7 +836,8 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                 pnl_j = round((entry_price_j - exit_price) * close_qty * mult_j, 2)
             else:
                 pnl_j = round((exit_price - entry_price_j) * close_qty * mult_j, 2)
-            outcome_j = "WIN" if pnl_j > 0 else ("LOSS" if pnl_j < 0 else "SCRATCH")
+            from trading_agent.learning.outcome import outcome_for_pnl
+            outcome_j = outcome_for_pnl(pnl_j)
 
             if trade_id_source == "sqlite" and journal_close_trade is not None:
                 try:

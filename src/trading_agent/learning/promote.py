@@ -8,7 +8,11 @@ Decisions for a CANARY param_version row are made daily by
        b. 5 consecutive losing days
      → status = REJECTED with a structured ``learning_events.canary_rolled_back``.
 
-  2. **Promotion** — only considered after ``N_canary_min = 20`` trades.  Gates:
+  2. **Promotion** — only considered after ``N_canary_min = 20`` trades, AND
+     only when BOTH canary and control have ≥ ``N_canary_min`` closed outcomes
+     in ``trade_outcome_features`` (empty aggregates pass every comparison
+     vacuously — 0 ≥ 0, 0 ≥ 0×0.95, 0 ≤ 0×1.1 — so thin evidence fails safe
+     to RETAIN).  Gates:
        - Wilson 95% CI lower bound on win rate ≥ control's mean win rate
        - profit factor ≥ control × 0.95
        - max drawdown ≤ control × 1.1
@@ -293,13 +297,28 @@ def evaluate_canary(canary_version_id: int) -> PromoteDecision:
             rationale=[f"only {n}/{N_CANARY_MIN} trades — wait for more samples"],
         )
 
-    # 3. Stats compare
+    # 3. Stats compare — gates are only meaningful with closed-outcome
+    #    evidence on BOTH sides.  Empty aggregates pass every comparison
+    #    vacuously (0 >= 0, 0 >= 0×0.95, 0 <= 0×1.1), so missing or thin
+    #    trade_outcome_features data must fail safe to RETAIN, never PROMOTE.
+    #    (n_trades_for_canary above counts routed journal rows, which can hit
+    #    20 while enrichment lags or breaks — it is not outcome evidence.)
     canary_stats = _stats_for_version(canary_version_id)
     control_id = parent_id  # most natural baseline is the parent
     control_stats = (
         _stats_for_version(int(control_id)) if control_id is not None
         else _aggregate([])
     )
+    if canary_stats.n < N_CANARY_MIN or control_stats.n < N_CANARY_MIN:
+        return PromoteDecision(
+            canary_version_id=canary_version_id, decision="RETAIN",
+            rationale=[
+                f"insufficient closed-outcome evidence: canary n={canary_stats.n}, "
+                f"control n={control_stats.n} — need ≥ {N_CANARY_MIN} each "
+                "before gates can run"
+            ],
+            canary_stats=canary_stats, control_stats=control_stats,
+        )
 
     rationale: list[str] = []
     pass_wilson = canary_stats.wilson_lb >= control_stats.win_rate

@@ -32,6 +32,24 @@ from trading_agent.store.postgres import cursor
 
 log = logging.getLogger(__name__)
 
+# journal_trades.outcome literals that mean "closed with a realized result".
+# The only writers — route_exit_or_hold (graph/nodes/intraday_nodes.py) and
+# the journal MCP ``close_trade`` — emit exactly these three; the other live
+# values are 'OPEN' and 'UNFILLED'.  Readers MUST filter on this set: the
+# original Phase 2.6 readers filtered on ('CLOSED', 'STOPPED', 'TARGET_HIT'),
+# which no writer ever produced, so trade_outcome_features stayed permanently
+# empty and the canary promotion gates evaluated on zero evidence.
+CLOSED_OUTCOMES: tuple[str, ...] = ("WIN", "LOSS", "SCRATCH")
+
+
+def outcome_for_pnl(pnl: float) -> str:
+    """Map a realized P&L to the journal_trades.outcome literal."""
+    if pnl > 0:
+        return "WIN"
+    if pnl < 0:
+        return "LOSS"
+    return "SCRATCH"
+
 
 @dataclass
 class OutcomeMetrics:
@@ -235,12 +253,12 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
                 FROM journal_trades jt
                 LEFT JOIN trade_outcome_features tof ON tof.trade_id = jt.id
                 LEFT JOIN regime_states rs ON rs.id = jt.entry_regime_state_id
-                WHERE jt.outcome IN ('CLOSED', 'STOPPED', 'TARGET_HIT')
+                WHERE jt.outcome = ANY(%s)
                   AND tof.id IS NULL
                 ORDER BY jt.closed_at DESC NULLS LAST
                 LIMIT %s
                 """,
-                (limit,),
+                (list(CLOSED_OUTCOMES), limit),
             )
             rows = cur.fetchall()
     except Exception as e:
@@ -341,6 +359,60 @@ def _try_archive_update(
     )
 
 
+def check_outcome_completeness(*, alert: bool = True) -> int:
+    """Count closed journal_trades rows that lack a trade_outcome_features row.
+
+    Runs nightly from ``enrich_outcomes_node`` (eod_review_graph) right AFTER
+    ``enrich_closed_trades``, so any positive count means enrichment is
+    silently failing — e.g. a writer/reader outcome-literal drift, the bug
+    class that left trade_outcome_features permanently empty while the canary
+    gates kept evaluating on zero evidence.
+
+    Returns the missing-row count, or -1 when the check itself could not run.
+    """
+    try:
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM journal_trades jt
+                LEFT JOIN trade_outcome_features tof ON tof.trade_id = jt.id
+                WHERE jt.outcome = ANY(%s)
+                  AND tof.id IS NULL
+                """,
+                (list(CLOSED_OUTCOMES),),
+            )
+            row = cur.fetchone()
+            missing = int(row[0]) if row else 0
+    except Exception as e:
+        log.warning("check_outcome_completeness: read failed (%s)", e)
+        return -1
+
+    if missing > 0 and alert:
+        log.warning(
+            "check_outcome_completeness: %s closed trade(s) without "
+            "trade_outcome_features rows — promotion gates are starving",
+            missing,
+        )
+        try:
+            from trading_agent.notify import send as ntfy_send
+            ntfy_send(
+                topic="ops",
+                title="Outcome enrichment gap",
+                body=(
+                    f"{missing} closed trade(s) have no trade_outcome_features "
+                    "row after EOD enrichment. Canary gates are running on "
+                    "incomplete evidence — check for outcome-literal drift "
+                    "between journal writers and learning readers."
+                ),
+                priority=4,
+                tags=["warning"],
+            )
+        except Exception as e:
+            log.error("check_outcome_completeness: ntfy failed: %s", e)
+    return missing
+
+
 def _lookup_risk_snapshot_id(risk_decision_id: str | None) -> int | None:
     """Resolve risk_decisions.risk_decision_id (text) → risk_snapshot_id."""
     if not risk_decision_id:
@@ -361,8 +433,11 @@ def _lookup_risk_snapshot_id(risk_decision_id: str | None) -> int | None:
 
 
 __all__ = [
+    "CLOSED_OUTCOMES",
     "OutcomeMetrics",
+    "check_outcome_completeness",
     "compute_outcome",
-    "write_outcome_features",
     "enrich_closed_trades",
+    "outcome_for_pnl",
+    "write_outcome_features",
 ]

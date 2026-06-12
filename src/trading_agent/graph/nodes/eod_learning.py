@@ -6,7 +6,10 @@ import logging
 from trading_agent.events import emit
 from trading_agent.graph.state import TradingGraphState
 from trading_agent.learning.excursion import update_excursions_once
-from trading_agent.learning.outcome import enrich_closed_trades
+from trading_agent.learning.outcome import (
+    check_outcome_completeness,
+    enrich_closed_trades,
+)
 from trading_agent.learning.promote import evaluate_and_apply_all
 
 log = logging.getLogger(__name__)
@@ -24,10 +27,14 @@ def enrich_outcomes_node(state: TradingGraphState) -> dict:
         log.warning("[learning/enrich_outcomes] failed: %s", e)
         ids = []
 
+    # Completeness watchdog: closed trades with no outcome row at this point
+    # mean enrichment is silently broken (alerts ops via ntfy internally).
+    unenriched = check_outcome_completeness()
+
     emit(
         run_id=run_id, trigger=trigger, agent="enrich_outcomes",
         event_type="outcomes_enriched",
-        payload={"trade_ids": ids, "n": len(ids)},
+        payload={"trade_ids": ids, "n": len(ids), "unenriched_closed": unenriched},
     )
     return {}
 
@@ -36,8 +43,9 @@ def promote_or_rollback_node(state: TradingGraphState) -> dict:
     """Phase 2.7 — evaluate every CANARY param_version and act.
 
     Auto-rollback fires for hard-risk breaches in the first 5 trades or
-    a 5-day losing streak.  Promotion to ACTIVE fires only after at least
-    20 trades and Wilson LB / profit-factor / drawdown gates all pass.
+    a 5-day losing streak.  Promotion to ACTIVE fires only with ≥ 20
+    closed outcomes on BOTH canary and control AND the Wilson LB /
+    profit-factor / drawdown gates all passing; thin evidence retains.
     Otherwise the row is RETAINED and the traffic ramp may bump it from
     10% → 20% via ``canary.maybe_ramp_traffic``.
     """

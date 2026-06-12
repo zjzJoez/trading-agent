@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from trading_agent.learning.outcome import CLOSED_OUTCOMES
 from trading_agent.learning.params import (
     PARAM_BOUNDS,
     ParamResolver,
@@ -114,12 +115,12 @@ def fetch_closed_trades(
                        ON rfs.id = rs.feature_snapshot_id
                 LEFT JOIN trade_outcome_features tof ON tof.trade_id = jt.id
                 LEFT JOIN journal_theses jth ON jth.id = jt.thesis_id
-                WHERE jt.outcome IN ('CLOSED', 'STOPPED', 'TARGET_HIT')
+                WHERE jt.outcome = ANY(%s)
                   AND jt.closed_at >= %s
                 ORDER BY jt.closed_at ASC
                 LIMIT %s
                 """,
-                (since, limit),
+                (list(CLOSED_OUTCOMES), since, limit),
             )
             raw = cur.fetchall()
     except Exception as e:
