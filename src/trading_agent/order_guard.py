@@ -142,7 +142,14 @@ def load_sector_map() -> dict[str, str]:
 def load_open_positions(sector_map: dict[str, str]) -> list[OpenPosition]:
     """Read trades rows with outcome='OPEN' from the local DB. The DB is
     source of truth — posttool_fill_capture writes here after each fill,
-    so the guard sees exactly what the journal considers live."""
+    so the guard sees exactly what the journal considers live.
+
+    Provenance filter: only the system's OWN positions (agent + virtual)
+    count toward R2/R3/R4. The journal also carries 54 'real_mirror' shadow
+    rows (operator real-account fills mirrored for post-mortems, permanently
+    OPEN by design) plus backfills/dry-runs — counting those blocked EVERY
+    opening order on R2_max_open ('already 58 open positions; cap is 6')
+    the moment the provenance migration and the in-tool guard merged."""
     out: list[OpenPosition] = []
     with connection() as conn:
         rows = conn.execute(
@@ -152,6 +159,7 @@ def load_open_positions(sector_map: dict[str, str]) -> list[OpenPosition]:
             FROM trades t
             LEFT JOIN theses th ON th.id = t.thesis_id
             WHERE t.outcome = 'OPEN'
+              AND COALESCE(t.provenance, 'agent') IN ('agent', 'virtual')
             """
         ).fetchall()
     for r in rows:
@@ -225,8 +233,12 @@ def has_existing_open_for(broker_symbol: str) -> bool:
     sqlite_says_no = False
     try:
         with connection() as conn:
+            # Same provenance filter as load_open_positions: a real_mirror
+            # row is the OPERATOR's real holding — the paper account holds
+            # nothing, so a SELL against it is an opening short, not a close.
             row = conn.execute(
                 "SELECT 1 FROM trades WHERE symbol = ? AND outcome = 'OPEN' "
+                "AND COALESCE(provenance, 'agent') IN ('agent', 'virtual') "
                 "LIMIT 1",
                 (broker_symbol,),
             ).fetchone()
