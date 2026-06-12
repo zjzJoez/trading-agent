@@ -1027,6 +1027,63 @@ class TestRouteExitOrHold:
         assert not outcome_closed, "journal must not close at placement time"
 
 
+    def test_duplicate_open_rows_resolve_to_newest(self):
+        """Phantom (placed-never-filled) + real fill can share a symbol while
+        both OPEN. Rows come newest-first; the resolver must keep the FIRST
+        (newest) so the phantom never receives the real trade's close."""
+        state = _base_state(
+            trigger="intraday_monitor",
+            journal={"exit_decisions": [
+                {"symbol": "US.AAPL", "action": "EXIT_STOP", "exit_qty_factor": 1.0, "reason": "stop"},
+            ]},
+            positions=[{
+                "symbol": "US.AAPL", "asset_type": "STK",
+                "qty": 10, "entry_price": 200.0, "mark": 180.0,
+                "thesis_id": 42, "strategy_label": "momentum_long",
+            }],
+        )
+        mock_order = {"thesis_id": 7, "rows": [{"order_id": "ORD9", "order_status": "SUBMITTED"}]}
+        with _patch_all_emits():
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[
+                           {"symbol": "US.AAPL", "trade_id": 99},  # newest = real
+                           {"symbol": "US.AAPL", "trade_id": 7},   # older = phantom
+                       ]):
+                with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order",
+                           return_value=mock_order) as mock_place:
+                    with patch("trading_agent.exits.fill_confirm.write_pending_close",
+                               return_value=True) as mock_pending:
+                        with patch("trading_agent.notify.send"):
+                            from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                            route_exit_or_hold(state)
+        mock_place.assert_called_once()
+        assert mock_place.call_args[1].get("thesis_id") == 99  # newest row wins
+        assert mock_pending.call_args[0][0] == 99              # pending on newest
+
+    def test_journal_unreadable_defers_all_exits(self):
+        """get_open_journal_trades() → None means UNKNOWN, not 'no trades':
+        every exit defers one tick; nothing is placed or misclassified as a
+        manual position."""
+        state = _base_state(
+            trigger="intraday_monitor",
+            journal={"exit_decisions": [
+                {"symbol": "US.AAPL", "action": "EXIT_STOP", "exit_qty_factor": 1.0, "reason": "stop"},
+            ]},
+            positions=[{
+                "symbol": "US.AAPL", "asset_type": "STK",
+                "qty": 10, "entry_price": 200.0, "mark": 180.0,
+            }],
+        )
+        with _patch_all_emits():
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=None):
+                with patch("trading_agent.mcp_servers.moomoo.server.place_paper_order") as mock_place:
+                    with patch("trading_agent.notify.send"):
+                        from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                        route_exit_or_hold(state)
+        mock_place.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # eod_nodes
 # ---------------------------------------------------------------------------

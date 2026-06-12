@@ -203,7 +203,7 @@ def health() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def get_open_journal_trades() -> list[dict]:
+def get_open_journal_trades() -> list[dict] | None:
     """Return open journal_trades rows joined with journal_theses.
 
     Canonical replacement for journal-mcp ``get_open_positions_with_thesis``
@@ -219,7 +219,14 @@ def get_open_journal_trades() -> list[dict]:
     ``strategy_label`` is extracted from ``broker_fill_json`` (it isn't a
     top-level column on the Postgres mirror).
 
-    Returns ``[]`` on any DB error — callers must tolerate that.
+    Rows are ordered newest-first; symbol-keyed consumers MUST keep
+    first-row-wins semantics (setdefault) so a phantom (placed-never-filled)
+    row sharing a symbol with a later real fill never shadows it.
+
+    Returns ``None`` when the store cannot be read — callers must treat that
+    as UNKNOWN, never as "no open trades": an EOD reconcile comparing against
+    an empty set during a DB outage produces a confidently wrong all-flat
+    report, and an exit pass would misclassify every position as manual.
     """
     sql = """
         SELECT
@@ -243,7 +250,7 @@ def get_open_journal_trades() -> list[dict]:
             return [dict(zip(cols, r)) for r in cur.fetchall()]
     except Exception as e:
         log.warning("get_open_journal_trades query failed: %s", e)
-        return []
+        return None
 
 
 if __name__ == "__main__":

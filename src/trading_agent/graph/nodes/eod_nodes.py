@@ -65,19 +65,22 @@ def _get_moomoo_positions() -> tuple[dict[str, dict], float, float]:
         return {}, 100_000.0, 100_000.0
 
 
-def _get_journal_open_trades() -> list[dict]:
+def _get_journal_open_trades() -> list[dict] | None:
     """Return open journal_trades rows from Postgres (joined with theses).
 
     Postgres ``journal_trades`` is the canonical source — autonomous fills
-    only write there, not to the Phase-1 SQLite mirror. The helper itself
-    returns ``[]`` on DB error, so this wrapper just guards the import.
+    only write there, not to the Phase-1 SQLite mirror. ``None`` means the
+    store could not be read; callers must treat that as UNKNOWN — comparing
+    against an empty set during a DB outage would produce a confidently
+    wrong all-flat reconcile report.
     """
     try:
         from trading_agent.store.postgres import get_open_journal_trades
     except Exception as e:
         log.warning("[eod] postgres import failed: %s", e)
-        return []
-    return list(get_open_journal_trades())
+        return None
+    rows = get_open_journal_trades()
+    return None if rows is None else list(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +100,25 @@ def reconcile_journal(state: TradingGraphState) -> dict:
 
     moomoo_positions, equity, cash = _get_moomoo_positions()
     journal_trades = _get_journal_open_trades()
+    if journal_trades is None:
+        # Journal unreadable — a discrepancy report against an empty set
+        # would flag every broker position as in_broker_not_journal and
+        # read as a confidently wrong "all flat" digest. Say so instead.
+        emit(
+            run_id=run_id, trigger=trigger, agent="reconcile_journal",
+            event_type="journal_unreadable", severity=2,
+            payload={"n_broker_positions": len(moomoo_positions)},
+        )
+        journal_payload = dict(state.get("journal") or {})
+        journal_payload["reconcile"] = {
+            "matched": [], "only_in_moomoo": [], "only_in_journal": [],
+            "open_trades": [], "discrepancy_count": 0,
+            "journal_unreadable": True,
+        }
+        return {
+            "journal": journal_payload,
+            "account": {"equity": equity, "cash": cash},
+        }
 
     moomoo_symbols = set(moomoo_positions.keys())
     journal_symbols = {t.get("symbol", "") for t in journal_trades if t.get("symbol")}
@@ -485,8 +507,15 @@ def mark_to_market(state: TradingGraphState) -> dict:
     log.info("[eod/mark_to_market] run_id=%s", run_id)
 
     journal = state.get("journal") or {}
-    open_trades: list[dict] = journal.get("open_trades") or _get_journal_open_trades()
+    open_trades: list[dict] | None = (
+        journal.get("open_trades") or _get_journal_open_trades())
 
+    if open_trades is None:
+        # Journal unreadable — "no marks tonight" must be loud, not a quiet
+        # no_open_positions that reads as an intentionally flat book.
+        emit(run_id=run_id, trigger=trigger, agent="mark_to_market",
+             event_type="journal_unreadable", severity=2, payload={})
+        return {}
     if not open_trades:
         emit(run_id=run_id, trigger=trigger, agent="mark_to_market",
              event_type="no_open_positions", payload={})

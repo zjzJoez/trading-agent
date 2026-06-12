@@ -356,9 +356,15 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
     except Exception as e:
         log.warning("[detect_exit_triggers] journal enrichment query failed: %s", e)
         return out
+    if rows is None:  # store unreadable — caller falls back to legacy lookup
+        return out
     for row in rows:
         symbol = row.get("symbol")
         if not symbol:
+            continue
+        # Rows are newest-first; first-row-wins so a phantom (placed-never-
+        # filled) OPEN row can't shadow the later real fill on the same symbol.
+        if str(symbol) in out:
             continue
         trade_id = row.get("trade_id")
         thesis_id = row.get("thesis_id")
@@ -641,20 +647,44 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
     # thesis_id is included so close_thesis can fire after a successful exit —
     # otherwise the thesis stays status='open' forever and creates a zombie row
     # that blocks /eod-review hygiene checks.
-    journal_trade_id_by_symbol: dict[str, tuple[int, int | None]] = {}
+    # None means the store could not be read — UNKNOWN, never "no trades":
+    # resolving exits against an empty map would misclassify every position
+    # as manual and skip the very closes that reduce risk.
+    journal_trade_id_by_symbol: dict[str, tuple[int, int | None]] | None = {}
     try:
         from trading_agent.store.postgres import get_open_journal_trades
-        for row in get_open_journal_trades():
-            sym = row.get("symbol")
-            tid = row.get("trade_id")
-            th_id = row.get("thesis_id")
-            if sym and tid is not None:
-                journal_trade_id_by_symbol[str(sym)] = (
-                    int(tid),
-                    int(th_id) if th_id is not None else None,
-                )
+        rows = get_open_journal_trades()
+        if rows is None:
+            journal_trade_id_by_symbol = None
+        else:
+            for row in rows:
+                sym = row.get("symbol")
+                tid = row.get("trade_id")
+                th_id = row.get("thesis_id")
+                if sym and tid is not None:
+                    # Newest-first ordering + setdefault = newest OPEN row
+                    # wins, matching the pre-port resolver semantics (a
+                    # phantom row must not receive the real trade's close).
+                    journal_trade_id_by_symbol.setdefault(
+                        str(sym),
+                        (int(tid), int(th_id) if th_id is not None else None),
+                    )
     except Exception as e:
         log.warning("[route_exit_or_hold] postgres journal lookup failed: %s", e)
+        journal_trade_id_by_symbol = None
+
+    if journal_trade_id_by_symbol is None:
+        log.warning(
+            "[route_exit_or_hold] journal unreadable — failing closed, "
+            "all %d exits deferred one tick", len(exits),
+        )
+        emit(
+            run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+            event_type="exit_pass_deferred_journal_unreadable", severity=2,
+            payload={"n_exits": len(exits),
+                     "symbols": [d["symbol"] for d in exits]},
+        )
+        return {}
 
     # In-flight closes (pending fill confirmation) — placing a second close
     # order for the same trade would over-close the position at the broker.
