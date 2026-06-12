@@ -4,15 +4,23 @@ Runs on every invocation of moomoo-mcp's order-placing tools. Blocks
 (exit 2) when:
 
   1. No open thesis for this ticker within the last 10 minutes
-     (see THESIS_FRESHNESS_MIN). Thesis table is the source of truth.
-  2. Any sizing rule in trading_agent.sizing returns a "block"-severity
-     violation (R1-R6; warns pass through).
+     (see order_guard.THESIS_FRESHNESS_MIN). Thesis table is source of truth.
+  2. The order would OPEN a short option position (SELL-to-open hard block;
+     SELL-to-close is exempt).
+  3. Any sizing rule in trading_agent.sizing returns a "block"-severity
+     violation (R1-R7; warns pass through).
+
+All evaluation logic lives in ``trading_agent.order_guard`` — the SAME
+engine the moomoo MCP server runs inside place_paper_order /
+place_paper_option_order. This hook is the early, client-side layer (fast
+feedback inside Claude Code); the server-side call is the authoritative
+choke point that also covers the autonomous graph and scripts. Keeping
+one engine means a rule fix lands in both layers at once (the R1
+close-exemption, d089349, previously had to be hook-only).
 
 Matcher is kept permissive so both the Claude Code hyphen-preserving
 form (`mcp__moomoo-mcp__...`) and the normalize-to-underscore form
-(`mcp__moomoo_mcp__...`) match. The first invocation in production
-will write the exact tool_name to the audit log; tighten later if
-desired.
+(`mcp__moomoo_mcp__...`) match.
 
 Contract (Claude Code hook protocol):
   stdin  → JSON with tool_name + tool_input
@@ -29,151 +37,19 @@ Fail-closed design:
 """
 from __future__ import annotations
 
-import csv
 import json
 import re
 import sys
 import traceback
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any
 
-# These imports hit trading_agent.* only — deliberately NOT mcp_servers.*,
-# which would drag in FastMCP + sentence-transformers.
-from trading_agent.config import CONFIG, ensure_dirs
-from trading_agent.db import connection
-from trading_agent.sizing import (
-    OpenPosition,
-    ProposedTrade,
-    SizingContext,
-    blockers,
-    check,
-    summarize,
-)
+from trading_agent.config import CONFIG
+from trading_agent.order_guard import GuardDecision, audit_decision, evaluate_order
 
-# ---- config constants ----
+GUARD_NAME = "pretool_order_guard"
 
 ORDER_TOOL_RE = re.compile(
     r"^mcp__moomoo[_-]mcp__(place_paper_order|place_paper_option_order)$"
 )
-OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{4,8})$")
-THESIS_FRESHNESS_MIN = 10
-
-AUDIT_PATH = CONFIG.data_dir / "hook_audit.log"
-SECTORS_CSV = CONFIG.data_dir / "sectors.csv"
-
-
-# ---- small utils ----
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _audit(rec: dict) -> None:
-    try:
-        ensure_dirs()
-        with AUDIT_PATH.open("a") as f:
-            f.write(json.dumps(rec, default=str) + "\n")
-    except Exception:
-        # Audit must never block the hook from completing.
-        pass
-
-
-def _block(reason: str, tool_name: str, detail: Any = None) -> int:
-    _audit({
-        "ts": _now(),
-        "hook": "pretool_order_guard",
-        "tool": tool_name,
-        "decision": "block",
-        "reason": reason,
-        "detail": detail,
-    })
-    sys.stderr.write(
-        f"REFUSED by pretool_order_guard: {reason}\n"
-        f"  tool: {tool_name}\n"
-    )
-    if detail:
-        sys.stderr.write(f"  detail: {detail}\n")
-    sys.stderr.write(
-        "\nFix and retry. See data/hook_audit.log for full context. "
-        "To override (never in production), edit "
-        "src/trading_agent/hooks/pretool_order_guard.py.\n"
-    )
-    return 2
-
-
-def _allow(tool_name: str, note: str = "", warns: list[str] | None = None) -> int:
-    _audit({
-        "ts": _now(),
-        "hook": "pretool_order_guard",
-        "tool": tool_name,
-        "decision": "allow",
-        "note": note,
-        "warns": warns or [],
-    })
-    return 0
-
-
-# ---- symbol parsing ----
-
-def _bare_ticker(symbol: str) -> str | None:
-    """US.AAPL → AAPL. Returns None if unparseable."""
-    if not symbol:
-        return None
-    s = symbol.strip().upper()
-    if s.startswith("US."):
-        s = s[3:]
-    if not s:
-        return None
-    # Reject obvious option codes handed to a stock tool.
-    if OCC_RE.match(s):
-        return None
-    return s
-
-
-def _parse_option_symbol(option_symbol: str) -> tuple[str, int, str, float] | None:
-    """Moomoo option code → (ticker, dte_from_today, right, strike).
-
-    Returns None on bad input. ``right`` ∈ {"C","P"}; ``strike`` is in
-    dollars (the OCC integer is divided by 1000).
-
-    Moomoo format: US.<TICKER><YYMMDD><C|P><strike*1000> where the strike
-    is unpadded (e.g., US.AAPL260515C267500 = $267.500 strike).
-    """
-    s = option_symbol.strip().upper()
-    if s.startswith("US."):
-        s = s[3:]
-    m = OCC_RE.match(s)
-    if not m:
-        return None
-    ticker = m.group(1)
-    yymmdd = m.group(2)
-    right = m.group(3)
-    strike_int = m.group(4)
-    try:
-        expiry = datetime.strptime(yymmdd, "%y%m%d").date()
-        strike = int(strike_int) / 1000.0
-    except ValueError:
-        return None
-    today = datetime.now(timezone.utc).date()
-    dte = (expiry - today).days
-    return ticker, dte, right, strike
-
-
-# ---- data sources ----
-
-def _load_sector_map() -> dict[str, str]:
-    if not SECTORS_CSV.exists():
-        return {}
-    out: dict[str, str] = {}
-    with SECTORS_CSV.open() as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            t = (row.get("ticker") or "").strip().upper()
-            sec = (row.get("sector") or "").strip()
-            if t and sec:
-                out[t] = sec
-    return out
 
 
 def _fetch_equity_from_sdk() -> tuple[float, float | None]:
@@ -223,283 +99,60 @@ def _fetch_equity_from_sdk() -> tuple[float, float | None]:
     return equity, cash
 
 
-def _load_open_positions(sector_map: dict[str, str]) -> list[OpenPosition]:
-    """Read trades rows with outcome='OPEN' from the local DB. The DB is
-    source of truth — posttool_fill_capture writes here after each fill,
-    so the hook sees exactly what the journal considers live."""
-    out: list[OpenPosition] = []
-    with connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT t.symbol, t.asset_type, t.side, t.qty, t.entry_price,
-                   t.stop, t.strategy_label, th.ticker
-            FROM trades t
-            LEFT JOIN theses th ON th.id = t.thesis_id
-            WHERE t.outcome = 'OPEN'
-            """
-        ).fetchall()
-    for r in rows:
-        symbol = r["symbol"]
-        # Trust the trade's symbol over the thesis ticker — a symbol is
-        # what actually trades; a thesis can be wrong or reused.
-        ticker = _ticker_from_any_symbol(symbol) or r["ticker"] or symbol
-        ticker_u = ticker.upper()
-        out.append(OpenPosition(
-            symbol=symbol,
-            ticker=ticker_u,
-            asset_type=r["asset_type"],
-            qty=float(r["qty"] or 0),
-            entry_price=float(r["entry_price"] or 0),
-            stop=(float(r["stop"]) if r["stop"] is not None else None),
-            sector=sector_map.get(ticker_u),
-            strategy_label=r["strategy_label"],
-        ))
-    return out
-
-
-def _ticker_from_any_symbol(symbol: str) -> str | None:
-    """Best-effort: US.AAPL → AAPL, US.AAPL250117C00200000 → AAPL."""
-    if not symbol:
-        return None
-    s = symbol.upper()
-    if s.startswith("US."):
-        s = s[3:]
-    m = OCC_RE.match(s)
-    if m:
-        return m.group(1)
-    return s
-
-
-def _has_fresh_open_thesis(ticker: str) -> tuple[bool, int | None]:
-    """True iff there's an open thesis for `ticker` created within the last
-    THESIS_FRESHNESS_MIN minutes. Returns (ok, thesis_id).
-
-    NOTE: We parse created_at in Python rather than compare via SQLite's
-    datetime('now','-X minutes'). The theses table stores timezone-aware
-    ISO-8601 strings ('2026-04-22T01:10:00+00:00'); SQLite's datetime(...)
-    returns space-separated, timezone-naive strings. Lexicographic compare
-    of the two forms is broken ('T' > ' '), so every open thesis looked
-    fresh regardless of age. Parsing in Python avoids the string pitfall.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=THESIS_FRESHNESS_MIN)
-    with connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, created_at FROM theses
-            WHERE ticker = ? AND status = 'open'
-            ORDER BY created_at DESC
-            """,
-            (ticker.upper(),),
-        ).fetchall()
-    for r in rows:
-        try:
-            created = datetime.fromisoformat(r["created_at"])
-        except Exception:
-            continue
-        # Defensive: naive strings get interpreted as UTC.
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        if created >= cutoff:
-            return True, int(r["id"])
-    return False, None
-
-
-# ---- main flow ----
-
-
-def _has_existing_open_for(broker_symbol: str) -> bool:
-    """True iff the local journal already has an OPEN trade for the
-    given broker symbol. Used to compute ``intent`` on the ProposedTrade:
-    SELL of an option we don't already hold = opening a SHORT; SELL of
-    one we do hold = closing the LONG.
-    """
-    if not broker_symbol:
-        return False
-    try:
-        with connection() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM trades WHERE symbol = ? AND outcome = 'OPEN' "
-                "LIMIT 1",
-                (broker_symbol,),
-            ).fetchone()
-            return row is not None
-    except Exception:
-        # Fail-open on lookup error: assume close (more conservative —
-        # SHORT-specific R5b/R5c won't fire spuriously on a real close).
-        return True
-
-
-def _build_proposed(
-    tool_name: str,
-    tool_input: dict,
-    sector_map: dict[str, str],
-) -> ProposedTrade | str:
-    """Returns a ProposedTrade, or a string error message to block with."""
-    is_option = tool_name.endswith("__place_paper_option_order")
-    side = str(tool_input.get("side", "")).upper()
-    if side not in {"BUY", "SELL"}:
-        return f"unknown side {side!r}"
-
-    strategy_label = tool_input.get("strategy_label")
-
-    if is_option:
-        opt_sym = tool_input.get("option_symbol", "")
-        parsed = _parse_option_symbol(opt_sym)
-        if not parsed:
-            return (
-                f"unparseable option_symbol {opt_sym!r}; expected "
-                "'US.<TICKER><YYMMDD><C|P><strike*1000 8d>'"
-            )
-        ticker, dte_from_symbol, right, strike = parsed
-        # Caller-provided dte wins (lets the skill pass explicit values);
-        # fall back to date-derived DTE otherwise.
-        dte = tool_input.get("dte")
-        if dte is None:
-            dte = dte_from_symbol
-        delta = tool_input.get("delta")
-        contracts = float(tool_input.get("contracts", 0))
-        price = float(tool_input.get("price", 0))
-        # Intent: SELL is OPEN (new short) iff no existing OPEN position
-        # has matching option_symbol; otherwise it's CLOSE of a long.
-        # BUY is OPEN (new long) iff no existing position; otherwise it's
-        # CLOSE of a short (buying back).
-        opens_for_symbol = _has_existing_open_for(opt_sym)
-        intent = "close" if opens_for_symbol else "open"
-        stop = tool_input.get("stop")  # callers MAY pass stop; R5c needs it
-        target = tool_input.get("target")  # CSP / strategy code may pass it
-        return ProposedTrade(
-            ticker=ticker,
-            asset_type="OPT",
-            side=side,  # type: ignore[arg-type]
-            qty=contracts,
-            entry_price=price,
-            stop=(float(stop) if stop is not None else None),
-            target=(float(target) if target is not None else None),
-            strategy_label=strategy_label,
-            sector=sector_map.get(ticker.upper()),
-            delta=(float(delta) if delta is not None else None),
-            dte=(int(dte) if dte is not None else None),
-            earnings_dte=tool_input.get("earnings_dte"),
-            right=right,  # type: ignore[arg-type]
-            strike=strike,
-            intent=intent,  # type: ignore[arg-type]
-        )
-
-    # stock branch
-    sym = tool_input.get("symbol", "")
-    ticker = _bare_ticker(sym)
-    if not ticker:
-        return f"unparseable stock symbol {sym!r}"
-    stop = tool_input.get("stop")
-    qty = float(tool_input.get("qty", 0))
-    price = float(tool_input.get("price", 0))
-    return ProposedTrade(
-        ticker=ticker,
-        asset_type="STK",
-        side=side,  # type: ignore[arg-type]
-        qty=qty,
-        entry_price=price,
-        stop=(float(stop) if stop is not None else None),
-        strategy_label=strategy_label,
-        sector=sector_map.get(ticker),
-        earnings_dte=tool_input.get("earnings_dte"),
+def _emit_block(decision: GuardDecision, tool_name: str) -> int:
+    sys.stderr.write(
+        f"REFUSED by {GUARD_NAME}: {decision.reason}\n"
+        f"  tool: {tool_name}\n"
     )
+    for v in decision.violations_json():
+        tag = "BLOCK" if v["severity"] == "block" else "warn "
+        sys.stderr.write(f"  [{tag}] {v['rule']}: {v['message']}\n")
+    sys.stderr.write(
+        "\nFix and retry. See data/hook_audit.log and the hook_audit_log "
+        "table in data/trader.db for full context. The moomoo server runs "
+        "the same gate — bypassing this hook will not place the order.\n"
+    )
+    return 2
 
 
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
     except Exception as e:
-        sys.stderr.write(f"[pretool_order_guard] bad payload: {e}\n")
+        sys.stderr.write(f"[{GUARD_NAME}] bad payload: {e}\n")
         return 0  # infra problem, not a policy violation
 
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {}) or {}
 
-    if not ORDER_TOOL_RE.match(tool_name):
+    m = ORDER_TOOL_RE.match(tool_name)
+    if not m:
         # Not our business.
         return 0
+    kind = "option" if m.group(1) == "place_paper_option_order" else "stock"
 
-    # ---- parse proposed trade ----
-    sector_map = _load_sector_map()
-    proposed = _build_proposed(tool_name, tool_input, sector_map)
-    if isinstance(proposed, str):
-        return _block(proposed, tool_name, detail={"tool_input": tool_input})
-
-    ticker = proposed.ticker
-    side = proposed.side
-
-    # ---- thesis freshness (opening trades only) ----
-    # Any OPEN (long buy OR short sell) needs a fresh thesis. CLOSE
-    # orders (selling a long / buying back a short) don't, because the
-    # original thesis was recorded when the position was opened.
-    if proposed.intent == "open":
-        ok, thesis_id = _has_fresh_open_thesis(ticker)
-        if not ok:
-            return _block(
-                f"no open thesis for {ticker} in the last "
-                f"{THESIS_FRESHNESS_MIN} minutes",
-                tool_name,
-                detail={"ticker": ticker},
-            )
-    else:
-        thesis_id = None  # closing — skip thesis-freshness gate
-
-    # ---- sizing ----
     # Equity + cash from live SDK (paper account). Fail-closed on any SDK
     # issue. Cash is best-effort (None falls back to equity in R5b).
     try:
         equity, cash = _fetch_equity_from_sdk()
     except Exception as e:
-        return _block(
-            "cannot verify sizing — moomoo equity lookup failed",
-            tool_name,
-            detail={"error": repr(e)},
+        decision = GuardDecision(
+            allowed=False,
+            reason="cannot verify sizing — moomoo equity lookup failed",
+            symbol=str(tool_input.get("option_symbol") or tool_input.get("symbol") or ""),
         )
-
-    opens = _load_open_positions(sector_map)
-    ctx = SizingContext(
-        equity=equity,
-        cash=cash,
-        opens=tuple(opens),
-        sector_lookup_available=bool(sector_map),
-    )
-    vs = check(ctx, proposed)
-    bs = blockers(vs)
-    warns = [f"{v.rule}: {v.message}" for v in vs if v.severity == "warn"]
-
-    if bs:
-        return _block(
-            "sizing rules violated",
-            tool_name,
-            detail={
-                "violations": [
-                    {"rule": v.rule, "message": v.message, "severity": v.severity}
-                    for v in vs
-                ],
-                "proposed": {
-                    "ticker": proposed.ticker,
-                    "asset_type": proposed.asset_type,
-                    "side": proposed.side,
-                    "qty": proposed.qty,
-                    "entry_price": proposed.entry_price,
-                    "stop": proposed.stop,
-                    "sector": proposed.sector,
-                    "strategy_label": proposed.strategy_label,
-                    "dte": proposed.dte,
-                    "delta": proposed.delta,
-                },
-                "equity": equity,
-                "open_count": len(opens),
-            },
+        audit_decision(decision, guard_name=GUARD_NAME, tool_name=tool_name)
+        sys.stderr.write(
+            f"REFUSED by {GUARD_NAME}: {decision.reason}\n  detail: {e!r}\n"
         )
+        return 2
 
-    return _allow(
-        tool_name,
-        note=f"thesis_id={thesis_id} ticker={ticker} equity=${equity:,.2f} "
-             f"opens={len(opens)}",
-        warns=warns,
-    )
+    decision = evaluate_order(kind, tool_input, equity=equity, cash=cash)
+    audit_decision(decision, guard_name=GUARD_NAME, tool_name=tool_name)
+
+    if not decision.allowed:
+        return _emit_block(decision, tool_name)
+    return 0
 
 
 if __name__ == "__main__":
@@ -507,7 +160,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except SystemExit:
         raise
-    except Exception as e:
+    except Exception:
         # Unhandled exception = fail-closed. The order must not silently go
         # through just because the hook crashed.
         sys.stderr.write(

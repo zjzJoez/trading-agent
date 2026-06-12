@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template — `bash scripts/setup.sh` substitutes __PROJECT_DIR__.
+  Mac-only: nightly order-guard reconciliation. Joins the last ~26h of
+  trades rows against guard-evaluation rows in hook_audit_log and pushes
+  a priority-5 ntfy alert (topic: risk) for any opening fill that no
+  guard layer evaluated. Tripwire for order paths that bypass the gate.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.trading-agent.guard-reconcile</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>trading_agent.jobs.reconcile_order_guard</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DB_PATH</key>
+        <string>__PROJECT_DIR__/data/trader.db</string>
+    </dict>
+
+    <!-- 08:30 local (GMT+8), Mon–Sat — after the prior US session closes
+         in all DST regimes, 30 min behind the overnight-scan job. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/data/logs/guard-reconcile.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/data/logs/guard-reconcile.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

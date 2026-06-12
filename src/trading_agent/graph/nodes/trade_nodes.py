@@ -791,6 +791,27 @@ def execute_paper_order(state: TradingGraphState) -> dict:
         )
         return {}
 
+    if result.get("order_blocked"):
+        # Server-side risk gate refused (thesis freshness / R1-R7 /
+        # SELL-to-open block). This is a policy stop, not an infra error —
+        # do NOT fall through to the order_placed emit.
+        log.warning(
+            "[execute_paper_order] %s refused by order guard: %s %s",
+            moomoo_symbol, result.get("reason"), result.get("violations"),
+        )
+        emit(
+            run_id=run_id, trigger=trigger, agent="execute_paper_order",
+            event_type="order_blocked_by_guard", severity=2,
+            payload={
+                "symbol": moomoo_symbol,
+                "reason": result.get("reason"),
+                "violations": result.get("violations"),
+            },
+        )
+        return {"order": {"placed": False, "blocked": True,
+                          "reason": result.get("reason"),
+                          "violations": result.get("violations")}}
+
     rows = result.get("rows") or []
     order_id = None
     if rows:

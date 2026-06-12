@@ -890,6 +890,14 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                         "[route_exit_or_hold] %s virtual fallback (broker rejected): %s",
                         symbol, result.get("reason"),
                     )
+                if not placed_order_id and result.get("order_blocked"):
+                    # Server-side risk gate refused the close — should not
+                    # happen for a journal-backed exit (closes are exempt);
+                    # surface loudly so the gap gets investigated.
+                    log.error(
+                        "[route_exit_or_hold] %s close REFUSED by order guard: %s %s",
+                        symbol, result.get("reason"), result.get("violations"),
+                    )
                 if placed_order_id:
                     log.info(
                         "[route_exit_or_hold] %s order placed %s qty=%s order_id=%s",

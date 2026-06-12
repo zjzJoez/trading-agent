@@ -46,7 +46,7 @@ Paper account or not, these reflexes kill real accounts:
 1. **Averaging down into a loss without a new thesis.** Hook allows it if sizing passes, but it almost always compounds the mistake. File a new thesis first, explaining *why* the second entry is different from the first.
 2. **Moving stops further away.** If the original stop is hit, that's the trade. Don't escape-hatch by widening.
 3. **Revenge trading.** After a loss, the `/research` step (with `search_past_trades`) is mandatory, not optional.
-4. **Selling premium on the way down.** Cash-secured puts (R5b, full collateral) and stop-protected naked calls (R5c) are allowed; SELL-to-open without those protections is hard-blocked at the order tools. Don't invent workarounds — every short leg charges assignment-stress heat.
+4. **Selling premium on the way down.** ALL SELL-to-open option legs are currently hard-blocked inside the order tools (`R_short_option_open_blocked`) until multi-leg combos get atomic sizing; R5b/R5c define the collateral/stop rules that will govern short legs when the block lifts. Don't invent workarounds — every short leg charges assignment-stress heat.
 5. **Holding single-leg long options through earnings.** IV crush is a known lesson (see earnings-play skill).
 
 ## What the hook does NOT catch

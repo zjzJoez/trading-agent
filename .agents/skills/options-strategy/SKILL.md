@@ -1,11 +1,11 @@
 ---
 name: options-strategy
-description: How to pick single-leg options for directional setups. Long premium is the default; short premium (cash-secured puts, naked calls) is allowed under R5b/R5c.
+description: How to pick single-leg options for directional setups. Long premium only for now — SELL-to-open is hard-blocked at the order tools until multi-leg combos get atomic sizing (R5b/R5c will govern short legs when the block lifts).
 ---
 
 # Options strategy
 
-Phase-1 is **single leg only**. Long premium is the default structure; opening short premium is also allowed — R5b requires cash-secured puts to be fully collateralized (`cash ≥ strike × 100 × qty − premium collected`), and R5c blocks a naked short call unless an explicit stop above entry is passed (R1 then sizes its risk on a 1.5× stress-buffered stop distance, `NAKED_CALL_STRESS_MULT`). Multi-leg structures (credit spreads, iron condors) still have no atomic sizing — each leg is checked standalone. The thresholds quoted in this doc mirror the constants in `src/trading_agent/sizing.py`; if they ever disagree, sizing.py wins (see its "Threshold raises (2026-05-22)" comment block).
+Phase-1 is **single leg only**, long premium by default. Opening short premium (SELL-to-open) is **currently hard-blocked inside `place_paper_option_order` itself** (rule `R_short_option_open_blocked`; SELL-to-close an existing long is exempt). The same guard runs in the PreToolUse hook for early feedback, but the server-side check is authoritative — scripts and direct MCP calls cannot route around it. This is deliberate: per-order sizing cannot bound a short leg's assignment exposure (a "spread" legged in as two orders evaluates its short leg as a naked short — see the 2026-06-08 AAPL 8x 300P leg, ~$235k assignment exposure at zero portfolio heat). The block stays until multi-leg combos get atomic width-minus-credit sizing; when it lifts, R5b (cash-secured puts fully collateralized: `cash ≥ strike × 100 × qty − premium collected`) and R5c (naked short calls need an explicit stop above entry; R1 then sizes on a 1.5× stress-buffered stop distance, `NAKED_CALL_STRESS_MULT`) are the rules that will govern short legs — they already apply in hypothetical sizing and replay. Thresholds quoted in this doc mirror the constants in `src/trading_agent/sizing.py`; if they ever disagree, sizing.py wins (see its "Threshold raises (2026-05-22)" comment block).
 
 ## When to use options vs stock
 
@@ -40,7 +40,7 @@ Use these `strategy_label` values consistently — post-mortem aggregates by lab
 - `directional_long_call` / `directional_long_put` — straight single-leg with a clear catalyst.
 - `pullback_to_MA` — long call when underlying bounces off 50/200 DMA with volume confirmation.
 - `breakout_long_call` — long call when price closes above a consolidation range on volume.
-- `earnings_directional_debit_spread` — NOTE: MVP hook is single-leg; if you want a spread, leg into it manually with two `place_paper_option_order` calls **on the same thesis_id**. The SELL leg is checked standalone as an opening short (R5b/R5c apply — a short call leg needs an explicit stop). Journal will treat them as two trades; post-mortem aggregates by `strategy_label`.
+- `earnings_directional_debit_spread` — **currently unavailable.** Legging into a spread with two `place_paper_option_order` calls no longer works: the SELL leg is a SELL-to-open and the order guard refuses it (the old legging advice routed around per-order max-loss math — exactly how the MRVL/AAPL spreads slipped through in June 2026). Until multi-leg combos are first-class (atomic width-minus-credit sizing), express the view with a single long leg instead, sized so the full debit is the max loss.
 - `earnings_iv_drop` — buy the call *after* earnings once IV collapses (known edge on outliers).
 
 Any label starting with `earnings_` is the only allowed form within 2 trading days of the earnings date (R6).
