@@ -113,11 +113,25 @@ def _load_active_model_or_exit():
 
 def _load_snapshots_or_exit(start: str, end: str):
     """Snapshot range loader with the same local-degrade contract."""
+    # Reuse rolling_walkforward's loader ([start, end) exclusive end) — same
+    # rows the walk-forward consumed, no second query dialect. `scripts/` is
+    # not a package, so resolve the sibling file by path: a bare
+    # `from scripts.rolling_walkforward import ...` only works when the repo
+    # root happens to be on sys.path, which `python scripts/foo.py` does NOT
+    # provide (first EC2 run failed exactly there, misreported as a Postgres
+    # outage by the broad except below).
     try:
-        # Reuse rolling_walkforward's loader ([start, end) exclusive end) —
-        # same rows the walk-forward consumed, no second query dialect.
-        from scripts.rolling_walkforward import load_snapshots_range
-
+        import importlib.util
+        rw_path = Path(__file__).resolve().parent / "rolling_walkforward.py"
+        spec = importlib.util.spec_from_file_location("rolling_walkforward", rw_path)
+        rw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rw)
+        load_snapshots_range = rw.load_snapshots_range
+    except Exception as e:
+        log.error("cannot load scripts/rolling_walkforward.py (%s: %s)",
+                  type(e).__name__, e)
+        sys.exit(2)
+    try:
         end_exclusive = (date.fromisoformat(end) + timedelta(days=1)).isoformat()
         return load_snapshots_range(start, end_exclusive)
     except SystemExit:
