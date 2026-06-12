@@ -712,16 +712,22 @@ def execute_paper_order(state: TradingGraphState) -> dict:
     proposal_entry = float(proposal.get("entry_price") or 0.0)
     is_opt = _is_option_code(moomoo_symbol)
     fresh_ask: float | None = None
+    fresh_bid: float | None = None
     try:
         from trading_agent.mcp_servers.moomoo.server import get_quote
         q = get_quote([moomoo_symbol])
         for r in (q.get("rows") or []):
             a = r.get("ask_price") or r.get("ask")
+            b = r.get("bid_price") or r.get("bid")
             last = r.get("last_price") or r.get("cur_price")
             if a and float(a) > 0:
                 fresh_ask = float(a)
             elif last and float(last) > 0:
                 fresh_ask = float(last)
+            # Bid is captured for cost accounting (quoted spread at entry),
+            # not for pricing the BUY — keep it raw, no last-price fallback.
+            if b and float(b) > 0:
+                fresh_bid = float(b)
             break
     except Exception as e:
         log.warning("[execute_paper_order] fresh-quote fetch failed: %s — using proposal price", e)
@@ -845,9 +851,26 @@ def execute_paper_order(state: TradingGraphState) -> dict:
             "symbol": moomoo_symbol,
             "qty": approved_qty,
             "limit_price": place_price,
+            # Cost-accounting provenance: the price we ASKED for plus the
+            # quoted market at order time. persist_trade_event stores these in
+            # broker_fill_json so outcome.compute_outcome can populate
+            # slippage_bps (requested vs dealt) and the quoted entry spread.
+            "requested_price": place_price,
+            "quoted_bid": fresh_bid,
+            "quoted_ask": fresh_ask,
             "raw_response": rows,
         }
     }
+
+
+def _entry_fees(qty: float, asset_type: str) -> float:
+    """Entry-side commission+fees estimate; never raises in the trade path."""
+    try:
+        from trading_agent.execution_costs import fees_per_side
+        return fees_per_side(qty, asset_type)
+    except Exception as e:
+        log.warning("[persist_trade_event] fee estimate failed: %s", e)
+        return 0.0
 
 
 def persist_trade_event(state: TradingGraphState) -> dict:
@@ -952,6 +975,18 @@ def persist_trade_event(state: TradingGraphState) -> dict:
                             "option_iv": proposal.get("option_iv"),
                             "option_delta": proposal.get("option_delta"),
                             "strategy_label": proposal.get("strategy_label"),
+                            # Phase 0 cost accounting — requested_price makes
+                            # slippage_bps computable (it was structurally NULL
+                            # before: outcome.compute_outcome read a key no
+                            # writer set); the quoted spread at entry feeds
+                            # cost calibration. provenance marks this row as
+                            # the system's own trade for aggregate hygiene.
+                            "requested_price": order.get("requested_price")
+                                or order.get("limit_price"),
+                            "entry_quoted_bid": order.get("quoted_bid"),
+                            "entry_quoted_ask": order.get("quoted_ask"),
+                            "entry_fees": _entry_fees(qty, asset_type),
+                            "provenance": "agent",
                         },
                         default=str,
                     ),

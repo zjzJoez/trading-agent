@@ -34,7 +34,15 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl REAL,
     outcome TEXT NOT NULL DEFAULT 'OPEN', -- OPEN/WIN/LOSS/SCRATCH
     broker_order_id TEXT,
-    is_paper INTEGER NOT NULL DEFAULT 1
+    is_paper INTEGER NOT NULL DEFAULT 1,
+    -- Phase 0 measurement integrity (2026-06): see db._ensure_trade_columns
+    -- for the matching ALTERs applied to pre-existing databases.
+    provenance TEXT NOT NULL DEFAULT 'agent',  -- agent/virtual/virtual_backfill/real_mirror/dry_run
+    fees REAL,                            -- cumulative round-trip commissions+fees (USD)
+    pnl_recomputed REAL,                  -- (exit-entry)*qty*mult from stored legs; audits self-reported pnl
+    pnl_mismatch INTEGER DEFAULT 0,       -- 1 when |pnl - pnl_recomputed| exceeds tolerance
+    exit_order_id TEXT,                   -- broker order id of an in-flight close (pending-exit state machine)
+    exit_state_json TEXT                  -- pending-close state: action/reason/requested price/attempts
 );
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_opened ON trades(opened_at);

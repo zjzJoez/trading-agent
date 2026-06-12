@@ -112,7 +112,21 @@ def compute_outcome(trade_row: dict[str, Any]) -> OutcomeMetrics:
     if entry is not None and exit_ is not None and stop is not None:
         risk_per_unit = abs(entry - stop)
         if risk_per_unit > 1e-9:
-            realized_r = (exit_ - entry) / risk_per_unit
+            # Net of round-trip fees (in price units) when the caller supplies
+            # asset_type — production enrichment always does. Friction-free
+            # realized_r overstated every downstream gate (replay scoring,
+            # canary promotion, the soak Sharpe gate) by the full cost stack.
+            fee_unit = 0.0
+            asset_type = trade_row.get("asset_type")
+            if asset_type:
+                try:
+                    from trading_agent.execution_costs import (
+                        round_trip_fee_per_unit,
+                    )
+                    fee_unit = round_trip_fee_per_unit(str(asset_type))
+                except Exception as e:
+                    log.warning("fee-per-unit lookup failed: %s", e)
+            realized_r = (exit_ - entry - fee_unit) / risk_per_unit
 
     holding_days: float | None = None
     if isinstance(opened_at, datetime) and isinstance(closed_at, datetime):
@@ -249,7 +263,7 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
                        jt.entry_regime_state_id, jt.exit_regime_state_id,
                        jt.params_version_id, jt.risk_decision_id, jt.outcome,
                        jt.broker_fill_json->>'strategy_label' AS strategy_label,
-                       rs.label AS entry_regime_label
+                       rs.label AS entry_regime_label, jt.asset_type
                 FROM journal_trades jt
                 LEFT JOIN trade_outcome_features tof ON tof.trade_id = jt.id
                 LEFT JOIN regime_states rs ON rs.id = jt.entry_regime_state_id
@@ -268,7 +282,7 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
     for r in rows:
         (tid, entry, exit_, stop, opened_at, closed_at, fill,
          entry_rs, exit_rs, pvid, rdid, outcome,
-         strategy_label, entry_regime_label) = r
+         strategy_label, entry_regime_label, asset_type) = r
         trade_row = {
             "id": tid,
             "entry_price": entry,
@@ -278,6 +292,7 @@ def enrich_closed_trades(limit: int = 50) -> list[int]:
             "closed_at": closed_at,
             "broker_fill_json": fill,
             "outcome": outcome,
+            "asset_type": asset_type,
         }
         metrics = compute_outcome(trade_row)
         risk_snapshot_id = _lookup_risk_snapshot_id(rdid)

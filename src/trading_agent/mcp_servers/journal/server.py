@@ -143,6 +143,16 @@ def close_thesis(thesis_id: int, status: Literal["triggered", "void"], note: str
     return {"thesis_id": thesis_id, "status": status}
 
 
+# Valid trades.provenance values. Aggregates and retrieval treat them
+# differently: only 'agent' rows are evidence of the system's own edge.
+#   agent            — autonomous pipeline or operator /enter paper fill
+#   virtual          — broker rejected the paper order; journaled at mid
+#   virtual_backfill — manual copy of an operator REAL trade (possibly scaled)
+#   real_mirror      — jobs/mirror_real_fills.py shadow row of a real fill
+#   dry_run          — exercise of the pipeline, cancelled before fill
+PROVENANCES = ("agent", "virtual", "virtual_backfill", "real_mirror", "dry_run")
+
+
 def _insert_fill(
     broker_order_id: str,
     symbol: str,
@@ -155,20 +165,25 @@ def _insert_fill(
     stop: float | None,
     target: float | None,
     reasoning: str | None,
+    provenance: str = "agent",
+    fees: float | None = None,
 ) -> dict:
     """Internal: insert one row into `trades`. Used by both record_fill and
     record_virtual_fill so neither re-enters an @mcp.tool() wrapper."""
+    if provenance not in PROVENANCES:
+        provenance = "agent"
     opened_at = _now()
     with connection() as conn:
         cur = conn.execute(
             """
             INSERT INTO trades (thesis_id, symbol, asset_type, strategy_label,
                 side, qty, entry_price, stop, target, opened_at, reasoning,
-                outcome, broker_order_id, is_paper)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, 1)
+                outcome, broker_order_id, is_paper, provenance, fees)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, 1, ?, ?)
             """,
             (thesis_id, symbol, asset_type, strategy_label, side, qty,
-             fill_price, stop, target, opened_at, reasoning, broker_order_id),
+             fill_price, stop, target, opened_at, reasoning, broker_order_id,
+             provenance, fees),
         )
         trade_id = cur.lastrowid
     return {
@@ -176,6 +191,7 @@ def _insert_fill(
         "thesis_id": thesis_id,
         "broker_order_id": broker_order_id,
         "is_paper": True,
+        "provenance": provenance,
     }
 
 
@@ -189,15 +205,25 @@ def record_fill(
     fill_price: float,
     thesis_id: int | None = None,
     strategy_label: str | None = None,
-    commission: float = 0.0,
+    commission: float | None = None,
     stop: float | None = None,
     target: float | None = None,
     reasoning: str | None = None,
+    provenance: str = "agent",
 ) -> dict:
     """Record a broker fill in the trades table. Usually called by
     posttool_fill_capture; exposed here for manual corrections and the
-    virtual-fill fallback. `commission` is accepted for future use but not
-    persisted yet (MVP paper accounts on Moomoo don't emit commissions)."""
+    virtual-fill fallback.
+
+    `commission` is the entry-side commission+fees in USD and is persisted
+    into trades.fees. When omitted, the execution-cost model's per-side
+    estimate is charged — paper P&L must never be silently friction-free.
+    `provenance` tags the row's origin (see PROVENANCES); only 'agent' rows
+    count toward the system's own expectancy statistics.
+    """
+    if commission is None:
+        from trading_agent.execution_costs import fees_per_side
+        commission = fees_per_side(qty, asset_type)
     return _insert_fill(
         broker_order_id=broker_order_id,
         symbol=symbol,
@@ -210,6 +236,8 @@ def record_fill(
         stop=stop,
         target=target,
         reasoning=reasoning,
+        provenance=provenance,
+        fees=float(commission),
     )
 
 
@@ -222,14 +250,22 @@ def record_virtual_fill(
     thesis_id: int,
     strategy_label: str | None = None,
     reasoning: str | None = None,
+    provenance: str = "virtual",
 ) -> dict:
     """Record a virtual options fill when MoomooOpenD rejects paper option
     orders. Stored in trades with `broker_order_id='VIRTUAL-<uuid>'` and
-    `is_paper=1`. The journal/post-mortem pipeline treats virtual fills
-    identically to broker fills — the only difference is that cancelling
-    and modifying are no-ops (there's no broker order to cancel)."""
+    `is_paper=1`, provenance='virtual' (pass 'virtual_backfill' when copying
+    an operator REAL trade so aggregates can exclude it). A virtual fill at
+    mid never paid the spread, so half a quoted spread plus per-side fees is
+    charged into trades.fees up front — friction-free virtual P&L is exactly
+    the accounting fiction Phase 0 removes."""
     import uuid
+
+    from trading_agent.execution_costs import fees_per_side, half_spread_cost
     virtual_id = f"VIRTUAL-{uuid.uuid4().hex[:12]}"
+    entry_friction = round(
+        fees_per_side(contracts, "OPT")
+        + half_spread_cost(mid_price, contracts, "OPT"), 4)
     return _insert_fill(
         broker_order_id=virtual_id,
         symbol=option_symbol,
@@ -242,6 +278,8 @@ def record_virtual_fill(
         stop=None,
         target=None,
         reasoning=reasoning,
+        provenance=provenance,
+        fees=entry_friction,
     )
 
 
@@ -268,7 +306,11 @@ def record_virtual_stock_fill(
     existing convention of `record_fill` / `record_virtual_fill`).
     """
     import uuid
+
+    from trading_agent.execution_costs import fees_per_side, half_spread_cost
     virtual_id = f"VIRTUAL-{uuid.uuid4().hex[:12]}"
+    entry_friction = round(
+        fees_per_side(qty, "STK") + half_spread_cost(price, qty, "STK"), 4)
     return _insert_fill(
         broker_order_id=virtual_id,
         symbol=ticker.upper(),
@@ -281,7 +323,13 @@ def record_virtual_stock_fill(
         stop=None,
         target=None,
         reasoning=reasoning,
+        provenance="virtual",
+        fees=entry_friction,
     )
+
+
+# |pnl - pnl_recomputed| beyond max(this, 1% of recomputed) flags a mismatch.
+_PNL_MISMATCH_TOLERANCE_USD = 1.0
 
 
 @mcp.tool()
@@ -291,19 +339,88 @@ def close_trade(
     outcome: Literal["WIN", "LOSS", "SCRATCH"],
     closed_at: str | None = None,
     pnl: float | None = None,
+    exit_fees: float | None = None,
 ) -> dict:
-    """Mark a trade as closed. `pnl` can be passed explicitly (preferred,
-    since it folds in commissions and multi-leg economics); otherwise the
-    caller should pre-compute and pass it.
+    """Mark a trade as closed.
+
+    `pnl` can be passed explicitly (preferred when it folds in multi-leg
+    economics) — but it is no longer trusted blindly: the journal recomputes
+    gross P&L from the stored legs ((exit-entry)*qty*mult, sign-flipped for
+    SELL-to-open), persists it as `pnl_recomputed`, and sets `pnl_mismatch=1`
+    when the caller's figure disagrees beyond tolerance (trade id 8 recorded
+    -$136 against leg arithmetic of -$268 and nobody noticed). When `pnl` is
+    omitted it is computed here: gross from legs minus total fees.
+
+    `exit_fees` (USD) is added to trades.fees; when omitted, the
+    execution-cost model's per-side estimate is charged.
     """
     closed_at = closed_at or _now()
     thesis_id = None
     thesis_closed = False
     with connection() as conn:
+        row = conn.execute(
+            "SELECT entry_price, qty, asset_type, side, fees, outcome, "
+            "broker_order_id, pnl, pnl_recomputed, pnl_mismatch "
+            "FROM trades WHERE id = ?",
+            (trade_id,),
+        ).fetchone()
+        if row is None:
+            return {"trade_id": trade_id, "error": "trade not found"}
+        # Idempotency guard: a second close (MCP retry, double-fire) must not
+        # accumulate phantom exit fees or rewrite pnl — exactly the ledger
+        # corruption Phase 0 removes.
+        if row["outcome"] != "OPEN":
+            return {
+                "trade_id": trade_id,
+                "error": "already closed",
+                "outcome": row["outcome"],
+                "pnl": row["pnl"],
+                "pnl_recomputed": row["pnl_recomputed"],
+                "pnl_mismatch": bool(row["pnl_mismatch"]),
+                "fees": row["fees"],
+            }
+        entry_price = float(row["entry_price"] or 0.0)
+        qty = float(row["qty"] or 0.0)
+        asset_type = str(row["asset_type"] or "STK")
+        side = str(row["side"] or "BUY").upper()
+        mult = 100.0 if asset_type == "OPT" else 1.0
+
+        if exit_fees is None:
+            from trading_agent.execution_costs import fees_per_side, half_spread_cost
+            exit_fees = fees_per_side(qty, asset_type)
+            # A virtual position closes at a MARK, not a dealt price — the
+            # exit never paid the spread, so charge half a quoted spread on
+            # top of fees (the entry side was charged at record time).
+            if str(row["broker_order_id"] or "").startswith("VIRTUAL-"):
+                exit_fees = round(
+                    exit_fees + half_spread_cost(exit_price, qty, asset_type), 4)
+        total_fees = round(float(row["fees"] or 0.0) + float(exit_fees), 4)
+
+        # Gross from the stored legs. side is the OPENING side: a SELL-to-open
+        # (short premium) profits when exit < entry.
+        if side == "SELL":
+            gross = (entry_price - float(exit_price)) * qty * mult
+        else:
+            gross = (float(exit_price) - entry_price) * qty * mult
+        pnl_recomputed = round(gross - total_fees, 2)
+
+        if pnl is None:
+            pnl = pnl_recomputed
+        # Tolerance covers rounding and a caller reporting gross (pre-fee)
+        # P&L — the signal we're after is id-8-class errors ($100+), not a
+        # missing fee line.
+        tolerance = max(_PNL_MISMATCH_TOLERANCE_USD, total_fees,
+                        abs(pnl_recomputed) * 0.01)
+        # 1e-6 epsilon: a caller reporting exact gross differs from the net
+        # figure by exactly total_fees — float noise must not flag that.
+        mismatch = 1 if abs(float(pnl) - pnl_recomputed) > tolerance + 1e-6 else 0
+
         conn.execute(
-            "UPDATE trades SET exit_price = ?, outcome = ?, closed_at = ?, pnl = ? "
-            "WHERE id = ?",
-            (exit_price, outcome, closed_at, pnl, trade_id),
+            "UPDATE trades SET exit_price = ?, outcome = ?, closed_at = ?, pnl = ?, "
+            "fees = ?, pnl_recomputed = ?, pnl_mismatch = ? "
+            "WHERE id = ? AND outcome = 'OPEN'",
+            (exit_price, outcome, closed_at, pnl, total_fees,
+             pnl_recomputed, mismatch, trade_id),
         )
         # Thesis lifecycle: once a position fully closes its thesis is no longer
         # live, so it must not linger as a stale 'open' thesis. When this trade's
@@ -334,6 +451,10 @@ def close_trade(
         "closed_at": closed_at,
         "thesis_id": thesis_id,
         "thesis_closed": thesis_closed,
+        "pnl": pnl,
+        "pnl_recomputed": pnl_recomputed,
+        "pnl_mismatch": bool(mismatch),
+        "fees": total_fees,
     }
 
 
@@ -440,15 +561,22 @@ def search_past_trades(query: str, k: int = 5) -> dict:
             (emb, k),
         ).fetchall())
 
-        # Lexical match on trades (symbol + strategy_label).
+        # Lexical match on trades (symbol + strategy_label). Contaminated
+        # provenance is excluded: virtual_backfill rows are scaled copies of
+        # operator real trades (the XLE 1→5x amplified loss) and dry_run rows
+        # never traded — retrieving them as "past trades" poisons the memory
+        # the synthesizer learns from. agent + real_mirror + virtual remain,
+        # tagged so the caller can weigh them.
         q_upper = query.upper()
         like = f"%{q_upper}%"
         lex_rows = _rowdicts(conn.execute(
             """
             SELECT id AS trade_id, symbol, asset_type, strategy_label, side,
-                   qty, entry_price, exit_price, outcome, pnl, opened_at, closed_at
+                   qty, entry_price, exit_price, outcome, pnl, opened_at, closed_at,
+                   COALESCE(provenance, 'agent') AS provenance
             FROM trades
-            WHERE UPPER(symbol) LIKE ? OR UPPER(COALESCE(strategy_label,'')) LIKE ?
+            WHERE (UPPER(symbol) LIKE ? OR UPPER(COALESCE(strategy_label,'')) LIKE ?)
+              AND COALESCE(provenance, 'agent') NOT IN ('virtual_backfill', 'dry_run')
             ORDER BY opened_at DESC
             LIMIT ?
             """,
@@ -499,6 +627,8 @@ def generate_post_mortem_prompt(since_date: str) -> dict:
             SELECT
                 t.id AS trade_id, t.symbol, t.asset_type, t.strategy_label, t.side,
                 t.qty, t.entry_price, t.exit_price, t.stop, t.target, t.pnl,
+                t.pnl_recomputed, t.pnl_mismatch, t.fees,
+                COALESCE(t.provenance, 'agent') AS provenance,
                 t.outcome, t.opened_at, t.closed_at, t.broker_order_id,
                 th.id AS thesis_id, th.ticker, th.direction, th.thesis_text,
                 th.invalidation, th.timeframe, th.expected_return_pct, th.max_loss_pct,
@@ -511,11 +641,22 @@ def generate_post_mortem_prompt(since_date: str) -> dict:
             (since_date,),
         ).fetchall())
 
-    # Quick aggregates so the skill doesn't have to recompute.
+    # Aggregates are split by provenance: only 'agent' rows are evidence of
+    # the SYSTEM's edge. Before this split, 5x-scaled copies of operator real
+    # losses (virtual_backfill) sat in the same by_strategy buckets as agent
+    # trades, so the post-mortem "learned" from losses the agent never took.
     by_strategy: dict[str, dict[str, Any]] = {}
+    by_strategy_shadow: dict[str, dict[str, Any]] = {}
+    agent_trades = 0
     for t in trades:
         s = t["strategy_label"] or "(none)"
-        b = by_strategy.setdefault(s, {"n": 0, "wins": 0, "losses": 0, "scratches": 0, "pnl": 0.0})
+        # 'virtual' fills are the agent's OWN decisions (broker rejected the
+        # paper order) — they count as system evidence. Only copies of
+        # operator trades and dry runs are quarantined to the shadow bucket.
+        is_agent = t["provenance"] in ("agent", "virtual")
+        bucket = by_strategy if is_agent else by_strategy_shadow
+        agent_trades += 1 if is_agent else 0
+        b = bucket.setdefault(s, {"n": 0, "wins": 0, "losses": 0, "scratches": 0, "pnl": 0.0})
         b["n"] += 1
         if t["outcome"] == "WIN":
             b["wins"] += 1
@@ -523,19 +664,30 @@ def generate_post_mortem_prompt(since_date: str) -> dict:
             b["losses"] += 1
         elif t["outcome"] == "SCRATCH":
             b["scratches"] += 1
-        b["pnl"] += float(t["pnl"] or 0.0)
+        # Prefer the leg-arithmetic figure over self-reported pnl when they
+        # disagree — the recomputed value is the auditable one.
+        pnl_val = t["pnl_recomputed"] if t["pnl_mismatch"] else t["pnl"]
+        b["pnl"] += float(pnl_val or t["pnl"] or 0.0)
 
     return {
         "since_date": since_date,
         "closed_trade_count": len(trades),
+        "agent_trade_count": agent_trades,
         "by_strategy": by_strategy,
+        "by_strategy_shadow": by_strategy_shadow,
         "trades": trades,
         "instructions": (
-            "Analyze the closed trades above. For each strategy_label, compute "
-            "win rate and avg pnl; flag strategies with <40% win rate or net-negative "
-            "pnl as candidates for moratorium. Check thesis_text vs outcome — was the "
-            "thesis right but sizing wrong, or was the thesis wrong to begin with? "
-            "Produce 3–8 concrete lessons (each 1–2 sentences, with tags like "
+            "Analyze the closed trades above. by_strategy covers ONLY "
+            "provenance='agent' rows — the system's own record; "
+            "by_strategy_shadow holds mirrored/backfilled operator trades for "
+            "context and must NOT be merged into the system's statistics. "
+            "For each agent strategy_label, compute win rate and avg pnl; flag "
+            "strategies with <40% win rate or net-negative pnl as candidates "
+            "for moratorium. Rows with pnl_mismatch=1 have self-reported pnl "
+            "contradicting leg arithmetic — trust pnl_recomputed. Check "
+            "thesis_text vs outcome — was the thesis right but sizing wrong, "
+            "or was the thesis wrong to begin with? Produce 3–8 concrete "
+            "lessons (each 1–2 sentences, with tags like "
             "'lesson,<symbol>,<label>') and call append_note for each with "
             "source='post_mortem'."
         ),
