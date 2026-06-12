@@ -131,8 +131,10 @@ def test_enrich_closed_trades_enriches_win_row():
     exit path actually writes) must produce a trade_outcome_features insert."""
     opened = datetime(2026, 6, 1, 14, 30, tzinfo=timezone.utc)
     closed = datetime(2026, 6, 3, 14, 30, tzinfo=timezone.utc)
+    # Trailing "OPT": jt.asset_type, added by the phase0 cost-model merge so
+    # realized_r can be computed net of round-trip fees.
     row = (7, 10.0, 12.0, 9.0, opened, closed, {}, None, None, None, None,
-           "WIN", None, None)
+           "WIN", None, None, "OPT")
     cur = MagicMock()
     cur.fetchall.return_value = [row]
     cur.fetchone.return_value = (99,)  # RETURNING id of the insert
