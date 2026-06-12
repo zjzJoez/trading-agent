@@ -251,18 +251,21 @@ def check(ctx: SizingContext, proposed: ProposedTrade) -> list[SizingViolation]:
         ))
 
     # ---- R3 per-ticker exposure ----
+    # Closes are fully exempt: existing notionals are valued at entry while
+    # equity is live, so a drawdown can push existing/equity over the cap —
+    # and the close is the order that reduces it.
     ticker_u = proposed.ticker.upper()
-    existing = sum(p.notional for p in ctx.opens if p.ticker.upper() == ticker_u)
-    proposed_exposure = proposed.notional if is_opening else 0.0
-    total_exposure = existing + proposed_exposure
-    r3_cap = MAX_TICKER_EXPOSURE_PCT * ctx.equity
-    if total_exposure > r3_cap + EPS:
-        violations.append(SizingViolation(
-            R3,
-            f"combined {ticker_u} exposure ${total_exposure:,.2f} "
-            f"exceeds {MAX_TICKER_EXPOSURE_PCT*100:.0f}% of equity (${r3_cap:,.2f})",
-            "block",
-        ))
+    if is_opening:
+        existing = sum(p.notional for p in ctx.opens if p.ticker.upper() == ticker_u)
+        total_exposure = existing + proposed.notional
+        r3_cap = MAX_TICKER_EXPOSURE_PCT * ctx.equity
+        if total_exposure > r3_cap + EPS:
+            violations.append(SizingViolation(
+                R3,
+                f"combined {ticker_u} exposure ${total_exposure:,.2f} "
+                f"exceeds {MAX_TICKER_EXPOSURE_PCT*100:.0f}% of equity (${r3_cap:,.2f})",
+                "block",
+            ))
 
     # ---- R4 sector concentration ----
     if is_opening:

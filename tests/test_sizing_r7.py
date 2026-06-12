@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from trading_agent.sizing import (
     MIN_RISK_REWARD,
+    OpenPosition,
     ProposedTrade,
     R1,
+    R3,
     R5B,
     R5C,
     R7,
@@ -266,6 +268,50 @@ def test_open_side_naked_call_still_blocked_after_close_exemption():
     rules = {v.rule for v in bs}
     assert R1 in rules, rules     # max_loss inf still blocks the open
     assert R5C in rules, rules    # and the naked-call-needs-stop rule
+
+
+# ---------------------------------------------------------------------------
+# R3 must EXEMPT closing orders — same bug class as the R1 2026-05-28 incident.
+# Existing notionals are valued at ENTRY price while equity is LIVE, so an
+# equity drawdown after entry can push existing/equity over the 12% cap; the
+# old gate then blocked the very order that unwinds the exposure (it zeroed
+# the proposed notional for closes but still blocked on existing alone).
+# ---------------------------------------------------------------------------
+
+
+def _aapl_open_15k() -> OpenPosition:
+    """100 sh @ $150 = $15,000 notional at entry."""
+    return OpenPosition(
+        symbol="US.AAPL", ticker="AAPL", asset_type="STK",
+        qty=100, entry_price=150.0,
+    )
+
+
+def test_r3_exempts_closing_when_existing_exposure_over_cap():
+    """Equity dropped $100k → $80k after entry: cap is now $9,600 and the
+    existing $15k AAPL notional alone breaches it. SELL-to-close must not
+    be R3-blocked (nor blocked at all)."""
+    ctx = SizingContext(equity=80_000.0, opens=(_aapl_open_15k(),))
+    t = ProposedTrade(
+        ticker="AAPL", asset_type="STK", side="SELL",
+        qty=100, entry_price=120.0, intent="close",
+    )
+    vs = check(ctx, t)
+    assert not any(v.rule == R3 for v in vs), [(v.rule, v.message) for v in vs]
+    assert blockers(vs) == [], [(v.rule, v.message) for v in blockers(vs)]
+
+
+def test_r3_still_blocks_opens_over_cap_after_close_exemption():
+    """Guard: exempting CLOSES must not weaken the OPEN side — adding to a
+    ticker already over the cap is still blocked."""
+    ctx = SizingContext(equity=80_000.0, opens=(_aapl_open_15k(),))
+    t = ProposedTrade(
+        ticker="AAPL", asset_type="STK", side="BUY",
+        qty=10, entry_price=120.0, stop=114.0, target=140.0,
+        intent="open",
+    )
+    bs = blockers(check(ctx, t))
+    assert any(v.rule == R3 for v in bs), [(v.rule, v.message) for v in bs]
 
 
 def test_r7_skipped_for_short_opens():
