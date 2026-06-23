@@ -6,8 +6,16 @@ Outputs: APPROVE / DOWNSIZE / VETO / DEFER (with approved_qty + reasons)
 Flow:
     1. Compute aggregates if a "after-this-trade" snapshot is needed
     2. Run deterministic guardrails (Python-enforced, hard caps)
-    3. If borderline → invoke LLM council (Phase 2.4 — currently stub)
+    3. If borderline → invoke the LLM council (here: the deterministic stub)
     4. Return final RiskOutput
+
+NOTE ON THE COUNCIL: `decide()` is the deterministic, no-LLM orchestrator —
+it deliberately uses `stub_council_review` and is retained for unit tests and
+as a library re-export (`trading_agent.risk.decide`). The PRODUCTION risk path
+does NOT call `decide()`; it runs through `graph/nodes/risk_nodes.py`, which
+calls the real LLM council (`real_council_review`, with its own stub fallback
+when the router is unavailable). Keep this path LLM-free so tests stay
+hermetic and `decide()` has no router dependency.
 
 The agent never directly calls OpenD. It just makes a decision; the
 executor is what places the order if approved.
@@ -107,7 +115,8 @@ def decide(input: RiskInput) -> RiskOutput:
     )
 
     if invoke:
-        # Phase 2.3 calls stub; Phase 2.4 swaps for real LLM council.
+        # decide() is the deterministic/test path: it ALWAYS uses the stub.
+        # The real LLM council lives in graph/nodes/risk_nodes.py (production).
         council = stub_council_review(
             deterministic_decision=gc.decision,
             deterministic_factor=gc.suggested_qty_factor,

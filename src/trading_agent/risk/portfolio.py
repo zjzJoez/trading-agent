@@ -309,6 +309,17 @@ def _occ_right_strike(symbol: str) -> tuple[str, float] | None:
     return m.group(3), int(m.group(4)) / 1000.0
 
 
+def _occ_expiry(symbol: str) -> str | None:
+    """US.AAPL260710P300000 → "260710" (YYMMDD). None if not an option code."""
+    s = (symbol or "").strip().upper()
+    if s.startswith("US."):
+        s = s[3:]
+    m = _OCC_RE.match(s)
+    if not m:
+        return None
+    return m.group(2)
+
+
 def _short_option_at_risk(p: OpenPosition) -> float:
     """Worst-case $ exposure of a short option leg.
 
@@ -349,6 +360,7 @@ def _heat_metrics(
     """
     total_at_risk = 0.0
     per_underlying: dict[str, float] = {}
+    per_expiry: dict[str, float] = {}
 
     for p in positions:
         if p.asset_type == "OPT" and p.side == "SELL":
@@ -370,16 +382,31 @@ def _heat_metrics(
         total_at_risk += at_risk
         per_underlying[p.underlying] = per_underlying.get(p.underlying, 0.0) + at_risk
 
+        # Per-expiry premium-at-risk bucket (event clustering). Only options
+        # with a parseable OCC expiry contribute; stock and unparseable legs
+        # have no expiry and are skipped. Uses the SAME at_risk value so the
+        # bucket is consistent with heat semantics (short-leg assignment
+        # exposure included, not just premium paid).
+        if p.asset_type == "OPT":
+            exp = _occ_expiry(p.symbol)
+            if exp is not None:
+                per_expiry[exp] = per_expiry.get(exp, 0.0) + at_risk
+
     heat_pct = total_at_risk / equity if equity > 0 else 0.0
     max_per_underlying_pct = (
         max(per_underlying.values()) / equity if per_underlying and equity > 0 else 0.0
+    )
+    max_per_expiry_pct = (
+        max(per_expiry.values()) / equity if per_expiry and equity > 0 else 0.0
     )
 
     return {
         "heat_pct": heat_pct,
         "max_per_underlying_pct": max_per_underlying_pct,
+        "max_per_expiry_pct": max_per_expiry_pct,
         "total_at_risk_usd": total_at_risk,
         "per_underlying_usd": per_underlying,
+        "per_expiry_usd": per_expiry,
     }
 
 

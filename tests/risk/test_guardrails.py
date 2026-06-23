@@ -233,6 +233,76 @@ def test_factor_exposure_breach():
 
 
 # ---------------------------------------------------------------------------
+# Same-expiry premium concentration (event clustering)
+# ---------------------------------------------------------------------------
+
+
+def test_same_expiry_premium_mild_breach_downsizes():
+    """2.5% in one expiry vs BULL cap 2% → 1.25× → DOWNSIZE."""
+    res = check_guardrails(
+        regime="BULL_TREND",
+        proposal_after_sizing={},
+        portfolio_aggregate_greeks=_greeks(),
+        portfolio_factor_exposures={},
+        portfolio_correlations={},
+        heat_metrics=_heat(max_per_expiry_pct=0.025),  # cap 0.02
+        data_quality=_dq(),
+    )
+    assert res.decision == "DOWNSIZE"
+    assert any(v.rule == "same_expiry_premium_max" for v in res.violations)
+    assert res.suggested_qty_factor < 1.0
+
+
+def test_same_expiry_premium_extreme_vetos():
+    """4% in one expiry vs BULL cap 2% → 2× > 1.5 → VETO."""
+    res = check_guardrails(
+        regime="BULL_TREND",
+        proposal_after_sizing={},
+        portfolio_aggregate_greeks=_greeks(),
+        portfolio_factor_exposures={},
+        portfolio_correlations={},
+        heat_metrics=_heat(max_per_expiry_pct=0.04),  # cap 0.02
+        data_quality=_dq(),
+    )
+    assert res.decision == "VETO"
+    assert any(v.rule == "same_expiry_premium_max" for v in res.violations)
+
+
+def test_same_expiry_premium_under_cap_approves():
+    """1.5% in one expiry is under the BULL cap 2% → no same-expiry violation."""
+    res = check_guardrails(
+        regime="BULL_TREND",
+        proposal_after_sizing={},
+        portfolio_aggregate_greeks=_greeks(),
+        portfolio_factor_exposures={},
+        portfolio_correlations={},
+        heat_metrics=_heat(max_per_expiry_pct=0.015),  # cap 0.02
+        data_quality=_dq(),
+    )
+    assert res.decision == "APPROVE"
+    assert not any(v.rule == "same_expiry_premium_max" for v in res.violations)
+
+
+def test_same_expiry_premium_stricter_in_bear():
+    """1.5% passes BULL (cap 2%) but breaches BEAR (cap 1%)."""
+    bull = check_guardrails(
+        regime="BULL_TREND", proposal_after_sizing={},
+        portfolio_aggregate_greeks=_greeks(), portfolio_factor_exposures={},
+        portfolio_correlations={}, heat_metrics=_heat(max_per_expiry_pct=0.015),
+        data_quality=_dq(),
+    )
+    assert bull.decision == "APPROVE"
+    bear = check_guardrails(
+        regime="BEAR_TREND", proposal_after_sizing={},
+        portfolio_aggregate_greeks=_greeks(), portfolio_factor_exposures={},
+        portfolio_correlations={}, heat_metrics=_heat(max_per_expiry_pct=0.015),
+        data_quality=_dq(),
+    )
+    assert bear.decision == "DOWNSIZE"
+    assert any(v.rule == "same_expiry_premium_max" for v in bear.violations)
+
+
+# ---------------------------------------------------------------------------
 # All-clear → APPROVE
 # ---------------------------------------------------------------------------
 
