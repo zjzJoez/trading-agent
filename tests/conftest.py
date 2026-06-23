@@ -19,9 +19,17 @@ just guarantees no test will ever leak to real ntfy.sh.
 """
 from __future__ import annotations
 
+import pathlib
+import sys
 from unittest.mock import patch
 
 import pytest
+
+# Make the repo root importable so tests can `import scripts.*` (the scripts/
+# dir is a namespace package, not part of the installed trading_agent wheel).
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 @pytest.fixture(autouse=True)
