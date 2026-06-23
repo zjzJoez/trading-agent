@@ -147,7 +147,12 @@ sensible default from `(entry, stop, target, asset_type)`.
 
   "regime_rules": {
     "exit_on_labels": ["CRISIS"],
-    "downsize_50_on_labels": []      // reserved, not yet implemented
+    "downsize_50_on_labels": []      // trim 50% once per label episode (P0b)
+  },
+
+  "event_rules": {
+    "exit_on_thesis_broken": true,   // exit when thesis flagged broken (P0c)
+    "exit_factor": 1.0               // 1.0 = full close
   },
 
   "time_in_trade_max_days": 30
@@ -174,6 +179,31 @@ skipped that tick.
 | Condition | Action |
 |---|---|
 | `regime_label in plan.regime_rules.exit_on_labels` (default: `["CRISIS"]`) | **EXIT_REGIME** full close |
+
+### P0b — Regime partial downsize
+
+| Condition | Action |
+|---|---|
+| `regime_label in plan.regime_rules.downsize_50_on_labels` AND not already trimmed at this label | **EXIT_REGIME_DOWNSIZE** trim 50% |
+
+Precedence: `exit_on_labels` (P0) is checked first, so a label in **both**
+lists full-flattens rather than trims. Idempotency: the trim fires at most
+once per (trade, regime-label) episode — `journal_trades.regime_downsized_at_label`
+records the label last trimmed at, and the branch only fires when the current
+label differs. Limitation (first cut): a label that leaves and returns will
+re-trim once it comes back, but not while it persists.
+
+### P0c — Event rule (thesis broken)
+
+| Condition | Action |
+|---|---|
+| `plan.event_rules.exit_on_thesis_broken` AND `journal_theses.status == 'thesis_broken'` | **EXIT_EVENT** close (`exit_factor`, default 1.0) |
+
+A broken thesis exits even before the price stop — invalidation discipline.
+The flag is set **out-of-band** (operator via journal-mcp `mark_thesis_broken`,
+or a future premarket news node); the intraday executor only READS it, so the
+hot path stays pure (no LLM/network). Below CRISIS in priority (a market-wide
+event dominates), above the price stop.
 
 ### P1 — Hard stop (direction-aware)
 
@@ -388,9 +418,13 @@ The EOD sweep at 21:30 UTC handles edge cases the immediate path misses:
   want to revive as shadow comparison later.
 - **No mid-trade adjustments to stop/target via LLM.** Plan is set at
   entry, immutable except via SQL. (Trailing-stop is mechanical, not LLM.)
-- **No thesis-broken auto-detection from news.** The plan's
-  `event_rules` field is reserved for future use; right now nothing
-  populates it.
+- **No AUTOMATED thesis-broken detection from news (yet).** The P0c event
+  exit consumes a `journal_theses.status == 'thesis_broken'` flag, but that
+  flag is set **manually/out-of-band** (operator via journal-mcp
+  `mark_thesis_broken`). Wiring a premarket news node that flips the flag when
+  news-analyst sentiment contradicts the thesis invalidation text is the
+  natural next step — the executor side (deterministic, hot-path-safe) is
+  already in place.
 
 ---
 

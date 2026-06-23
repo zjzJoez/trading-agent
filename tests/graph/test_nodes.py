@@ -721,6 +721,88 @@ class TestDetectExitTriggers:
         assert dec["action"] == "EXIT_TARGET"
         assert dec["exit_qty_factor"] == 0.5
 
+    # -- area C: regime downsize + thesis-broken event wiring ----------------
+
+    def _run_detect(self, *, pos, enrichment, regime_label):
+        sym = pos["symbol"]
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=[pos],
+            regime={"label": regime_label, "confidence": 0.7, "gate": {}},
+        )
+        with _patch_all_emits():
+            with patch(
+                "trading_agent.graph.nodes.intraday_nodes._load_journal_enrichment_by_symbol",
+                return_value={sym: enrichment},
+            ):
+                with patch(
+                    "trading_agent.mcp_servers.moomoo.server.get_quote",
+                    return_value={"rows": []},
+                ):
+                    from trading_agent.graph.nodes.intraday_nodes import detect_exit_triggers
+                    return detect_exit_triggers(state)
+
+    def _downsize_enrichment(self, **over):
+        from trading_agent.llm.schemas import ExitPlan, RegimeRulesConfig
+        plan = ExitPlan(
+            hard_stop=7.0, hard_target=18.0,
+            regime_rules=RegimeRulesConfig(
+                downsize_50_on_labels=["VOLATILE_TRANSITION"]),
+        )
+        base = {
+            "trade_id": 5, "thesis_id": 6, "stop": 7.0, "target": 18.0,
+            "exit_plan": plan.model_dump(), "mfe_so_far": None, "opened_at": None,
+            "regime_downsized_at_label": None, "thesis_status": "open",
+        }
+        base.update(over)
+        return base
+
+    def test_regime_downsize_passes_through_with_label(self):
+        """qty=4 in a downsize regime → EXIT_REGIME_DOWNSIZE 0.5, decision
+        carries regime_label so route can stamp the guard."""
+        pos = {"symbol": "US.NVDA260817C220000", "asset_type": "OPT",
+               "qty": 4, "entry_price": 10.0, "mark": 12.0}
+        result = self._run_detect(
+            pos=pos, enrichment=self._downsize_enrichment(),
+            regime_label="VOLATILE_TRANSITION")
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "EXIT_REGIME_DOWNSIZE"
+        assert dec["exit_qty_factor"] == 0.5
+        assert dec["regime_label"] == "VOLATILE_TRANSITION"
+
+    def test_regime_downsize_qty1_demoted_to_hold(self):
+        pos = {"symbol": "US.NVDA260817C220000", "asset_type": "OPT",
+               "qty": 1, "entry_price": 10.0, "mark": 12.0}
+        result = self._run_detect(
+            pos=pos, enrichment=self._downsize_enrichment(),
+            regime_label="VOLATILE_TRANSITION")
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "HOLD"
+        assert "demoted_from_EXIT_REGIME_DOWNSIZE" in dec["reason"]
+
+    def test_already_downsized_at_label_holds(self):
+        """Guard already stamped at this label → no re-trim."""
+        pos = {"symbol": "US.NVDA260817C220000", "asset_type": "OPT",
+               "qty": 4, "entry_price": 10.0, "mark": 12.0}
+        result = self._run_detect(
+            pos=pos,
+            enrichment=self._downsize_enrichment(
+                regime_downsized_at_label="VOLATILE_TRANSITION"),
+            regime_label="VOLATILE_TRANSITION")
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "HOLD"
+
+    def test_thesis_broken_event_exit_passes_through(self):
+        pos = {"symbol": "US.NVDA260817C220000", "asset_type": "OPT",
+               "qty": 4, "entry_price": 10.0, "mark": 12.0}
+        result = self._run_detect(
+            pos=pos,
+            enrichment=self._downsize_enrichment(thesis_status="thesis_broken"),
+            regime_label="RANGE_LOW_VOL")
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "EXIT_EVENT"
+        assert dec["exit_qty_factor"] == 1.0
+
     def test_scale_rungs_taken_passed_through_skips_fired_rung(self):
         """Critical fix for the scale-rung repeat-fire bug.
 
