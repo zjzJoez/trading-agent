@@ -80,6 +80,7 @@ def test_expected_wiring_snapshot():
     self-documenting."""
     assert _ELIGIBLE_KEYS == [
         "implicit_stop_frac",
+        "min_dte",
         "option_premium_stop_pct",
         "r1_soft_cap_pct",
         "r3_ticker_exposure_pct",
@@ -93,19 +94,20 @@ def test_expected_wiring_snapshot():
 
 def test_fully_ineligible_families_derived_from_key_flags():
     """CANARY_INELIGIBLE_FAMILIES is derived, not hand-listed — one source
-    of truth (the per-key flags in params.py)."""
+    of truth (the per-key flags in params.py). After area E pruned the
+    consumer-less keys and wired min_dte, only REGIME_THRESHOLDS remains
+    fully ineligible (global/premarket scope, no global-scope canary routing)."""
     assert CANARY_INELIGIBLE_FAMILIES == frozenset({
-        ParamFamily.ENTRY_FILTERS,
-        ParamFamily.CANDIDATE_COUNT,
         ParamFamily.REGIME_THRESHOLDS,
     })
 
 
 def test_ineligible_keys_helper():
     assert ineligible_keys({"r1_soft_cap_pct": 0.01}) == []
+    # crisis_vix_level (regime_thresholds) stays canary_eligible=False.
     assert ineligible_keys(
-        {"implicit_stop_frac": 0.04, "default_stop_atr_mult": 2.0}
-    ) == ["default_stop_atr_mult"]
+        {"implicit_stop_frac": 0.04, "crisis_vix_level": 40.0}
+    ) == ["crisis_vix_level"]
     # Unknown keys are ignored (rejected upstream at insert time)
     assert ineligible_keys({"phantom": 1}) == []
 
@@ -165,12 +167,23 @@ def test_insert_canary_rejects_ineligible_family():
         )
 
 
-def test_insert_canary_rejects_ineligible_key_in_mixed_family():
-    """stop_distances is family-eligible, but default_stop_atr_mult has no
-    ATR consumer — the per-key check must refuse it at creation time."""
+def test_insert_canary_rejects_ineligible_key_in_mixed_family(monkeypatch):
+    """The per-key check must refuse an ineligible key inside an otherwise
+    eligible family. After area E pruned default_stop_atr_mult no real family
+    is mixed, so synthesize one: flip option_premium_stop_pct ineligible
+    (stop_distances keeps implicit_stop_frac eligible, so the family-level
+    check passes and the per-key check is what must catch this)."""
+    import dataclasses
+
+    from trading_agent.learning import params as params_mod
+
+    bad = dataclasses.replace(
+        params_mod.PARAM_BOUNDS["option_premium_stop_pct"], canary_eligible=False
+    )
+    monkeypatch.setitem(params_mod.PARAM_BOUNDS, "option_premium_stop_pct", bad)
     with pytest.raises(CanaryFamilyIneligible):
         insert_canary(
             parent_version_id=1,
-            params={"default_stop_atr_mult": 2.0},
+            params={"option_premium_stop_pct": 0.55},
             rationale="x", created_by="test",
         )

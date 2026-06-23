@@ -189,6 +189,72 @@ class TestSizingSoftCaps:
 
 
 # ---------------------------------------------------------------------------
+# deterministic_sizing — min_dte entry filter (area E)
+# ---------------------------------------------------------------------------
+
+
+class TestMinDteEntryFilter:
+    def test_short_dated_option_is_filtered(self):
+        """resolver min_dte=18, option DTE 10 → entry filtered (infeasible),
+        one param_consumed row keyed on min_dte."""
+        p = _opt_proposal(qty=10)
+        p["option_dte"] = 10
+        state = _state_with_resolver(
+            {"min_dte": 18}, proposal=p,
+            account={"equity": 100_000.0}, positions=[],
+        )
+        result, mock_emit = _run_sizing(state)
+        assert result["sizing"]["infeasible"] is True
+        assert result["sizing"]["approved_qty"] == 0.0
+        assert result["proposal"]["qty"] == 0.0
+        assert result["sizing"]["r1_r6_violations"][0]["rule"] == "entry_min_dte"
+        calls = _param_consumed_calls(mock_emit)
+        assert len(calls) == 1
+        assert calls[0]["payload"]["effects"][0]["key"] == "min_dte"
+
+    def test_long_dated_option_passes(self):
+        """resolver min_dte=18, option DTE 30 → not filtered; normal sizing
+        approves all 10 and emits no min_dte param_consumed."""
+        p = _opt_proposal(qty=10)
+        p["option_dte"] = 30
+        state = _state_with_resolver(
+            {"min_dte": 18}, proposal=p,
+            account={"equity": 100_000.0}, positions=[],
+        )
+        result, mock_emit = _run_sizing(state)
+        assert result["sizing"]["infeasible"] is False
+        assert result["sizing"]["approved_qty"] == 10.0
+        assert _param_consumed_calls(mock_emit) == []
+
+    def test_no_resolver_value_is_noop_even_for_short_dte(self):
+        """Without a min_dte override the filter must not fire (byte-identical
+        to the pre-learning path); the R5 hard floor still governs downstream."""
+        p = _opt_proposal(qty=10)
+        p["option_dte"] = 10
+        state = _state_with_resolver(
+            None, proposal=p,
+            account={"equity": 100_000.0}, positions=[],
+        )
+        result, _ = _run_sizing(state)
+        # not filtered by the learner — the entry_min_dte rule never fires
+        viols = result["sizing"].get("r1_r6_violations", [])
+        assert all(v.get("rule") != "entry_min_dte" for v in viols)
+
+    def test_stock_proposal_is_exempt(self):
+        """Stock proposals have no DTE → min_dte filter must not touch them."""
+        p = _opt_proposal(qty=10)
+        p["asset_type"] = "STK"
+        p.pop("option_dte", None)
+        state = _state_with_resolver(
+            {"min_dte": 18}, proposal=p,
+            account={"equity": 100_000.0}, positions=[],
+        )
+        result, _ = _run_sizing(state)
+        viols = result["sizing"].get("r1_r6_violations", [])
+        assert all(v.get("rule") != "entry_min_dte" for v in viols)
+
+
+# ---------------------------------------------------------------------------
 # regime_execution_gate — regime_size_multipliers
 # ---------------------------------------------------------------------------
 

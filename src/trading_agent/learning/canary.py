@@ -438,18 +438,17 @@ def maybe_ramp_traffic(canary_version_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 # Derived from the per-key ``ParamBound.canary_eligible`` flags so there is
-# ONE source of truth (params.py) for "does this knob have a live consumer".
-# A family lands here when NO key in it is eligible:
-#   * ENTRY_FILTERS / CANDIDATE_COUNT — take effect upstream of
-#     assign_canary_node (scout / research_ticker / build_trade_proposal);
-#     routing them at sizing time would mis-attribute outcomes since the
-#     candidates were already chosen under control.
-#   * REGIME_THRESHOLDS — the live classifier runs on its own schedule with
-#     DEFAULT_CRISIS_PARAMS and never sees a resolver; only shadow/replay
-#     read these keys (see params.py per-key comments).
-# Families with a MIX of eligible/ineligible keys (stop_distances:
-# default_stop_atr_mult has no ATR consumer) are caught by the per-key
-# checks in ``insert_canary`` and ``route_canary`` instead.
+# ONE source of truth (params.py) for "can this knob be A/B-routed live".
+# A family lands here when NO key in it is eligible. After area E pruned the
+# consumer-less keys and wired min_dte, the only fully-ineligible family is:
+#   * REGIME_THRESHOLDS — the classifier now consumes these (classify_regime
+#     threads them into classify()), so an ACTIVE swap is real, BUT it runs at
+#     premarket/global scope while canary routing is per-(ticker,date) at
+#     candidate_entry time. There is no global-scope canary routing path yet,
+#     so an A/B canary on them can't attribute — keep them out of live routing.
+# The per-key checks in ``insert_canary`` / ``route_canary`` remain as defence
+# for any FUTURE mixed family (an eligible family carrying an ineligible key);
+# none exists in PARAM_BOUNDS today.
 CANARY_INELIGIBLE_FAMILIES: frozenset[ParamFamily] = frozenset(
     fam for fam in ParamFamily
     if not any(
@@ -478,10 +477,10 @@ def insert_canary(
             f"family {fam.value} cannot be routed live yet — "
             "use SHADOW status until node-ordering rearchitect lands"
         )
-    # Per-key check for mixed families (e.g. stop_distances where
-    # default_stop_atr_mult has no consumer): refuse at creation time so
-    # the caller learns immediately instead of route_canary silently
-    # skipping the row forever.
+    # Per-key check for any FUTURE mixed family (an eligible family carrying
+    # an ineligible key): refuse at creation time so the caller learns
+    # immediately instead of route_canary silently skipping the row forever.
+    # No such family exists in PARAM_BOUNDS today (area E pruned the last one).
     bad = ineligible_keys(params)
     if bad:
         raise CanaryFamilyIneligible(

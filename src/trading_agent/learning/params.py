@@ -45,7 +45,6 @@ class ParamFamily(str, Enum):
     STOP_DISTANCES = "stop_distances"
     ENTRY_FILTERS = "entry_filters"
     REGIME_THRESHOLDS = "regime_thresholds"
-    CANDIDATE_COUNT = "candidate_count"
     REGIME_SIZE_MULTIPLIERS = "regime_size_multipliers"
 
 
@@ -128,51 +127,36 @@ PARAM_BOUNDS: dict[str, ParamBound] = {
         default=0.50, min=0.30, max=0.70,
         description="Premium-stop trigger; close at this fraction of entry premium.",
     ),
-    "default_stop_atr_mult": ParamBound(
-        family=ParamFamily.STOP_DISTANCES,
-        default=1.50, min=0.75, max=3.00,
-        description="ATR-multiple stop for equity-direction proxies.",
-        # Missing consumer: an ATR series is not available anywhere in the
-        # trade path at exit-plan-build time (persist_trade_event sees only
-        # entry/stop/target).  Until ATR is threaded into the proposal, a
-        # canary on this key is an A/A test.
-        canary_eligible=False,
-    ),
+    # NOTE: default_stop_atr_mult was PRUNED (area E). No ATR series is
+    # threaded into the trade path, so wiring a consumer would be fictional and
+    # the system trades long-premium options almost exclusively (STK-direction
+    # stops fall back to implicit_stop_frac). Re-add it only alongside a real
+    # ATR feed on the proposal.
 
     # -- entry_filters -----------------------------------------------------
-    # Missing consumer (all three): these gate which candidates the scout /
-    # trader LLMs even produce — upstream of assign_canary_node, so routing
-    # them live would mis-attribute outcomes (candidates were already chosen
-    # under control values).  Shadow-only until the node ordering moves
-    # canary assignment ahead of the scout.
-    "min_setup_quality": ParamBound(
-        family=ParamFamily.ENTRY_FILTERS,
-        default=0.60, min=0.40, max=0.85,
-        description="Trader setup-quality score floor (0..1).",
-        canary_eligible=False,
-    ),
-    "max_iv_percentile_long_premium": ParamBound(
-        family=ParamFamily.ENTRY_FILTERS,
-        default=70.0, min=40.0, max=90.0,
-        description="Skip new long-premium entries if IV percentile above this.",
-        canary_eligible=False,
-    ),
+    # min_dte is the only surviving entry filter. min_setup_quality and
+    # max_iv_percentile_long_premium were PRUNED (area E): the trader proposal
+    # carries no setup-quality score and no IV-PERCENTILE series, so neither
+    # had a real field to consume — a canary on them was fictional.
+    # Live consumer for min_dte: trade_nodes.deterministic_sizing entry filter,
+    # which runs AFTER assign_canary so per-ticker attribution is valid.
     "min_dte": ParamBound(
         family=ParamFamily.ENTRY_FILTERS,
         default=7, min=3, max=21, integer=True,
         description="Minimum days-to-expiry on new option entries.",
-        canary_eligible=False,
     ),
 
     # -- regime_thresholds -------------------------------------------------
     # v3 §6.2: VIX≥35, VIX 5d Δ≥+10, SPY 5d ≤−7%, corr≥0.80 + RV≥30, HYG ≤−5%
     # Two flags trip CRISIS.  These knobs let the learner tune sensitivity
     # within the published envelope.
-    # Missing consumer (all five): the live regime classifier
-    # (graph/nodes/regime_nodes.py) runs on its own schedule with
-    # DEFAULT_CRISIS_PARAMS / hardcoded confidence thresholds and never sees
-    # a per-ticker resolver — only learning/shadow.py and learning/replay.py
-    # read these keys, which makes any canary on them an A/A test.
+    # LIVE consumer (area E): graph/nodes/regime_nodes.classify_regime now
+    # threads these into classify() (crisis_params + confidence thresholds),
+    # so an ACTIVE swap actually changes the live classifier and shadow replay
+    # is non-fictional.  They stay canary_eligible=False NOT for lack of a
+    # consumer but because the classifier runs at premarket/global scope while
+    # canary routing is per-(ticker,date) at candidate_entry time — there is no
+    # global-scope canary routing path yet, so an A/B canary can't attribute.
     "crisis_vix_level": ParamBound(
         family=ParamFamily.REGIME_THRESHOLDS,
         default=35.0, min=30.0, max=45.0,
@@ -204,15 +188,11 @@ PARAM_BOUNDS: dict[str, ParamBound] = {
         canary_eligible=False,
     ),
 
-    # -- candidate_count ---------------------------------------------------
-    # Missing consumer: scout output cap is applied upstream of
-    # assign_canary_node (same mis-attribution problem as entry_filters).
-    "max_candidates_per_scout": ParamBound(
-        family=ParamFamily.CANDIDATE_COUNT,
-        default=5, min=1, max=12, integer=True,
-        description="Scout output cap fed to candidate_entry per run.",
-        canary_eligible=False,
-    ),
+    # NOTE: max_candidates_per_scout (family candidate_count) was PRUNED
+    # (area E). The scout's top-N cap runs in premarket, upstream of
+    # assign_canary and in a separate process, governed by DISPATCH_MIN_SCORE /
+    # MAX_DISPATCH_PER_SCAN (not learnable) — it gates which tickers dispatch,
+    # not any single trade's outcome, so there is no per-trade counterfactual.
 
     # -- regime_size_multipliers ------------------------------------------
     # CRISIS multiplier is INTENTIONALLY ABSENT — it is a hard zero.

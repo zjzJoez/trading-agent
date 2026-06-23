@@ -356,9 +356,9 @@ def test_learning_critic_proposals_count():
             "n_proposed": 1,
             "proposals": [
                 {
-                    "param_name": "min_setup_quality",
-                    "current_value": 0.5,
-                    "proposed_value": 0.55,
+                    "param_name": "r1_soft_cap_pct",
+                    "current_value": 0.020,
+                    "proposed_value": 0.018,
                     "rationale": "win-rate softness in low-quality bucket",
                     "expected_impact": "fewer false positives",
                     "min_canary_trades": 25,

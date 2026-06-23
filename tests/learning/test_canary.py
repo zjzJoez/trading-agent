@@ -145,14 +145,15 @@ def test_route_zero_traffic_never_routes_canary():
 
 
 def test_ineligible_families_documented():
-    """Codex review 🔴 — ENTRY_FILTERS and CANDIDATE_COUNT take effect upstream
-    of assign_canary_node and would mis-attribute outcomes if routed live.
-    ITEM 11 added REGIME_THRESHOLDS: the live classifier runs with
-    DEFAULT_CRISIS_PARAMS and never sees a resolver, so a thresholds canary
-    is an A/A test (only learning/shadow + replay read those keys)."""
-    assert ParamFamily.ENTRY_FILTERS in CANARY_INELIGIBLE_FAMILIES
-    assert ParamFamily.CANDIDATE_COUNT in CANARY_INELIGIBLE_FAMILIES
+    """After area E only REGIME_THRESHOLDS is fully ineligible: the classifier
+    now consumes those keys (ACTIVE swaps are real) but runs at premarket/global
+    scope while canary routing is per-(ticker,date) — no global-scope routing
+    path, so an A/B canary can't attribute. ENTRY_FILTERS became eligible
+    (min_dte wired to deterministic_sizing); CANDIDATE_COUNT was removed and
+    the two consumer-less entry filters pruned."""
     assert ParamFamily.REGIME_THRESHOLDS in CANARY_INELIGIBLE_FAMILIES
+    # ENTRY_FILTERS now has a live consumer (min_dte) → eligible
+    assert ParamFamily.ENTRY_FILTERS not in CANARY_INELIGIBLE_FAMILIES
     # The families with live consumers (trade_nodes) MUST stay eligible
     assert ParamFamily.SIZING_AGGRESSION not in CANARY_INELIGIBLE_FAMILIES
     assert ParamFamily.STOP_DISTANCES not in CANARY_INELIGIBLE_FAMILIES

@@ -297,11 +297,19 @@ def classify(
     *,
     crisis_params: dict[str, float] | None = None,
     prior_label: RegimeLabel | None = None,
+    confidence_transition: float = CONFIDENCE_TRANSITION_THRESHOLD,
+    confidence_llm_review: float = CONFIDENCE_LLM_REVIEW_THRESHOLD,
 ) -> RegimePrediction:
     """Top-level classify: Layer 0 → Layer 1 → uncertainty rules.
 
     `prior_label` is the previous tick's label, used to detect transitions
     that should soft-land in VOLATILE_TRANSITION.
+
+    `confidence_transition` / `confidence_llm_review` default to the module
+    constants but may be overridden by the online-learning resolver
+    (regime_thresholds family) so an ACTIVE param swap actually moves the live
+    classifier (area E). `crisis_params` likewise overrides the crisis-overlay
+    thresholds.
     """
     # ---- DQ gate first: missing critical data → safe-mode TRANSITION ----
     deg = snapshot.degradation_level
@@ -348,7 +356,7 @@ def classify(
     review_reason = None
 
     # ---- Uncertainty rules ----
-    if confidence < CONFIDENCE_TRANSITION_THRESHOLD:
+    if confidence < confidence_transition:
         # Force soft-land state
         pending_label = label
         label = "VOLATILE_TRANSITION"
@@ -365,7 +373,7 @@ def classify(
         review_reason = "label_changed_low_confidence"
 
     needs_llm = (
-        confidence < CONFIDENCE_LLM_REVIEW_THRESHOLD
+        confidence < confidence_llm_review
         or label == "VOLATILE_TRANSITION"
         or (prior_label is not None and prior_label != label)
         or deg > 0
