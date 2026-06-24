@@ -199,13 +199,13 @@ def _credit_put_spread_spec() -> StrategySpec:
     )
     return StrategySpec(
         name="credit_put_spread_30_45",
-        # BLOCKED: SELL-to-open is hard-blocked at the order tools
-        # (order_guard.R_short_option_open_blocked) and multi-leg combos
-        # have no atomic sizing yet — the two legs would be sized/filled
-        # independently. Declared NOW so the high-WR track has a
-        # falsifiable target the day that infra lands, not so it can
-        # trade today.
-        status="blocked",
+        # ACTIVE (area A): the atomic multi-leg path landed. A defined-risk
+        # vertical now opens via place_paper_option_combo, which sizes it as
+        # ONE position off max_loss = (width − net_credit) and is governed by
+        # R5e (defined-risk proof) + R1-R5/R5d. The single-leg SELL-to-open
+        # hard block (R_short_option_open_blocked) remains in force — only
+        # provable verticals are unblocked, never a legged-in naked short.
+        status="active",
         structure=(
             "Short put vertical, 30–45 DTE: sell a 0.20–0.30 |delta| put, "
             "buy a further-OTM put; max loss defined by the width."
@@ -250,6 +250,8 @@ _LABEL_PREFIX_TO_SPEC: tuple[tuple[str, str], ...] = (
     ("earnings_iv_drop", "convexity_long_premium"),
     ("pullback_", "convexity_long_premium"),
     ("breakout_", "convexity_long_premium"),
+    # Defined-risk credit verticals (area A) — placed via the combo path.
+    ("credit_put_spread", "credit_put_spread_30_45"),
 )
 
 

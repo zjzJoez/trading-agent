@@ -35,7 +35,12 @@ from moomoo import (
 from mcp.server.fastmcp import FastMCP
 
 from trading_agent.config import CONFIG
-from trading_agent.order_guard import GuardDecision, audit_decision, evaluate_order
+from trading_agent.order_guard import (
+    GuardDecision,
+    audit_decision,
+    evaluate_combo,
+    evaluate_order,
+)
 
 # ---------------------------------------------------------------------------
 # Silence moomoo-api SDK stdout pollution.
@@ -560,6 +565,156 @@ def _run_order_guard(
                 "Fix the violation and retry; see data/trader.db "
                 "hook_audit_log for the full record.",
     }
+
+def _run_combo_guard(
+    params: dict,
+    *,
+    tool_name: str,
+    leg_quotes: dict | None = None,
+) -> tuple[dict | None, dict]:
+    """Evaluate + audit a multi-leg combo. Returns (refusal_or_None, summary).
+
+    Mirrors _run_order_guard but routes through evaluate_combo. The summary
+    (net_credit / width / max_loss) is echoed by the tool on success so
+    posttool can journal the spread as ONE defined-risk position.
+    """
+    try:
+        equity, cash = _fetch_paper_equity_cash()
+    except Exception as e:
+        symbol = (f"{params.get('short_leg_symbol', '')}+"
+                  f"{params.get('long_leg_symbol', '')}")
+        decision = GuardDecision(
+            allowed=False,
+            reason="cannot verify sizing — moomoo equity lookup failed",
+            symbol=symbol,
+        )
+        audit_decision(decision, guard_name="server_order_guard", tool_name=tool_name)
+        return (
+            {
+                "order_blocked": True,
+                "guard": "server_order_guard",
+                "reason": decision.reason,
+                "detail": repr(e),
+                "violations": [],
+                "hint": "OpenD equity lookup failed; combo refused fail-closed.",
+            },
+            {},
+        )
+
+    decision = evaluate_combo(params, equity=equity, cash=cash, leg_quotes=leg_quotes)
+    audit_decision(decision, guard_name="server_order_guard", tool_name=tool_name)
+    summary = decision.proposed or {}
+    if decision.allowed:
+        return (None, summary)
+    return (
+        {
+            "order_blocked": True,
+            "guard": "server_order_guard",
+            "reason": decision.reason,
+            "violations": decision.violations_json(),
+            "warns": list(decision.warns),
+            "thesis_id": decision.thesis_id,
+            "hint": "Combo refused by the server-side risk gate (thesis "
+                    "freshness + R5e defined-risk proof + R1-R5 sized as one "
+                    "position + R5d liquidity on BOTH legs).",
+        },
+        summary,
+    )
+
+
+@mcp.tool()
+def place_paper_option_combo(
+    short_leg_symbol: str,
+    long_leg_symbol: str,
+    contracts: int,
+    short_price: float,
+    long_price: float,
+    thesis_id: int,
+    strategy_label: str | None = None,
+    short_delta: float | None = None,
+    long_delta: float | None = None,
+) -> dict:
+    """Open a DEFINED-RISK two-leg credit vertical on the PAPER account.
+
+    This is the ONLY sanctioned way to open a short option leg: the guard
+    (R5e) proves the long leg caps the short (a real vertical, finite
+    max_loss = (width − net_credit) × 100 × contracts) before anything
+    reaches the broker. A single-leg SELL-to-open remains hard-blocked.
+
+    Both legs must share underlying + expiry + right, with equal `contracts`,
+    a net CREDIT (short_price > long_price), and the long strike capping the
+    short (put: long below short; call: long above short).
+
+    The broker has no atomic combo primitive, so this places the PROTECTIVE
+    LONG leg first, then the SHORT leg; if the short leg is rejected it
+    immediately closes the just-opened long (never leaves an unintended naked
+    long) and returns a rollback error. On success it returns both fills under
+    `combo_rows` (+ combo=True, net_credit, width, max_loss) so the fill-capture
+    hook journals the spread as ONE position.
+    """
+    _assert_paper()
+    params = {
+        "short_leg_symbol": short_leg_symbol,
+        "long_leg_symbol": long_leg_symbol,
+        "contracts": contracts,
+        "short_price": short_price,
+        "long_price": long_price,
+        "strategy_label": strategy_label,
+        "short_delta": short_delta,
+        "long_delta": long_delta,
+    }
+    refusal, summary = _run_combo_guard(params, tool_name="place_paper_option_combo")
+    if refusal is not None:
+        return refusal
+
+    # 1) Protective LONG leg first — we are never momentarily naked-short.
+    ret_l, df_l = _trade().place_order(
+        price=long_price, qty=contracts, code=long_leg_symbol,
+        trd_side=TrdSide.BUY, order_type=OrderType.NORMAL, trd_env=PAPER_ENV,
+    )
+    if ret_l != RET_OK:
+        return {
+            "thesis_id": thesis_id, "strategy_label": strategy_label,
+            "combo": False, "virtual_fill_suggested": True,
+            "reason": str(df_l),
+            "hint": "Long protective leg rejected; nothing opened. Caller may "
+                    "record a virtual combo fill via trade-journal-mcp.",
+        }
+
+    # 2) SHORT leg. On failure, roll back the long we just opened.
+    ret_s, df_s = _trade().place_order(
+        price=short_price, qty=contracts, code=short_leg_symbol,
+        trd_side=TrdSide.SELL, order_type=OrderType.NORMAL, trd_env=PAPER_ENV,
+    )
+    if ret_s != RET_OK:
+        rolled_back = False
+        try:
+            rb_ret, _ = _trade().place_order(
+                price=long_price, qty=contracts, code=long_leg_symbol,
+                trd_side=TrdSide.SELL, order_type=OrderType.MARKET,
+                trd_env=PAPER_ENV,
+            )
+            rolled_back = rb_ret == RET_OK
+        except Exception:
+            rolled_back = False
+        return {
+            "thesis_id": thesis_id, "strategy_label": strategy_label,
+            "combo": False, "combo_rollback": True, "rolled_back_long": rolled_back,
+            "reason": str(df_s),
+            "hint": "Short leg rejected after the long leg filled; submitted a "
+                    "closing order for the long leg. Verify the long position "
+                    "is flat; nothing was left as an unintended naked long.",
+        }
+
+    return {
+        "thesis_id": thesis_id, "strategy_label": strategy_label,
+        "combo": True,
+        "net_credit": summary.get("net_credit"),
+        "width": summary.get("width"),
+        "max_loss": summary.get("max_loss"),
+        "combo_rows": _df_records(df_l) + _df_records(df_s),
+    }
+
 
 @mcp.tool()
 def place_paper_order(

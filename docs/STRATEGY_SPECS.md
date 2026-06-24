@@ -24,12 +24,16 @@ not constants, and move when `data/execution_costs.json` is recalibrated.
 | Spec | Status | Structure | Entry gates | Regimes | Expected WR | Breakeven WR (gross → net) | Falsification |
 |---|---|---|---|---|---|---|---|
 | `convexity_long_premium` | **active** | Single-leg long premium, debit-defined risk | DTE 21–45, \|delta\| 0.30–0.55, R:R ≥ 2.0, catalyst required in RANGE_LOW_VOL | BULL_TREND, RANGE_LOW_VOL | 30–45% (payoff target 2.5:1) | ~33% → ~39% | LB95(mean R) < 0 after 30 closed trades |
-| `credit_put_spread_30_45` | **blocked** | Short put vertical, width-defined risk | DTE 30–45, short-leg \|delta\| 0.20–0.30, R:R ≈ 0.40 | BULL_TREND, RANGE_LOW_VOL | 70–80% (avg loss must stay < ~2.5× avg win net of friction) | ~71% → ~77% | LB95(mean R) < 0 after 30 closed trades, or realized WR < breakeven_wr_net |
+| `credit_put_spread_30_45` | **active** | Short put vertical, width-defined risk | DTE 30–45, short-leg \|delta\| 0.20–0.30, R:R ≈ 0.40 | BULL_TREND, RANGE_LOW_VOL | 70–80% (avg loss must stay < ~2.5× avg win net of friction) | ~71% → ~77% | LB95(mean R) < 0 after 30 closed trades, or realized WR < breakeven_wr_net |
 
-`credit_put_spread_30_45` is blocked because SELL-to-open is hard-blocked at
-the order tools (`R_short_option_open_blocked`) and multi-leg combos have no
-atomic sizing. It is declared now so the high-WR track has a falsifiable
-target the day that infrastructure lands.
+`credit_put_spread_30_45` is **active** (area A): a defined-risk vertical opens
+via the `place_paper_option_combo` MCP tool, which proves the long leg caps the
+short (R5e) and sizes the spread as ONE position off
+`max_loss = (width − net_credit) × 100 × contracts`. The single-leg
+SELL-to-open hard block (`R_short_option_open_blocked`) stays in force — only
+provable verticals are unblocked, never a legged-in naked short. Known v1
+limitations: portfolio heat over-counts the short leg at the broker-position
+level (conservative), and a first-class combo-CLOSE path is a follow-up.
 
 ## Label mapping
 

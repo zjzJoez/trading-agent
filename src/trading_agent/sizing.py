@@ -49,6 +49,7 @@ R6 = "R6_earnings_lock"
 R7 = "R7_risk_reward"
 R5B = "R5b_csp_collateral"
 R5C = "R5c_naked_call_no_stop"
+R5E = "R5e_combo_defined_risk"               # multi-leg vertical defined-risk gate
 R_STOP_MISSING = "R1_stop_missing"          # warn-only signal when stop absent
 R_SECTOR_UNKNOWN = "R4_sector_unknown"      # warn-only signal when sector lookup empty
 R_TARGET_MISSING = "R7_target_missing"      # warn-only signal when target absent
@@ -450,6 +451,182 @@ def check(ctx: SizingContext, proposed: ProposedTrade) -> list[SizingViolation]:
                     ))
 
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Multi-leg defined-risk verticals (R5e) — area A
+# ---------------------------------------------------------------------------
+#
+# The single-leg SELL-to-open hard block (order_guard.R_short_option_open_blocked)
+# stays in force forever: a legged-in short evaluated ALONE is a naked short.
+# A DEFINED-RISK vertical is different — the long leg caps the short leg's loss,
+# so the position's true risk is a finite (width - net_credit). check_combo
+# PROVES that property before any sizing, then sizes the combo as ONE position
+# off its max_loss. Only CREDIT verticals are unblocked here; naked shorts and
+# debit structures stay blocked.
+
+
+@dataclass(frozen=True)
+class ComboLeg:
+    """One leg of a two-leg vertical. `price` is the per-contract premium."""
+    option_symbol: str
+    side: Literal["BUY", "SELL"]
+    contracts: float
+    price: float
+    right: Literal["C", "P"]
+    strike: float
+    dte: int | None = None
+    delta: float | None = None
+
+
+@dataclass(frozen=True)
+class ProposedCombo:
+    """A two-leg defined-risk credit vertical to open atomically."""
+    ticker: str
+    legs: tuple[ComboLeg, ...]
+    strategy_label: str | None = None
+    sector: str | None = None
+    intent: Literal["open"] = "open"
+
+    @property
+    def short_leg(self) -> ComboLeg | None:
+        shorts = [leg for leg in self.legs if leg.side == "SELL"]
+        return shorts[0] if len(shorts) == 1 else None
+
+    @property
+    def long_leg(self) -> ComboLeg | None:
+        longs = [leg for leg in self.legs if leg.side == "BUY"]
+        return longs[0] if len(longs) == 1 else None
+
+    @property
+    def contracts(self) -> float:
+        return self.legs[0].contracts if self.legs else 0.0
+
+    @property
+    def net_credit(self) -> float:
+        """Per-contract net credit = short premium − long premium."""
+        s, lo = self.short_leg, self.long_leg
+        return (s.price - lo.price) if (s and lo) else 0.0
+
+    @property
+    def width(self) -> float:
+        s, lo = self.short_leg, self.long_leg
+        return abs(s.strike - lo.strike) if (s and lo) else 0.0
+
+    @property
+    def max_loss(self) -> float:
+        """Defined risk = (width − net_credit) × 100 × contracts."""
+        return max(0.0, self.width - self.net_credit) * 100.0 * self.contracts
+
+    @property
+    def notional(self) -> float:
+        # A defined-risk vertical's true exposure (for R3) is its max_loss —
+        # capital at risk — not the gross premium of either leg.
+        return self.max_loss
+
+
+def check_combo(ctx: SizingContext, combo: ProposedCombo) -> list[SizingViolation]:
+    """Validate a two-leg defined-risk credit vertical, then size it as ONE
+    position. Returns all violations; caller blocks on any severity=='block'.
+
+    Defined-risk invariants (R5e) are checked FIRST. If ANY fails the structure
+    is not a provable vertical and is blocked outright — the per-leg
+    short-open path (R5b/R5c) is intentionally NOT consulted, because the
+    width-minus-credit math supersedes it for a bounded short leg and a
+    non-vertical must never fall through to a naked-short evaluation.
+    """
+    legs = combo.legs
+    if len(legs) != 2:
+        return [SizingViolation(
+            R5E, f"combo must have exactly 2 legs, got {len(legs)}", "block")]
+    a, b = legs
+    s, lo = combo.short_leg, combo.long_leg
+    if s is None or lo is None:
+        return [SizingViolation(
+            R5E, "combo must have exactly one BUY and one SELL leg", "block")]
+    if abs(a.contracts - b.contracts) > EPS or combo.contracts <= 0:
+        return [SizingViolation(
+            R5E, f"combo legs need equal positive contracts; got "
+            f"{a.contracts} and {b.contracts}", "block")]
+    if a.dte is not None and b.dte is not None and a.dte != b.dte:
+        return [SizingViolation(
+            R5E, f"combo legs must share one expiry; got dte {a.dte} and "
+            f"{b.dte} (calendars not supported)", "block")]
+    if a.right != b.right:
+        return [SizingViolation(
+            R5E, f"combo legs must be the same right (both C or both P); got "
+            f"{a.right} and {b.right}", "block")]
+    # Long leg must CAP the short leg → defined risk.
+    capped = (lo.strike < s.strike) if a.right == "P" else (lo.strike > s.strike)
+    if not capped:
+        return [SizingViolation(
+            R5E, f"long leg does not cap the short (right={a.right}, "
+            f"short_strike={s.strike}, long_strike={lo.strike}) — not a "
+            f"defined-risk vertical", "block")]
+    net_credit, width = combo.net_credit, combo.width
+    if net_credit <= 0:
+        return [SizingViolation(
+            R5E, f"combo is not a credit spread (net_credit ${net_credit:.2f} "
+            f"<= 0); debit structures are blocked", "block")]
+    if width <= net_credit + EPS:
+        return [SizingViolation(
+            R5E, f"combo max_loss <= 0 (width ${width:.2f} <= net_credit "
+            f"${net_credit:.2f}) — mispriced or not defined-risk", "block")]
+
+    # ---- size the combo as ONE position ----
+    v: list[SizingViolation] = []
+    max_loss = combo.max_loss
+    is_opening = combo.intent == "open"
+
+    r1_budget = MAX_SINGLE_RISK_PCT * ctx.equity
+    if is_opening and max_loss > r1_budget + EPS:
+        v.append(SizingViolation(
+            R1, f"combo max loss ${max_loss:,.2f} exceeds "
+            f"{MAX_SINGLE_RISK_PCT*100:.0f}% of equity (${r1_budget:,.2f})",
+            "block"))
+
+    if is_opening and len(ctx.opens) >= MAX_CONCURRENT_OPENS:
+        v.append(SizingViolation(
+            R2, f"already {len(ctx.opens)} open positions; cap is "
+            f"{MAX_CONCURRENT_OPENS}", "block"))
+
+    ticker_u = combo.ticker.upper()
+    if is_opening:
+        existing = sum(p.notional for p in ctx.opens if p.ticker.upper() == ticker_u)
+        total = existing + combo.notional
+        r3_cap = MAX_TICKER_EXPOSURE_PCT * ctx.equity
+        if total > r3_cap + EPS:
+            v.append(SizingViolation(
+                R3, f"combined {ticker_u} exposure ${total:,.2f} exceeds "
+                f"{MAX_TICKER_EXPOSURE_PCT*100:.0f}% of equity (${r3_cap:,.2f})",
+                "block"))
+
+    if is_opening:
+        if combo.sector:
+            same = [p for p in ctx.opens
+                    if p.sector and p.sector == combo.sector
+                    and p.ticker.upper() != ticker_u]
+            if len(same) >= MAX_SAME_SECTOR_OPENS:
+                v.append(SizingViolation(
+                    R4, f"already {len(same)} open positions in sector "
+                    f"{combo.sector!r}: {[p.ticker for p in same]}; cap is "
+                    f"{MAX_SAME_SECTOR_OPENS}", "block"))
+        elif not ctx.sector_lookup_available:
+            v.append(SizingViolation(
+                R_SECTOR_UNKNOWN,
+                "sectors.csv missing — R4 not enforced for this combo", "warn"))
+        else:
+            v.append(SizingViolation(
+                R_SECTOR_UNKNOWN, f"sector for {ticker_u} not in sectors.csv — "
+                "R4 not enforced for this combo", "warn"))
+
+    dte = legs[0].dte
+    if is_opening and dte is not None and not (OPTION_DTE_MIN <= dte <= OPTION_DTE_MAX):
+        v.append(SizingViolation(
+            R5, f"combo DTE {dte} outside [{OPTION_DTE_MIN},{OPTION_DTE_MAX}]",
+            "block"))
+
+    return v
 
 
 def blockers(vs: list[SizingViolation]) -> list[SizingViolation]:

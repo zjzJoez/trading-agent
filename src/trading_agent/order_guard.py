@@ -59,12 +59,16 @@ from typing import Literal
 from trading_agent.config import CONFIG, ensure_dirs
 from trading_agent.db import connection
 from trading_agent.sizing import (
+    R5E,
+    ComboLeg,
     OpenPosition,
+    ProposedCombo,
     ProposedTrade,
     SizingContext,
     SizingViolation,
     blockers,
     check,
+    check_combo,
 )
 
 OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{4,8})$")
@@ -539,6 +543,7 @@ class GuardDecision:
     equity: float | None = None
     open_count: int | None = None
     proposed: dict | None = None          # serialized ProposedTrade summary
+    legs: tuple[dict, ...] | None = None  # per-leg summary for combos (audit)
 
     def violations_json(self) -> list[dict]:
         return [
@@ -689,6 +694,166 @@ def evaluate_order(
         equity=equity,
         open_count=len(opens),
         proposed=proposed_summary,
+    )
+
+
+# ---- multi-leg defined-risk combo path (area A) ----
+#
+# A SEPARATE entry point from evaluate_order. The single-leg
+# is_opening_option_short hard block in evaluate_order is UNTOUCHED — a short
+# leg is only ever legal inside evaluate_combo, where check_combo proves the
+# long leg caps it (defined risk). Closing a spread still uses the single-leg
+# close path (BUY-to-close short / SELL-to-close long, both intent=close,
+# already allowed).
+
+
+def build_proposed_combo(
+    params: dict, sector_map: dict[str, str]
+) -> ProposedCombo | str:
+    """Build a ProposedCombo from place_paper_option_combo arguments.
+
+    Returns a string error (caller blocks with it) on unparseable/mismatched
+    leg symbols. Both legs must share an underlying; right/expiry/strike
+    relationships are validated downstream by check_combo.
+    """
+    short_sym = str(params.get("short_leg_symbol", ""))
+    long_sym = str(params.get("long_leg_symbol", ""))
+    sp = parse_option_symbol(short_sym)
+    lp = parse_option_symbol(long_sym)
+    if not sp:
+        return (f"unparseable short_leg_symbol {short_sym!r}; expected "
+                "'US.<TICKER><YYMMDD><C|P><strike*1000>'")
+    if not lp:
+        return (f"unparseable long_leg_symbol {long_sym!r}; expected "
+                "'US.<TICKER><YYMMDD><C|P><strike*1000>'")
+    s_tkr, s_dte, s_right, s_strike = sp
+    l_tkr, l_dte, l_right, l_strike = lp
+    if s_tkr != l_tkr:
+        return f"combo legs span different underlyings: {s_tkr} vs {l_tkr}"
+    try:
+        contracts = float(params.get("contracts", 0))
+        short_price = float(params.get("short_price", 0))
+        long_price = float(params.get("long_price", 0))
+    except (TypeError, ValueError):
+        return "combo contracts/short_price/long_price must be numeric"
+
+    def _opt_float(key):
+        val = params.get(key)
+        return float(val) if val is not None else None
+
+    short_leg = ComboLeg(
+        option_symbol=short_sym, side="SELL", contracts=contracts,
+        price=short_price, right=s_right, strike=s_strike,  # type: ignore[arg-type]
+        dte=s_dte, delta=_opt_float("short_delta"),
+    )
+    long_leg = ComboLeg(
+        option_symbol=long_sym, side="BUY", contracts=contracts,
+        price=long_price, right=l_right, strike=l_strike,  # type: ignore[arg-type]
+        dte=l_dte, delta=_opt_float("long_delta"),
+    )
+    return ProposedCombo(
+        ticker=s_tkr,
+        legs=(short_leg, long_leg),
+        strategy_label=params.get("strategy_label"),
+        sector=sector_map.get(s_tkr.upper()),
+        intent="open",
+    )
+
+
+def _combo_leg_summary(combo: ProposedCombo) -> tuple[dict, ...]:
+    return tuple(
+        {"option_symbol": leg.option_symbol, "side": leg.side,
+         "contracts": leg.contracts, "price": leg.price,
+         "right": leg.right, "strike": leg.strike, "dte": leg.dte,
+         "delta": leg.delta}
+        for leg in combo.legs
+    )
+
+
+def evaluate_combo(
+    params: dict,
+    *,
+    equity: float,
+    cash: float | None,
+    leg_quotes: dict[str, dict] | None = None,
+) -> GuardDecision:
+    """Gate one atomic two-leg defined-risk vertical: parse → thesis freshness
+    on the underlying → check_combo (R5e + R1-R5 sized as ONE position) → R5d
+    liquidity on BOTH legs. ``leg_quotes`` (``{option_symbol: snapshot}``) lets
+    a caller that already holds fresh snapshots pass them through instead of
+    triggering fetches (same spoofing-guard pattern as evaluate_order's
+    option_quote).
+    """
+    short_sym = str(params.get("short_leg_symbol") or "")
+    long_sym = str(params.get("long_leg_symbol") or "")
+    symbol = f"{short_sym}+{long_sym}"
+    sector_map = load_sector_map()
+    combo = build_proposed_combo(params, sector_map)
+    if isinstance(combo, str):
+        return GuardDecision(allowed=False, reason=combo, symbol=symbol)
+
+    legs_summary = _combo_leg_summary(combo)
+    proposed_summary = {
+        "ticker": combo.ticker, "asset_type": "OPT_COMBO",
+        "strategy_label": combo.strategy_label, "sector": combo.sector,
+        "contracts": combo.contracts, "net_credit": combo.net_credit,
+        "width": combo.width, "max_loss": combo.max_loss, "intent": "open",
+    }
+
+    # One fresh thesis on the underlying covers the whole combo.
+    ok, thesis_id = has_fresh_open_thesis(combo.ticker)
+    if not ok:
+        return GuardDecision(
+            allowed=False,
+            reason=(f"no open thesis for {combo.ticker} in the last "
+                    f"{THESIS_FRESHNESS_MIN} minutes"),
+            symbol=symbol, ticker=combo.ticker, intent="open",
+            proposed=proposed_summary, legs=legs_summary,
+        )
+
+    opens = load_open_positions(sector_map)
+    ctx = SizingContext(
+        equity=equity, cash=cash, opens=tuple(opens),
+        sector_lookup_available=bool(sector_map),
+    )
+    vs: list[SizingViolation] = list(check_combo(ctx, combo))
+
+    # R5d liquidity on BOTH legs (each must independently pass). A combo only
+    # opens, so liquidity always applies; the protective long wing gets the
+    # same gate (a thin wing you can't price is a spread you skip).
+    for leg in combo.legs:
+        if leg_quotes is not None:
+            q = leg_quotes.get(leg.option_symbol)
+        else:
+            try:
+                q = fetch_option_quote(leg.option_symbol)
+            except Exception:
+                q = None
+        vs += check_option_liquidity(leg.option_symbol, q)
+
+    bs = blockers(vs)
+    warns = tuple(f"{v.rule}: {v.message}" for v in vs if v.severity == "warn")
+
+    if bs:
+        liq_rules = {R5D, R5D_UNQUOTABLE}
+        if all(v.rule in liq_rules for v in bs):
+            reason = "option liquidity gate failed (R5d)"
+        elif any(v.rule == R5E for v in bs):
+            reason = "combo defined-risk gate failed (R5e)"
+        else:
+            reason = "sizing rules violated"
+        return GuardDecision(
+            allowed=False, reason=reason, symbol=symbol, ticker=combo.ticker,
+            intent="open", thesis_id=thesis_id, violations=tuple(vs),
+            warns=warns, equity=equity, open_count=len(opens),
+            proposed=proposed_summary, legs=legs_summary,
+        )
+
+    return GuardDecision(
+        allowed=True, reason="ok", symbol=symbol, ticker=combo.ticker,
+        intent="open", thesis_id=thesis_id, violations=tuple(vs), warns=warns,
+        equity=equity, open_count=len(opens),
+        proposed=proposed_summary, legs=legs_summary,
     )
 
 
