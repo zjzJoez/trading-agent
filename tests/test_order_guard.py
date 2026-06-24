@@ -562,3 +562,44 @@ def test_single_leg_sell_to_open_still_blocked(guard_db):
     })
     assert not d.allowed
     assert any(v.rule == R_NO_SHORT_OPEN for v in d.violations)
+
+
+def test_open_combo_counts_at_max_loss_for_r3(guard_db):
+    """An open combo journaled at net_credit (1.2) must register its true
+    max_loss (380) as existing exposure, not 1.2×100=120 — otherwise a
+    follow-on order under-counts R3 ticker concentration."""
+    import json as _json
+
+    from trading_agent.db import connection
+    from trading_agent.order_guard import load_open_positions, load_sector_map
+    with connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO trades (symbol, asset_type, side, qty, entry_price, "
+            "opened_at, outcome, is_paper) "
+            "VALUES (?, 'OPT', 'SELL', 1, 1.2, ?, 'OPEN', 1)",
+            ("US.SPY260717P00100000",
+             datetime.now(timezone.utc).isoformat()),
+        )
+        tid = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO market_snapshots (trade_id, taken_at, payload) "
+            "VALUES (?, ?, ?)",
+            (tid, datetime.now(timezone.utc).isoformat(),
+             _json.dumps({"combo": True, "max_loss": 380.0, "net_credit": 1.2})),
+        )
+        conn.commit()
+    opens = load_open_positions(load_sector_map())
+    spy = next(p for p in opens if p.ticker == "SPY")
+    assert spy.risk_notional == 380.0
+    assert spy.notional == 380.0  # NOT 120
+
+
+def test_combo_response_returns_guard_verified_thesis_id(guard_db, monkeypatch):
+    """evaluate_combo runs on the underlying's fresh thesis; the placement
+    summary must carry that guard-verified id so the journal FK never breaks
+    on a caller-supplied bad id."""
+    tid = _insert_thesis("SPY")
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    d = _eval_combo(_combo_params())
+    assert d.allowed
+    assert d.thesis_id == tid

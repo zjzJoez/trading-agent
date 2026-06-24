@@ -961,9 +961,26 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                     "[route_exit_or_hold] partial-close rung increment "
                     "%s failed: %s", symbol, e,
                 )
-                # Treat as best-effort — broker already trimmed the position.
-                # Don't fail the whole loop; the next tick re-evaluates.
-                closed_ok = True
+                if action == "EXIT_REGIME_DOWNSIZE":
+                    # The stamp IS the idempotency guard. The broker already
+                    # trimmed, but with regime_downsized_at_label unpersisted
+                    # the NEXT tick would trim ANOTHER 50%. Do NOT mark this a
+                    # clean success — surface a sev-1 alert so the operator
+                    # fixes the unpersisted guard before the position bleeds out.
+                    closed_ok = False
+                    emit(
+                        run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                        event_type="downsize_guard_unpersisted", severity=1,
+                        payload={"symbol": symbol, "trade_id": trade_id,
+                                 "regime_label": dec_regime_label,
+                                 "error": repr(e),
+                                 "risk": "next tick may re-trim 50% — stamp "
+                                         "regime_downsized_at_label manually"},
+                    )
+                else:
+                    # Scale rung: best-effort — broker already trimmed and the
+                    # rung counter is advisory; next tick re-evaluates safely.
+                    closed_ok = True
         else:
             # Full close — the journal is NOT closed here anymore. The close
             # order just placed must be CONFIRMED at the broker's dealt price

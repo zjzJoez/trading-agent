@@ -40,6 +40,7 @@ class _StubTradeCtx:
         self.equity = equity
         self.fail_accinfo = fail_accinfo
         self.place_order_calls: list[dict] = []
+        self.modify_order_calls: list[dict] = []
 
     def accinfo_query(self, **kwargs):
         if self.fail_accinfo:
@@ -54,6 +55,11 @@ class _StubTradeCtx:
             "price": kwargs["price"], "dealt_qty": 0, "dealt_avg_price": 0,
             "order_status": "SUBMITTING",
         }])
+
+    def modify_order(self, **kwargs):
+        self.modify_order_calls.append(kwargs)
+        return 0, pd.DataFrame([{"order_id": kwargs.get("order_id", ""),
+                                 "order_status": "CANCELLED_ALL"}])
 
 
 @pytest.fixture()
@@ -244,9 +250,10 @@ def test_combo_not_defined_risk_blocked_before_broker(stub_ctx, monkeypatch):
     assert "R5e_combo_defined_risk" in {v["rule"] for v in resp["violations"]}
 
 
-def test_combo_short_leg_rejection_rolls_back_long(guard_db, monkeypatch):
-    """Broker fills the long leg then rejects the short — the tool must close
-    the long so nothing is left as an unintended naked long."""
+def test_combo_short_rejection_cancels_working_long(guard_db, monkeypatch):
+    """Long leg is a LIMIT order still WORKING (dealt_qty=0) when the short is
+    rejected → roll back by CANCELLING it, NOT market-selling (a market sell
+    with no position would open a naked short of the long-leg option)."""
     from trading_agent.mcp_servers.moomoo import server
 
     class _FailShortLeg(_StubTradeCtx):
@@ -258,7 +265,8 @@ def test_combo_short_leg_rejection_rolls_back_long(guard_db, monkeypatch):
             return 0, pd.DataFrame([{
                 "order_id": f"STUB-{idx}", "code": kwargs["code"],
                 "trd_side": str(kwargs["trd_side"]), "qty": kwargs["qty"],
-                "price": kwargs["price"], "order_status": "SUBMITTING",
+                "price": kwargs["price"], "dealt_qty": 0,  # WORKING, not filled
+                "order_status": "SUBMITTING",
             }])
 
     ctx = _FailShortLeg()
@@ -272,9 +280,47 @@ def test_combo_short_leg_rejection_rolls_back_long(guard_db, monkeypatch):
     assert resp.get("combo") is False
     assert resp.get("combo_rollback") is True
     assert resp.get("rolled_back_long") is True
-    # 3 calls: long BUY open, short SELL (fails), long SELL-to-close rollback
+    assert resp.get("rollback_action") == "cancelled_working_long"
+    # 2 place_orders (long BUY, short SELL-fail); the working long is CANCELLED,
+    # not sold — exactly ONE modify_order(CANCEL) on the long's order id.
+    assert len(ctx.place_order_calls) == 2
+    assert len(ctx.modify_order_calls) == 1
+    assert ctx.modify_order_calls[0]["order_id"] == "STUB-0"
+
+
+def test_combo_short_rejection_market_sells_filled_long(guard_db, monkeypatch):
+    """Long leg actually FILLED (dealt_qty>0) when the short is rejected → roll
+    back by market-selling the dealt quantity to flatten the real position."""
+    from trading_agent.mcp_servers.moomoo import server
+
+    class _FilledLongFailShort(_StubTradeCtx):
+        def place_order(self, **kwargs):
+            idx = len(self.place_order_calls)
+            self.place_order_calls.append(kwargs)
+            if idx == 1:  # short opening leg rejected
+                return -1, "simulated short-leg rejection"
+            # long leg fills immediately
+            return 0, pd.DataFrame([{
+                "order_id": f"STUB-{idx}", "code": kwargs["code"],
+                "trd_side": str(kwargs["trd_side"]), "qty": kwargs["qty"],
+                "price": kwargs["price"], "dealt_qty": kwargs["qty"],
+                "dealt_avg_price": kwargs["price"], "order_status": "FILLED_ALL",
+            }])
+
+    ctx = _FilledLongFailShort()
+    monkeypatch.setattr(server, "_trade", lambda: ctx)
+    _insert_thesis("SPY")
+    _patch_combo_quote(monkeypatch)
+    resp = server.place_paper_option_combo(
+        short_leg_symbol=_SHORT_PUT, long_leg_symbol=_LONG_PUT,
+        contracts=1, short_price=2.0, long_price=0.8, thesis_id=1,
+    )
+    assert resp.get("combo_rollback") is True
+    assert resp.get("rolled_back_long") is True
+    assert resp.get("rollback_action") == "sold_filled_long"
+    # 3 place_orders: long BUY, short SELL-fail, long SELL-to-close (market)
     assert len(ctx.place_order_calls) == 3
-    assert ctx.place_order_calls[0]["code"] == _LONG_PUT
+    assert ctx.modify_order_calls == []
     assert str(ctx.place_order_calls[2]["trd_side"]).endswith("SELL")
     assert ctx.place_order_calls[2]["code"] == _LONG_PUT
 

@@ -186,7 +186,10 @@ def load_open_positions(sector_map: dict[str, str]) -> list[OpenPosition]:
         rows = conn.execute(
             """
             SELECT t.symbol, t.asset_type, t.side, t.qty, t.entry_price,
-                   t.stop, t.strategy_label, th.ticker
+                   t.stop, t.strategy_label, th.ticker,
+                   (SELECT ms.payload FROM market_snapshots ms
+                    WHERE ms.trade_id = t.id
+                    ORDER BY ms.taken_at DESC LIMIT 1) AS snapshot_payload
             FROM trades t
             LEFT JOIN theses th ON th.id = t.thesis_id
             WHERE t.outcome = 'OPEN'
@@ -199,6 +202,21 @@ def load_open_positions(sector_map: dict[str, str]) -> list[OpenPosition]:
         # what actually trades; a thesis can be wrong or reused.
         ticker = ticker_from_any_symbol(symbol) or r["ticker"] or symbol
         ticker_u = ticker.upper()
+        # Defined-risk combos are journaled with entry_price=net_credit (for
+        # P&L); their true exposure is the max_loss stored in the snapshot.
+        # Without this override R3/R4 would under-count the spread as just the
+        # small credit collected.
+        risk_notional: float | None = None
+        sp = r["snapshot_payload"] if "snapshot_payload" in r.keys() else None
+        if sp:
+            try:
+                payload = json.loads(sp) if isinstance(sp, str) else sp
+                if isinstance(payload, dict) and payload.get("combo"):
+                    ml = payload.get("max_loss")
+                    if ml is not None:
+                        risk_notional = float(ml)
+            except (ValueError, TypeError):
+                pass
         out.append(OpenPosition(
             symbol=symbol,
             ticker=ticker_u,
@@ -208,6 +226,7 @@ def load_open_positions(sector_map: dict[str, str]) -> list[OpenPosition]:
             stop=(float(r["stop"]) if r["stop"] is not None else None),
             sector=sector_map.get(ticker_u),
             strategy_label=r["strategy_label"],
+            risk_notional=risk_notional,
         ))
     return out
 

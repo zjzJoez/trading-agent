@@ -603,7 +603,11 @@ def _run_combo_guard(
 
     decision = evaluate_combo(params, equity=equity, cash=cash, leg_quotes=leg_quotes)
     audit_decision(decision, guard_name="server_order_guard", tool_name=tool_name)
-    summary = decision.proposed or {}
+    summary = dict(decision.proposed or {})
+    # Carry the GUARD-VERIFIED thesis id (from has_fresh_open_thesis) so the
+    # journal always gets an FK-valid id — a caller-supplied bad id would
+    # otherwise silently drop the whole spread on the swallowed FK error.
+    summary["thesis_id"] = decision.thesis_id
     if decision.allowed:
         return (None, summary)
     return (
@@ -674,45 +678,72 @@ def place_paper_option_combo(
     )
     if ret_l != RET_OK:
         return {
-            "thesis_id": thesis_id, "strategy_label": strategy_label,
+            "thesis_id": summary.get("thesis_id") or thesis_id,
+            "strategy_label": strategy_label,
             "combo": False, "virtual_fill_suggested": True,
             "reason": str(df_l),
             "hint": "Long protective leg rejected; nothing opened. Caller may "
                     "record a virtual combo fill via trade-journal-mcp.",
         }
 
-    # 2) SHORT leg. On failure, roll back the long we just opened.
+    # The long leg is a LIMIT order, so RET_OK only means "accepted", not
+    # "filled". Capture its fill state for a correct rollback decision.
+    long_rows = _df_records(df_l)
+    long_row = long_rows[0] if long_rows else {}
+    long_oid = str(long_row.get("order_id") or "")
+    long_dealt = float(long_row.get("dealt_qty") or 0)
+
+    # 2) SHORT leg. On failure, roll back the long correctly: if it actually
+    #    FILLED, flatten the dealt qty at market; if it is still WORKING,
+    #    cancel it (there is no position to flatten — a market sell would open
+    #    a naked short of the long-leg option).
     ret_s, df_s = _trade().place_order(
         price=short_price, qty=contracts, code=short_leg_symbol,
         trd_side=TrdSide.SELL, order_type=OrderType.NORMAL, trd_env=PAPER_ENV,
     )
     if ret_s != RET_OK:
         rolled_back = False
+        rollback_action = "none"
         try:
-            rb_ret, _ = _trade().place_order(
-                price=long_price, qty=contracts, code=long_leg_symbol,
-                trd_side=TrdSide.SELL, order_type=OrderType.MARKET,
-                trd_env=PAPER_ENV,
-            )
-            rolled_back = rb_ret == RET_OK
-        except Exception:
+            if long_dealt > 0:
+                rb_ret, _ = _trade().place_order(
+                    price=long_price, qty=int(long_dealt), code=long_leg_symbol,
+                    trd_side=TrdSide.SELL, order_type=OrderType.MARKET,
+                    trd_env=PAPER_ENV,
+                )
+                rolled_back = rb_ret == RET_OK
+                rollback_action = "sold_filled_long"
+            elif long_oid:
+                rb_ret, _ = _trade().modify_order(
+                    modify_order_op=ModifyOrderOp.CANCEL, order_id=long_oid,
+                    qty=0, price=0, trd_env=PAPER_ENV,
+                )
+                rolled_back = rb_ret == RET_OK
+                rollback_action = "cancelled_working_long"
+            else:
+                rollback_action = "no_long_handle"
+        except Exception as e:
             rolled_back = False
+            rollback_action = f"rollback_error:{e!r}"
         return {
-            "thesis_id": thesis_id, "strategy_label": strategy_label,
-            "combo": False, "combo_rollback": True, "rolled_back_long": rolled_back,
+            "thesis_id": summary.get("thesis_id") or thesis_id,
+            "strategy_label": strategy_label,
+            "combo": False, "combo_rollback": True,
+            "rolled_back_long": rolled_back, "rollback_action": rollback_action,
             "reason": str(df_s),
-            "hint": "Short leg rejected after the long leg filled; submitted a "
-                    "closing order for the long leg. Verify the long position "
-                    "is flat; nothing was left as an unintended naked long.",
+            "hint": "Short leg rejected. The long leg was rolled back per its "
+                    "fill state (filled → market-closed; still working → "
+                    "cancelled). Verify the long position is flat.",
         }
 
     return {
-        "thesis_id": thesis_id, "strategy_label": strategy_label,
+        "thesis_id": summary.get("thesis_id") or thesis_id,
+        "strategy_label": strategy_label,
         "combo": True,
         "net_credit": summary.get("net_credit"),
         "width": summary.get("width"),
         "max_loss": summary.get("max_loss"),
-        "combo_rows": _df_records(df_l) + _df_records(df_s),
+        "combo_rows": long_rows + _df_records(df_s),
     }
 
 

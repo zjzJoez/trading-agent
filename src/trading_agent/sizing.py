@@ -101,10 +101,19 @@ class OpenPosition:
     stop: float | None = None
     sector: str | None = None        # GICS sector, looked up from sectors.csv
     strategy_label: str | None = None
+    # Exposure override (area A). A defined-risk combo is journaled as one OPT
+    # row with entry_price=net_credit (for P&L), but its true capital-at-risk
+    # for R3/R4 is max_loss = (width − net_credit) × 100 × contracts. When set,
+    # `notional` returns this instead of the credit-based product so a combo
+    # counts at its real exposure in opening-rule aggregation.
+    risk_notional: float | None = None
 
     @property
     def notional(self) -> float:
-        """Dollar exposure at entry price. Options multiplied by contract-size 100."""
+        """Dollar exposure. Options multiplied by contract-size 100, unless an
+        explicit risk_notional override is supplied (defined-risk combos)."""
+        if self.risk_notional is not None:
+            return self.risk_notional
         if self.asset_type == "OPT":
             return self.qty * 100.0 * self.entry_price
         return self.qty * self.entry_price

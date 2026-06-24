@@ -169,3 +169,18 @@ def test_combo_unaffected_by_single_leg_short_block():
     naked-short path."""
     vs = check_combo(_ctx(), _put_credit_spread())
     assert all("short_option_open_blocked" not in v.rule for v in vs)
+
+
+def test_open_position_risk_notional_override():
+    """A combo is journaled at net_credit but its R3/R4 exposure must be its
+    max_loss — the risk_notional override carries that through OpenPosition."""
+    combo_row = OpenPosition(
+        symbol="US.SPY260717P00100000", ticker="SPY", asset_type="OPT",
+        qty=1.0, entry_price=1.2, risk_notional=380.0,
+    )
+    assert combo_row.notional == 380.0  # NOT 1.2 × 100 × 1 = 120
+    plain = OpenPosition(
+        symbol="US.SPY260717P00100000", ticker="SPY", asset_type="OPT",
+        qty=1.0, entry_price=1.2,
+    )
+    assert plain.notional == 120.0  # no override → credit-based product

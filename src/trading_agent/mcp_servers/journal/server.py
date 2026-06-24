@@ -487,8 +487,11 @@ def close_trade(
             ).fetchone()[0]
             if remaining_open == 0:
                 cur = conn.execute(
+                    # 'thesis_broken' included so a broken-thesis close still
+                    # records the terminal 'triggered' status (parity with the
+                    # Postgres fill-confirm path).
                     "UPDATE theses SET status = 'triggered' "
-                    "WHERE id = ? AND status = 'open'",
+                    "WHERE id = ? AND status IN ('open','thesis_broken')",
                     (thesis_id,),
                 )
                 thesis_closed = cur.rowcount > 0
