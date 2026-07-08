@@ -1,0 +1,14 @@
+[Unit]
+Description=trading-agent nightly reconciliation @ 22:00 UTC daily
+Requires=trading-agent-reconcile.service
+
+[Timer]
+# 30 min after the EOD review (21:30 UTC) so exit fills from the close have
+# settled. Daily (not Mon..Fri): weekend runs catch Friday-expiry drift like
+# the 2026-07-02 MRVL spread that sat OPEN in the journal for six days.
+OnCalendar=*-*-* 22:00:00 UTC
+Persistent=true
+Unit=trading-agent-reconcile.service
+
+[Install]
+WantedBy=timers.target

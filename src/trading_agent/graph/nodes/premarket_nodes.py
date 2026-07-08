@@ -67,18 +67,36 @@ def _fetch_quotes_batch(tickers: list[str]) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _fetch_recent_filing_headline(ticker: str) -> str | None:
-    """Best-effort: get the most recent EDGAR filing type for context."""
+def _fetch_recent_filing_headlines(tickers: list[str]) -> dict[str, str]:
+    """Best-effort: most recent EDGAR filing type per ticker, for context.
+
+    One event loop for the whole batch; fetches stay sequential inside it
+    (SEC rate limit). get_recent_filings_for_ticker is async — it must be
+    awaited, not called (the old sync call returned a bare coroutine, so
+    every headline was silently missing)."""
+    import asyncio
+
+    from trading_agent.mcp_servers.edgar.server import get_recent_filings_for_ticker
+
+    async def _all() -> dict[str, str]:
+        out: dict[str, str] = {}
+        for ticker in tickers:
+            bare = ticker.split(".", 1)[1] if ticker.startswith("US.") else ticker
+            try:
+                result = await get_recent_filings_for_ticker(ticker=bare, limit=1)
+                rows = result.get("rows") or []
+                if rows:
+                    r = rows[0]
+                    out[ticker] = f"{r.get('form','?')} filed {r.get('filing_date','?')}"
+            except Exception as e:
+                log.warning("[premarket] EDGAR filing headline failed for %s: %s", ticker, e)
+        return out
+
     try:
-        from trading_agent.mcp_servers.edgar.server import get_recent_filings_for_ticker
-        result = get_recent_filings_for_ticker(ticker=ticker, limit=1)
-        filings = result.get("filings") or []
-        if filings:
-            f = filings[0]
-            return f"{f.get('form','?')} filed {f.get('filed','?')}"
-    except Exception:
-        pass
-    return None
+        return asyncio.run(_all())
+    except Exception as e:
+        log.warning("[premarket] EDGAR filing headline batch failed: %s", e)
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -144,9 +162,10 @@ def collect_watchlist_data(state: TradingGraphState) -> dict:
             quote_data[ticker]["momentum_50d"] = d.get("momentum_50d")
 
     # Also grab one recent EDGAR filing per ticker (best-effort, sequential)
-    for ticker in watchlist[:6]:  # limit to top 6 to avoid rate-limit
-        headline = _fetch_recent_filing_headline(ticker)
-        if headline and ticker in quote_data:
+    # — limit to top 6 to avoid rate-limit.
+    headlines = _fetch_recent_filing_headlines(watchlist[:6])
+    for ticker, headline in headlines.items():
+        if ticker in quote_data:
             quote_data[ticker]["recent_filing"] = headline
 
     emit(

@@ -10,8 +10,9 @@ Design invariants:
 - Ticker→CIK mapping is the critical lookup: every SEC API needs CIK, not
   ticker. We hydrate the map at first use from
   https://www.sec.gov/files/company_tickers.json (weekly refresh).
-- All tools are async. The httpx.AsyncClient is created lazily at first
-  tool call and reused for the server lifetime.
+- All tools are async. The httpx.AsyncClient is created lazily per event
+  loop and reused for that loop's lifetime (sync graph nodes wrap each call
+  in asyncio.run(), so one process may see many short-lived loops).
 """
 from __future__ import annotations
 
@@ -50,8 +51,13 @@ DEFAULT_CACHE_DIR = CONFIG.filings_cache_dir
 
 mcp = FastMCP("edgar-mcp")
 
-_client: httpx.AsyncClient | None = None
-_client_lock = asyncio.Lock()
+# httpx.AsyncClient binds to the event loop it first runs on. Sync callers
+# (graph nodes) wrap each call in asyncio.run(), so a process can see many
+# short-lived loops — cache one client per loop and evict entries whose loop
+# has closed, otherwise the second asyncio.run() in a process dies with
+# "Event loop is closed" (observed 2026-07-08: premarket filing headlines
+# silently missing for every ticker after the first).
+_clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
 _rate_sem = asyncio.Semaphore(SEC_CONCURRENCY)
 
 # Ticker→CIK map is populated at first lookup.
@@ -62,19 +68,21 @@ _ticker_map_lock = asyncio.Lock()
 # --------- plumbing ---------
 
 async def _client_singleton() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        async with _client_lock:
-            if _client is None:
-                _client = httpx.AsyncClient(
-                    headers={
-                        "User-Agent": CONFIG.sec_user_agent,
-                        "Accept-Encoding": "gzip, deflate",
-                    },
-                    timeout=httpx.Timeout(30.0, connect=10.0),
-                    follow_redirects=True,
-                )
-    return _client
+    loop = asyncio.get_running_loop()
+    client = _clients.get(loop)
+    if client is None or client.is_closed:
+        for stale in [lp for lp in _clients if lp.is_closed()]:
+            del _clients[stale]
+        client = httpx.AsyncClient(
+            headers={
+                "User-Agent": CONFIG.sec_user_agent,
+                "Accept-Encoding": "gzip, deflate",
+            },
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+        )
+        _clients[loop] = client
+    return client
 
 
 def _cache_path(url: str, suffix: str = ".bin") -> Path:

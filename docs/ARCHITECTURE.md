@@ -236,8 +236,14 @@ block) and runs **inside** `place_paper_order` / `place_paper_option_order`
 in the moomoo MCP server — the authoritative choke point covering the
 autonomous graph, scripts, and any MCP client, not just Claude Code
 sessions. Every evaluation is audited to the `hook_audit_log` table;
-`jobs/reconcile_order_guard.py` (nightly launchd) alerts on any opening
-fill without a matching evaluation row.
+`jobs/reconcile_order_guard.py` (nightly: Mac launchd 08:30 GMT+8 + EC2
+systemd timer 22:00 UTC) alerts on any opening fill without a matching
+evaluation row, and reconciles broker paper positions against journal
+OPEN rows across both stores (local sqlite + Postgres `journal_trades`)
+— a broker position with no OPEN row, an OPEN row with no position, or a
+net-quantity mismatch all page ntfy `risk` at priority 5. Hosts that
+cannot see every journal store (the Mac can't reach the EC2 Postgres)
+only check the journal→broker direction to avoid false alarms.
 
 Phase 2 extends `pretool_order_guard.py` to also accept the autonomous-order
 path: requires a valid `risk_decision_id` referencing a non-expired
