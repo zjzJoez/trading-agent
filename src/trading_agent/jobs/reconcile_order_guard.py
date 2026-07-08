@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -356,19 +357,31 @@ def main(argv: list[str] | None = None) -> int:
     position_stores: list[str] = []
     position_findings: list[dict] = []
     if not args.skip_positions:
-        broker = _load_broker_positions()
-        if broker is not None:
-            positions_checked = True
-            journal_rows = _load_open_rows_sqlite()
-            position_stores.append("sqlite")
-            pg_rows = _load_open_rows_pg()
-            if pg_rows is not None:
-                journal_rows.extend(pg_rows)
-                position_stores.append("postgres")
-            position_findings = compare_positions(
-                broker, journal_rows,
-                all_stores_visible=pg_rows is not None,
-            )
+        try:
+            broker = _load_broker_positions()
+            if broker is not None:
+                positions_checked = True
+                journal_rows = _load_open_rows_sqlite()
+                position_stores.append("sqlite")
+                pg_rows = _load_open_rows_pg()
+                if pg_rows is not None:
+                    journal_rows.extend(pg_rows)
+                    position_stores.append("postgres")
+                position_findings = compare_positions(
+                    broker, journal_rows,
+                    all_stores_visible=pg_rows is not None,
+                )
+        finally:
+            # The moomoo SDK context spawns non-daemon threads that hang the
+            # interpreter at exit (the same failure orchestrator's
+            # _shutdown_resources handles) — close it as soon as we're done.
+            try:
+                from trading_agent.mcp_servers.moomoo.server import (
+                    shutdown as _mm_shutdown,
+                )
+                _mm_shutdown()
+            except Exception:
+                pass
 
     all_findings = findings + position_findings
     summary = {
@@ -418,4 +431,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    # Belt-and-braces vs any library non-daemon thread we don't know about:
+    # flush, then os._exit so launchd/systemd oneshots never hang in
+    # threading._shutdown() (observed 2026-07-08: the SDK context kept the
+    # process alive 5+ min after the report printed; mirror_real_fills has
+    # been stuck the same way for a day).
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(rc)
