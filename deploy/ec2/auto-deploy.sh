@@ -54,7 +54,11 @@ _notify_ops() {
 # subsequent failures within the same SHA only ping once per hour at most.
 # After 3 consecutive failures on the same SHA, the retry cadence stops
 # being important — operator already knows it's broken.
-FAILURE_STATE_DIR="/var/lib/trading-agent-auto-deploy"
+# data/ is gitignored, so state files here never dirty the tree that
+# `git pull --ff-only` needs clean. (/var/lib needs root; this service
+# runs as ubuntu — the old path made every write below fail, and under
+# `set -e` that aborted the failure handler itself.)
+FAILURE_STATE_DIR="$REPO_DIR/data/auto-deploy-state"
 _ntfy_failure_with_backoff() {
     local body="$1"
     mkdir -p "$FAILURE_STATE_DIR" 2>/dev/null || true
@@ -70,8 +74,9 @@ _ntfy_failure_with_backoff() {
         count=$(cat "$count_marker" 2>/dev/null || echo 0)
     fi
     count=$((count + 1))
-    echo "$count" > "$count_marker"
-    touch "$marker"
+    # Best-effort: a state write must never kill the failure path (set -e).
+    echo "$count" > "$count_marker" 2>/dev/null || true
+    touch "$marker" 2>/dev/null || true
     local elapsed=$((now - last_ts))
     # First failure → priority 5. Subsequent failures on the same SHA within
     # 1 hour → silent. After 1 hour → priority 4 reminder.
