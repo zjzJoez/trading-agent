@@ -6,9 +6,11 @@ open) and bought the pre-market spike, which faded at the open. Trading
 only in regular hours against live quotes is the fix.
 
 Primary: pandas_market_calendars (a project dep) — handles DST + holidays
-+ early closes. Fallback: a plain 13:30-20:00 UTC weekday window (correct
-during US EDT, ~1h off during EST but never lets a weekend/clearly-closed
-session through).
++ early closes. Fallback: the plain 09:30-16:00 America/New_York weekday
+window built with stdlib zoneinfo — DST-correct year-round (a fixed
+13:30-20:00 UTC window would read OPEN at 08:30 ET during EST, exactly
+when the winter premarket digest fires), just without holidays / early
+closes.
 """
 from __future__ import annotations
 
@@ -19,14 +21,6 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
-
-
-def _fallback_is_open(now_utc: datetime) -> bool:
-    """Plain UTC window: Mon-Fri 13:30-20:00 UTC (US regular hours in EDT)."""
-    if now_utc.weekday() >= 5:  # Sat/Sun
-        return False
-    t = now_utc.timetz().replace(tzinfo=None)
-    return time(13, 30) <= t <= time(20, 0)
 
 
 def _coerce_utc(dt: datetime | None) -> datetime:
@@ -57,7 +51,8 @@ def us_session_bounds(now_utc: datetime | None = None) -> tuple[datetime, dateti
     "Today" is the America/New_York calendar date of ``now_utc`` (a UTC
     evening after an ET midnight belongs to the NEXT session). Half-days
     come back with their real early close. Best-effort: any calendar
-    error degrades to the plain 13:30-20:00 UTC weekday window. Never
+    error degrades to the plain 09:30-16:00 America/New_York weekday
+    window (DST-correct via zoneinfo; no holidays / early closes). Never
     raises.
     """
     now_utc = _coerce_utc(now_utc)
@@ -73,12 +68,12 @@ def us_session_bounds(now_utc: datetime | None = None) -> tuple[datetime, dateti
         market_close = sched.iloc[0]["market_close"].to_pydatetime()
         return market_open, market_close
     except Exception as e:
-        log.warning("[market_calendar] mcal schedule failed (%s) — UTC fallback", e)
+        log.warning("[market_calendar] mcal schedule failed (%s) — ET fallback", e)
         if day.weekday() >= 5:
             return None
         return (
-            datetime.combine(day, time(13, 30), tzinfo=timezone.utc),
-            datetime.combine(day, time(20, 0), tzinfo=timezone.utc),
+            datetime.combine(day, time(9, 30), tzinfo=ET).astimezone(timezone.utc),
+            datetime.combine(day, time(16, 0), tzinfo=ET).astimezone(timezone.utc),
         )
 
 

@@ -191,6 +191,53 @@ class TestDeclineCooldown:
         with patch("trading_agent.store.postgres.cursor", return_value=ctx):
             return _in_decline_cooldown("NVDA", now_utc=self.NOW)
 
+    def _rows_cursor(self, rows):
+        """Fake cursor that applies the query's reason-exclusion plus
+        ORDER BY ts DESC LIMIT 1 to `rows` of (ts, event_type, reason) —
+        so the tests exercise the SQL filter's semantics, and fail if the
+        no_parsed_output exclusion ever drops out of the query text."""
+        cur = MagicMock()
+
+        def _execute(sql, params=None):
+            assert "no_parsed_output" in sql, (
+                "decline-cooldown query must exclude LLM parse failures"
+            )
+            kept = sorted(
+                (r for r in rows if (r[2] or "") != "no_parsed_output"),
+                key=lambda r: r[0],
+                reverse=True,
+            )
+            cur.fetchone.return_value = (kept[0][0], kept[0][1]) if kept else None
+
+        cur.execute.side_effect = _execute
+        ctx = MagicMock()
+        ctx.__enter__.return_value = cur
+        ctx.__exit__.return_value = False
+        return ctx
+
+    def test_no_parsed_output_decline_is_not_a_considered_decline(self):
+        """A declined/reason=no_parsed_output event 1 trading day ago is an
+        LLM parse FAILURE (trade_nodes.build_trade_proposal), not the
+        pipeline saying no — it must NOT put the ticker in cooldown."""
+        from trading_agent.graph.nodes.premarket_nodes import _in_decline_cooldown
+        ctx = self._rows_cursor([
+            (datetime(2026, 6, 9, 15, 0, tzinfo=timezone.utc),
+             "declined", "no_parsed_output"),
+        ])
+        with patch("trading_agent.store.postgres.cursor", return_value=ctx):
+            assert _in_decline_cooldown("NVDA", now_utc=self.NOW) is None
+
+    def test_genuine_decline_still_cooldowns_under_reason_filter(self):
+        from trading_agent.graph.nodes.premarket_nodes import _in_decline_cooldown
+        ctx = self._rows_cursor([
+            (datetime(2026, 6, 9, 15, 0, tzinfo=timezone.utc),
+             "declined", "no edge vs regime"),
+        ])
+        with patch("trading_agent.store.postgres.cursor", return_value=ctx):
+            res = _in_decline_cooldown("NVDA", now_utc=self.NOW)
+        assert res is not None
+        assert res["trading_days_ago"] == 1
+
     def test_declined_one_trading_day_ago_in_cooldown(self):
         # Tue 6/9 → Wed 6/10 = 1 trading day ≤ 3 → blocked
         res = self._check(datetime(2026, 6, 9, 15, 0, tzinfo=timezone.utc))
@@ -278,6 +325,78 @@ class TestDeclineCooldown:
         assert len(skips) == 1
         assert skips[0]["payload"]["ticker"] == "NVDA"
         assert skips[0]["payload"]["declined_at"] == "2026-06-09T15:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# Dispatch guard ordering + empty-scan decision events
+# ---------------------------------------------------------------------------
+
+class TestDispatchGuardOrdering:
+    """The regular-hours gate must run BEFORE halt/soak/regime, and an empty
+    in-session scan must still emit a dispatch decision — both keep the
+    scan_dispatch_liveness outside_regular_hours exclusion sound: every
+    non-outside_regular_hours skip provably comes from an in-session scan."""
+
+    def _run(self, candidates, market_open, halt=False):
+        state = _base_state(
+            candidates=candidates,
+            regime={"label": "BULL_TREND", "gate": {"allow_new_entries": True}},
+        )
+        emitted: list[dict] = []
+        from trading_agent.graph.nodes.premarket_nodes import (
+            _dispatch_candidate_entry_if_eligible,
+        )
+        with patch("trading_agent.graph.nodes.premarket_nodes.emit",
+                   side_effect=lambda **kw: emitted.append(kw)):
+            with patch("trading_agent.market_calendar.is_us_market_open",
+                       return_value=market_open):
+                with patch("pathlib.Path.exists", return_value=halt):
+                    _dispatch_candidate_entry_if_eligible(
+                        state, state["candidates"], state["regime"])
+        return emitted
+
+    def test_market_closed_with_halt_flag_reads_outside_regular_hours(self):
+        """Market closed + halt flag set → the 08:30 digest scan must emit
+        outside_regular_hours (which liveness excludes), NOT halt_flag_set
+        (which would count as an executing-scan decision and mask two dead
+        executing scans during a halted stretch)."""
+        emitted = self._run(
+            candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "x"}],
+            market_open=False, halt=True,
+        )
+        skips = [e for e in emitted if e["event_type"] == "candidate_entry_skipped"]
+        assert len(skips) == 1
+        assert skips[0]["payload"]["reason"] == "outside_regular_hours"
+
+    def test_market_open_with_halt_flag_still_reads_halt(self):
+        """Dispatch outcome unchanged by the re-order: in-session + halted
+        still skips with halt_flag_set."""
+        emitted = self._run(
+            candidates=[{"ticker": "NVDA", "score": 0.9, "reason": "x"}],
+            market_open=True, halt=True,
+        )
+        skips = [e for e in emitted if e["event_type"] == "candidate_entry_skipped"]
+        assert len(skips) == 1
+        assert skips[0]["payload"]["reason"] == "halt_flag_set"
+
+    def test_empty_in_session_scan_emits_no_candidates(self):
+        """Zero candidates during regular hours → emit a no_candidates skip
+        (a decision event) instead of returning silently, so two completed-
+        but-empty executing scans don't trip a false 17:00 ET liveness
+        alert on a merely quiet day."""
+        emitted = self._run(candidates=[], market_open=True)
+        skips = [e for e in emitted if e["event_type"] == "candidate_entry_skipped"]
+        assert len(skips) == 1
+        assert skips[0]["payload"]["reason"] == "no_candidates"
+
+    def test_empty_closed_scan_reads_outside_regular_hours(self):
+        """Zero candidates while the market is closed → the (excluded)
+        outside_regular_hours reason, not no_candidates — the 08:30 digest
+        must never count toward executing-scan liveness."""
+        emitted = self._run(candidates=[], market_open=False)
+        skips = [e for e in emitted if e["event_type"] == "candidate_entry_skipped"]
+        assert len(skips) == 1
+        assert skips[0]["payload"]["reason"] == "outside_regular_hours"
 
 
 # ---------------------------------------------------------------------------

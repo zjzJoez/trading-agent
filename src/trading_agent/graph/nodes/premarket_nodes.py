@@ -634,6 +634,7 @@ def _dispatch_candidate_entry_if_eligible(
     """Spin off the candidate_entry subgraph for the highest-scoring candidate.
 
     Conditions for dispatch (all must hold):
+      * market in its regular cash session (checked FIRST — see below)
       * at least one candidate, top score ≥ DISPATCH_MIN_SCORE
       * halt flag absent
       * soak phase allows new entries
@@ -650,10 +651,42 @@ def _dispatch_candidate_entry_if_eligible(
     run_id = state["run_id"]
     trigger = state["trigger"]
 
-    if not candidates:
+    # ---- Global guards (checked ONCE for the whole scan) ----
+    # Regular-hours gate — FIRST, before every other guard. The 08:30 ET
+    # premarket scan runs an hour before the 09:30 ET open — dispatching/
+    # executing then buys pre-market spikes at unreliable quotes (6/2 SNOW:
+    # bought ~$273 pre-market, faded to $256 at open). When the market is
+    # closed the scan still ranks + sends its digest (awareness), but does
+    # NOT dispatch. The 10:15 and 13:30 ET scans run in regular hours and
+    # are the ones that actually trade. Routing is by MARKET STATE, not
+    # wall-clock: any scan that happens to run while the market is open
+    # will dispatch (holidays / half-days after the early close correctly
+    # degrade to digest-only).
+    #
+    # Ordering matters for scan_dispatch_liveness: it excludes ONLY
+    # skipped-with-reason=outside_regular_hours events, so every other skip
+    # reason must provably come from an in-session scan. Checking this gate
+    # first guarantees that — a halted/soaked/regime-blocked 08:30 digest
+    # emits outside_regular_hours (excluded), never a reason that would
+    # mask two dead executing scans.
+    from trading_agent.market_calendar import is_us_market_open
+    if not is_us_market_open():
+        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+             event_type="candidate_entry_skipped",
+             payload={"reason": "outside_regular_hours",
+                      "note": "digest-only; dispatch deferred to the open scan"})
         return
 
-    # ---- Global guards (checked ONCE for the whole scan) ----
+    # Empty in-session scan: emit (don't return silently) so a trading day
+    # whose two executing scans both completed with zero candidates still
+    # produces dispatch-decision events — otherwise scan_dispatch_liveness
+    # would false-alarm at 17:00 ET on a merely quiet day.
+    if not candidates:
+        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+             event_type="candidate_entry_skipped",
+             payload={"reason": "no_candidates"})
+        return
+
     # Halt flag
     from pathlib import Path
     halt_flag = Path.home() / "trading-agent" / "data" / "halt.flag"
@@ -681,23 +714,6 @@ def _dispatch_candidate_entry_if_eligible(
         emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
              event_type="candidate_entry_skipped",
              payload={"reason": "regime_blocks_new_entries", "regime_label": regime.get("label")})
-        return
-
-    # Regular-hours gate. The 08:30 ET premarket scan runs an hour before
-    # the 09:30 ET open — dispatching/executing then buys pre-market spikes
-    # at unreliable quotes (6/2 SNOW: bought ~$273 pre-market, faded to $256
-    # at open). When the market is closed the scan still ranks + sends its
-    # digest (awareness), but does NOT dispatch. The 10:15 and 13:30 ET
-    # scans run in regular hours and are the ones that actually trade.
-    # Routing is by MARKET STATE, not wall-clock: any scan that happens to
-    # run while the market is open will dispatch (holidays / half-days
-    # after the early close correctly degrade to digest-only).
-    from trading_agent.market_calendar import is_us_market_open
-    if not is_us_market_open():
-        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-             event_type="candidate_entry_skipped",
-             payload={"reason": "outside_regular_hours",
-                      "note": "digest-only; dispatch deferred to the open scan"})
         return
 
     # ---- Remaining position budget (R2 cap) ----
@@ -988,6 +1004,11 @@ def _in_decline_cooldown(
       * ``declined``       — build_trade_proposal: trader-synthesizer said no
       * ``veto_persisted`` — persist_veto: risk council / guardrails VETO
 
+    Excluded: ``declined`` events with reason='no_parsed_output'. Those are
+    LLM parse FAILURES (build_trade_proposal got no usable output), not the
+    pipeline looking at the setup and saying no — an infrastructure hiccup
+    must not lock a name out for 3 trading days.
+
     Age is measured in TRADING days via market_calendar.trading_days_between
     — a Friday decline is 1 trading day old on Monday, not 3. The 14-day
     calendar bound on the query comfortably covers 3 trading days plus any
@@ -1008,6 +1029,7 @@ def _in_decline_cooldown(
                 SELECT ts, event_type FROM agent_events
                 WHERE event_type IN ('declined', 'veto_persisted')
                   AND UPPER(payload->>'ticker') = %s
+                  AND COALESCE(payload->>'reason', '') <> 'no_parsed_output'
                   AND ts > NOW() - interval '14 days'
                 ORDER BY ts DESC
                 LIMIT 1
