@@ -272,6 +272,90 @@ def spec_for_label(label: str | None) -> StrategySpec | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Schema-level band enforcement — proposal validation, BEFORE sizing
+# ---------------------------------------------------------------------------
+
+
+def spec_band_violations(
+    *,
+    strategy_label: str | None,
+    asset_type: str | None,
+    option_dte: int | None,
+    option_delta: float | None,
+) -> list[dict[str, Any]]:
+    """DTE/delta bands an OPT proposal must satisfy at PROPOSAL time.
+
+    Mapped labels enforce their spec's declared ``dte_range`` /
+    ``abs_delta_range``, intersected with the global R5 band — a spec can
+    only TIGHTEN the policy gates, never relax them (R5's 14–60 DTE /
+    0.25–0.65 |delta| remain the outer bound; convexity's 21–45 DTE /
+    0.30–0.55 |delta| is the binding inner band for mapped labels).
+
+    UNMAPPED-LABEL POLICY: an unmapped/legacy strategy_label is NOT a free
+    pass. An OPT proposal whose label maps to no spec falls back to the
+    global R5 band at this same layer, so the 2026-07-08 CRNX shape
+    (label 'momentum-continuation-ITM-call', delta 0.815) dies at proposal
+    validation regardless of what the label says.
+
+    A missing dte/delta skips only that band — matching sizing's R5
+    None-semantics; sizing remains the enforcement of record downstream.
+    Non-OPT proposals have no option bands → always [].
+    """
+    if (asset_type or "").upper() != "OPT":
+        return []
+    # Lazy import mirrors sizing's own lazy import of this module — keeps
+    # the two policy modules free of an import cycle.
+    from trading_agent.sizing import (
+        OPTION_DELTA_MAX,
+        OPTION_DELTA_MIN,
+        OPTION_DTE_MAX,
+        OPTION_DTE_MIN,
+    )
+
+    dte_lo, dte_hi = float(OPTION_DTE_MIN), float(OPTION_DTE_MAX)
+    delta_lo, delta_hi = float(OPTION_DELTA_MIN), float(OPTION_DELTA_MAX)
+    spec = spec_for_label(strategy_label)
+    source = "global_r5"
+    if spec is not None:
+        source = spec.name
+        spec_dte = spec.entry_gates.get("dte_range")
+        if spec_dte is not None:
+            dte_lo = max(dte_lo, float(spec_dte[0]))
+            dte_hi = min(dte_hi, float(spec_dte[1]))
+        spec_delta = spec.entry_gates.get("abs_delta_range")
+        if spec_delta is not None:
+            delta_lo = max(delta_lo, float(spec_delta[0]))
+            delta_hi = min(delta_hi, float(spec_delta[1]))
+
+    violations: list[dict[str, Any]] = []
+    if option_dte is not None and not (dte_lo <= int(option_dte) <= dte_hi):
+        violations.append({
+            "band": "dte_range",
+            "spec": source,
+            "bounds": [dte_lo, dte_hi],
+            "value": int(option_dte),
+            "message": (
+                f"option_dte {int(option_dte)} outside {source} band "
+                f"[{dte_lo:g},{dte_hi:g}]"
+            ),
+        })
+    if option_delta is not None:
+        abs_d = abs(float(option_delta))
+        if not (delta_lo <= abs_d <= delta_hi):
+            violations.append({
+                "band": "abs_delta_range",
+                "spec": source,
+                "bounds": [delta_lo, delta_hi],
+                "value": abs_d,
+                "message": (
+                    f"|option_delta| {abs_d:.3f} outside {source} band "
+                    f"[{delta_lo:g},{delta_hi:g}]"
+                ),
+            })
+    return violations
+
+
 __all__ = [
     "ExpectancyProfile",
     "REGISTRY",
@@ -279,5 +363,6 @@ __all__ = [
     "breakeven_wr_gross",
     "breakeven_wr_net",
     "round_trip_friction_r",
+    "spec_band_violations",
     "spec_for_label",
 ]

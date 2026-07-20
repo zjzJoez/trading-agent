@@ -16,6 +16,7 @@ from trading_agent.strategy_specs import (
     breakeven_wr_gross,
     breakeven_wr_net,
     round_trip_friction_r,
+    spec_band_violations,
     spec_for_label,
 )
 
@@ -135,6 +136,90 @@ def test_exact_spec_name_resolves_directly():
 ])
 def test_unknown_labels_are_legacy(label):
     assert spec_for_label(label) is None
+
+
+# ---------------------------------------------------------------------------
+# spec_band_violations — schema-level band enforcement (Week-1 Step 6b)
+# ---------------------------------------------------------------------------
+
+
+def test_band_mapped_label_tightens_to_spec_dte():
+    """DTE 50 is inside the global R5 band (14–60) but outside convexity's
+    declared 21–45 — the spec's inner band must bind for mapped labels."""
+    v = spec_band_violations(
+        strategy_label="directional_long_call", asset_type="OPT",
+        option_dte=50, option_delta=0.45,
+    )
+    assert [x["band"] for x in v] == ["dte_range"]
+    assert v[0]["spec"] == "convexity_long_premium"
+    assert v[0]["bounds"] == [21.0, 45.0]
+
+
+def test_band_mapped_label_tightens_to_spec_delta():
+    """|delta| 0.60 passes R5's 0.25–0.65 but not convexity's 0.30–0.55."""
+    v = spec_band_violations(
+        strategy_label="pullback_reversal", asset_type="OPT",
+        option_dte=30, option_delta=0.60,
+    )
+    assert [x["band"] for x in v] == ["abs_delta_range"]
+    assert v[0]["spec"] == "convexity_long_premium"
+    assert v[0]["bounds"] == [0.30, 0.55]
+
+
+def test_band_mapped_label_inside_spec_passes():
+    assert spec_band_violations(
+        strategy_label="directional_long_call", asset_type="OPT",
+        option_dte=30, option_delta=-0.45,   # abs() — puts pass too
+    ) == []
+
+
+def test_band_unmapped_label_falls_back_to_global_r5():
+    """CRNX 2026-07-08 regression shape: an UNMAPPED legacy label is not a
+    free pass — delta 0.815 dies against the global R5 band (0.25–0.65)."""
+    v = spec_band_violations(
+        strategy_label="momentum-continuation-ITM-call", asset_type="OPT",
+        option_dte=44, option_delta=0.815,
+    )
+    assert [x["band"] for x in v] == ["abs_delta_range"]
+    assert v[0]["spec"] == "global_r5"
+    assert v[0]["bounds"] == [0.25, 0.65]
+    assert v[0]["value"] == pytest.approx(0.815)
+
+
+def test_band_unmapped_label_inside_global_band_passes():
+    assert spec_band_violations(
+        strategy_label="momentum-continuation-ITM-call", asset_type="OPT",
+        option_dte=44, option_delta=0.60,
+    ) == []
+
+
+def test_band_spec_never_relaxes_below_global():
+    """credit_put_spread declares 0.20–0.30, but R5's 0.25 floor wins: the
+    effective band is the intersection [0.25, 0.30] — specs only tighten."""
+    v = spec_band_violations(
+        strategy_label="credit_put_spread_30_45", asset_type="OPT",
+        option_dte=35, option_delta=0.22,
+    )
+    assert [x["band"] for x in v] == ["abs_delta_range"]
+    assert v[0]["bounds"] == [0.25, 0.30]
+
+
+def test_band_stock_and_missing_greeks_skip():
+    # STK proposals have no option bands
+    assert spec_band_violations(
+        strategy_label="trend", asset_type="STK",
+        option_dte=None, option_delta=None,
+    ) == []
+    # Missing dte/delta skip only that band (matches sizing R5 semantics)
+    assert spec_band_violations(
+        strategy_label="momentum-continuation-ITM-call", asset_type="OPT",
+        option_dte=None, option_delta=None,
+    ) == []
+    v = spec_band_violations(
+        strategy_label="momentum-continuation-ITM-call", asset_type="OPT",
+        option_dte=None, option_delta=0.815,
+    )
+    assert [x["band"] for x in v] == ["abs_delta_range"]
 
 
 # ---------------------------------------------------------------------------

@@ -891,7 +891,24 @@ def execute_paper_order(state: TradingGraphState) -> dict:
         approved_qty = cap
 
     if approved_qty <= 0:
+        # Was a silent return — an APPROVE that arrives here with qty 0
+        # (regime downsize to 0, tiny-paper clamp, sizing infeasible with
+        # council override) left no Postgres trace at all. Emit a dedicated
+        # event so "approved but nothing placed" is auditable.
         log.info("[execute_paper_order] approved_qty=0 — nothing to place")
+        sizing = state.get("sizing") or {}
+        violations = sizing.get("r1_r6_violations") or []
+        emit(
+            run_id=run_id, trigger=trigger, agent="execute_paper_order",
+            event_type="order_skipped_zero_qty", severity=1,
+            payload={
+                "ticker": proposal.get("ticker"),
+                "requested_qty": proposal.get("qty"),
+                "risk_decision": risk.get("decision"),
+                "blockers": [v for v in violations if v.get("severity") == "block"],
+                "warnings": [v for v in violations if v.get("severity") == "warn"],
+            },
+        )
         return {}
 
     raw_symbol = proposal.get("symbol", "")
@@ -1661,6 +1678,49 @@ def build_trade_proposal(state: TradingGraphState) -> dict:
         proposal_dict["option_dte"] = int(p.option_dte)
     if p.option_iv is not None:
         proposal_dict["option_iv"] = float(p.option_iv)
+
+    # Schema-level spec-band gate (Week-1 Step 6b) — backstop to the same
+    # check inside TraderProposal's validator. Any proposal shape that
+    # reaches here outside its band (a schema-layer regression, a replayed
+    # legacy shape like the 2026-07-08 CRNX 0.815-delta) dies HERE, before
+    # a thesis exists and before sizing ever sees it. Unmapped labels fall
+    # back to the global R5 band — see spec_band_violations' policy note.
+    from trading_agent.strategy_specs import spec_band_violations
+    band_violations = spec_band_violations(
+        strategy_label=proposal_dict.get("strategy_label"),
+        asset_type=proposal_dict.get("asset_type"),
+        option_dte=proposal_dict.get("option_dte"),
+        option_delta=proposal_dict.get("option_delta"),
+    )
+    if band_violations:
+        emit(
+            run_id=run_id, trigger=trigger, agent="build_trade_proposal",
+            event_type="proposal_rejected_spec_band", severity=1,
+            payload={
+                "ticker": proposal_dict.get("ticker"),
+                "symbol": proposal_dict.get("symbol"),
+                "strategy_label": proposal_dict.get("strategy_label"),
+                "violations": band_violations,
+                "proposal_shape": {
+                    "asset_type": proposal_dict.get("asset_type"),
+                    "option_dte": proposal_dict.get("option_dte"),
+                    "option_delta": proposal_dict.get("option_delta"),
+                },
+            },
+        )
+        # Still capture the shape in the shadow log — the null test wants
+        # every LLM proposal, including the ones the gates killed.
+        from trading_agent.shadow.persist import (
+            finalize_shadow_proposal,
+            insert_shadow_proposal,
+        )
+        sid = insert_shadow_proposal(
+            run_id=run_id, trigger=trigger,
+            proposal=proposal_dict, regime=regime,
+        )
+        if sid is not None:
+            finalize_shadow_proposal(sid, final_action="REJECTED_SPEC_BAND")
+        return {"research": {**research, "trader_decline": True}}
 
     emit(
         run_id=run_id, trigger=trigger, agent="build_trade_proposal",

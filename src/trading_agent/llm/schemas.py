@@ -434,6 +434,29 @@ class TraderProposal(_Strict):
                     f"{min_rr}."
                 )
 
+        # Spec-band gate (Week-1 Step 6b): a label mapped to a StrategySpec
+        # must sit inside the spec's declared DTE/delta bands; an UNMAPPED
+        # label on an OPT proposal falls back to the global R5 band — no
+        # label is a free pass. Raising HERE keeps the failure inside the
+        # router's schema-retry loop (same rationale as _effective_min_rr):
+        # the LLM can pick a compliant contract in-flight instead of dying
+        # at build_trade_proposal's post-parse backstop.
+        try:
+            from trading_agent.strategy_specs import spec_band_violations
+            band_violations = spec_band_violations(
+                strategy_label=self.strategy_label,
+                asset_type=self.asset_type,
+                option_dte=self.option_dte,
+                option_delta=self.option_delta,
+            )
+        except Exception:  # noqa: BLE001 — schema validation must never crash
+            band_violations = []
+        if band_violations:
+            raise ValueError(
+                "; ".join(str(v["message"]) for v in band_violations)
+                + ". Pick a contract inside the band."
+            )
+
         # If exit_plan is supplied, its hard_stop/hard_target should match
         # the top-level stop/target, AND its direction must match.
         if self.exit_plan is not None:

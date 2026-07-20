@@ -2003,3 +2003,142 @@ class TestSoakGates:
                                 from trading_agent.graph.nodes.trade_nodes import deterministic_sizing
                                 result = deterministic_sizing(state)
         assert result["sizing"]["approved_qty"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# execute_paper_order — zero-qty audit event (Week-1 Step 6a)
+# ---------------------------------------------------------------------------
+
+class TestExecuteZeroQty:
+    def test_zero_qty_emits_dedicated_event_and_skips_order(self):
+        """approved_qty=0 must leave a Postgres trace, not a silent return."""
+        state = _base_state(
+            trigger="candidate_entry",
+            risk={"decision": "APPROVE", "approved_qty": 0},
+            proposal={"ticker": "NVDA", "symbol": "US.NVDA260821C00180000",
+                      "qty": 0.0, "asset_type": "OPT"},
+            sizing={"r1_r6_violations": [
+                {"rule": "R5_option_policy", "severity": "block",
+                 "message": "options: |delta| 0.82 outside [0.25,0.65]"},
+                {"rule": "R7_target_missing", "severity": "warn",
+                 "message": "no target"},
+            ], "approved_qty": 0.0, "infeasible": True},
+        )
+        with patch("trading_agent.graph.nodes.trade_nodes.emit") as mock_emit:
+            with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                with patch("trading_agent.learning.soak.tiny_paper_qty_cap", return_value=None):
+                    from trading_agent.graph.nodes.trade_nodes import execute_paper_order
+                    result = execute_paper_order(state)
+        # No order path taken: node returns empty and emits exactly the
+        # zero-qty event (any order attempt would emit other events too).
+        assert result == {}
+        events = [c.kwargs["event_type"] for c in mock_emit.call_args_list]
+        assert events == ["order_skipped_zero_qty"]
+        payload = mock_emit.call_args_list[0].kwargs["payload"]
+        assert payload["ticker"] == "NVDA"
+        assert payload["requested_qty"] == 0.0
+        assert payload["risk_decision"] == "APPROVE"
+        assert [b["rule"] for b in payload["blockers"]] == ["R5_option_policy"]
+        assert [w["rule"] for w in payload["warnings"]] == ["R7_target_missing"]
+
+    def test_positive_qty_does_not_emit_skip_event(self):
+        """Sanity: the new event never fires when there is qty to place.
+        (Symbol parse fails downstream → symbol_parse_failed, not skip.)"""
+        state = _base_state(
+            trigger="candidate_entry",
+            risk={"decision": "APPROVE", "approved_qty": 1},
+            proposal={"ticker": "NVDA", "symbol": "not-a-symbol", "qty": 1.0},
+            sizing={"r1_r6_violations": [], "approved_qty": 1.0},
+        )
+        with patch("trading_agent.graph.nodes.trade_nodes.emit") as mock_emit:
+            with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
+                with patch("trading_agent.learning.soak.tiny_paper_qty_cap", return_value=None):
+                    from trading_agent.graph.nodes.trade_nodes import execute_paper_order
+                    execute_paper_order(state)
+        events = [c.kwargs["event_type"] for c in mock_emit.call_args_list]
+        assert "order_skipped_zero_qty" not in events
+
+
+# ---------------------------------------------------------------------------
+# build_trade_proposal — spec-band backstop (Week-1 Step 6b)
+# ---------------------------------------------------------------------------
+
+def _synth_output(**proposal_overrides):
+    """A TraderSynthesizerOutput whose proposal BYPASSES pydantic validation
+    (model_construct) — replays historical shapes the schema now rejects."""
+    from trading_agent.llm.schemas import TraderProposal, TraderSynthesizerOutput
+    fields = dict(
+        ticker="CRNX", symbol="US.CRNX260821C00040000", asset_type="OPT",
+        direction="LONG_CALL", strategy_label="momentum-continuation-ITM-call",
+        entry_price=2.0, stop=1.0, target=5.0,
+        expected_return_pct=150.0, max_loss_pct=50.0,
+        option_delta=0.815, option_dte=44, option_iv=0.9,
+        qty_request=2, exit_plan=None,
+    )
+    fields.update(proposal_overrides)
+    return TraderSynthesizerOutput.model_construct(
+        decline_to_trade=False, decline_reason="",
+        proposal=TraderProposal.model_construct(**fields),
+        reflection_notes=[], proposal_notes="",
+    )
+
+
+class TestSpecBandBackstop:
+    def _run_node(self, synth):
+        state = _base_state(
+            trigger="candidate_entry",
+            research={"target_ticker": "CRNX"},
+            regime={"label": "BULL_TREND", "confidence": 0.8, "gate": {}},
+            account={"equity": 100_000.0},
+            positions=[],
+        )
+        router = MagicMock()
+        router.call.return_value = MagicMock(parsed=synth)
+        with patch("trading_agent.graph.nodes.trade_nodes.emit") as mock_emit:
+            with patch("trading_agent.llm.get_router", return_value=router):
+                with patch("trading_agent.shadow.persist.insert_shadow_proposal",
+                           return_value=77) as mock_insert:
+                    with patch("trading_agent.shadow.persist.finalize_shadow_proposal") as mock_fin:
+                        from trading_agent.graph.nodes.trade_nodes import build_trade_proposal
+                        result = build_trade_proposal(state)
+        return result, mock_emit, mock_insert, mock_fin
+
+    def test_crnx_2026_07_08_replay_is_rejected(self):
+        """Regression: {dte 44, delta 0.815, unmapped legacy label} must die
+        at proposal validation — never reach sizing — with the dedicated
+        event naming the violated band."""
+        result, mock_emit, mock_insert, mock_fin = self._run_node(_synth_output())
+        assert "proposal" not in result
+        assert result["research"]["trader_decline"] is True
+        events = [c.kwargs["event_type"] for c in mock_emit.call_args_list]
+        assert events == ["proposal_rejected_spec_band"]
+        payload = mock_emit.call_args_list[0].kwargs["payload"]
+        assert payload["strategy_label"] == "momentum-continuation-ITM-call"
+        assert [v["band"] for v in payload["violations"]] == ["abs_delta_range"]
+        assert payload["violations"][0]["spec"] == "global_r5"
+        # Shadow log still captures the killed proposal for the null test
+        mock_insert.assert_called_once()
+        mock_fin.assert_called_once_with(77, final_action="REJECTED_SPEC_BAND")
+
+    def test_mapped_label_outside_spec_band_is_rejected(self):
+        """convexity-mapped label with DTE 50: inside global R5 but outside
+        the spec's 21–45 — the tighter inner band binds."""
+        result, mock_emit, _, _ = self._run_node(_synth_output(
+            strategy_label="directional_long_call", option_dte=50,
+            option_delta=0.45,
+        ))
+        assert "proposal" not in result
+        payload = mock_emit.call_args_list[0].kwargs["payload"]
+        assert [v["band"] for v in payload["violations"]] == ["dte_range"]
+        assert payload["violations"][0]["spec"] == "convexity_long_premium"
+
+    def test_compliant_proposal_passes_through(self):
+        result, mock_emit, mock_insert, mock_fin = self._run_node(_synth_output(
+            strategy_label="directional_long_call", option_dte=30,
+            option_delta=0.45,
+        ))
+        assert result["proposal"]["ticker"] == "CRNX"
+        assert result["shadow_proposal_id"] == 77
+        events = [c.kwargs["event_type"] for c in mock_emit.call_args_list]
+        assert events == ["proposal_built"]
+        mock_fin.assert_not_called()

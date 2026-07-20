@@ -219,6 +219,55 @@ def test_proposal_exit_plan_field_optional():
 
 
 # ---------------------------------------------------------------------------
+# Spec-band gate on TraderProposal (Week-1 Step 6b)
+# ---------------------------------------------------------------------------
+
+
+def _opt_payload(*, label: str, dte: int, delta: float) -> dict:
+    # Geometry clears every R:R floor in play (risk=1.0, reward=3.0 → 3:1).
+    return {
+        "ticker": "CRNX", "symbol": "US.CRNX260901C00040000",
+        "asset_type": "OPT", "direction": "LONG_CALL",
+        "strategy_label": label,
+        "entry_price": 2.0, "stop": 1.0, "target": 5.0,
+        "expected_return_pct": 150.0, "max_loss_pct": 50.0,
+        "option_delta": delta, "option_dte": dte,
+        "qty_request": 2,
+    }
+
+
+def test_proposal_spec_band_rejects_mapped_label_outside_spec():
+    """DTE 50 passes global R5 (14–60) but not convexity's 21–45 — the
+    mapped label's tighter band must bind at schema time."""
+    from pydantic import ValidationError
+    from trading_agent.llm.schemas import TraderProposal
+
+    with pytest.raises(ValidationError, match="convexity_long_premium"):
+        TraderProposal.model_validate(
+            _opt_payload(label="directional_long_call", dte=50, delta=0.45))
+
+
+def test_proposal_spec_band_rejects_crnx_unmapped_label():
+    """2026-07-08 CRNX replay: unmapped legacy label, delta 0.815 — must
+    die against the global R5 fallback band, label notwithstanding."""
+    from pydantic import ValidationError
+    from trading_agent.llm.schemas import TraderProposal
+
+    with pytest.raises(ValidationError, match="global_r5"):
+        TraderProposal.model_validate(
+            _opt_payload(label="momentum-continuation-ITM-call",
+                         dte=44, delta=0.815))
+
+
+def test_proposal_spec_band_accepts_compliant_contract():
+    from trading_agent.llm.schemas import TraderProposal
+
+    obj = TraderProposal.model_validate(
+        _opt_payload(label="directional_long_call", dte=30, delta=0.45))
+    assert obj.option_dte == 30
+
+
+# ---------------------------------------------------------------------------
 # SHORT direction — geometry inversion + R7 exemption
 # ---------------------------------------------------------------------------
 

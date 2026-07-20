@@ -215,7 +215,7 @@ def finalize_shadow_proposal(
 ) -> None:
     """Mark the final outcome. `final_action` should be one of:
     EXECUTED | VETOED_BY_GATE | VETOED_BY_RISK | VETOED_BY_COUNCIL |
-    DEFERRED | DECLINED_BY_TRADER.
+    DEFERRED | DECLINED_BY_TRADER | REJECTED_SPEC_BAND.
     """
     if shadow_id is None:
         return
