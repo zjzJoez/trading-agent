@@ -2007,10 +2007,16 @@ class TestSoakGates:
             account={"equity": 100_000.0},
             positions=[],
         )
+        # Patch the names deterministic_sizing actually binds
+        # (trade_nodes.sizing_check / trade_nodes.blockers) — patching
+        # trading_agent.sizing.check no longer neutralizes sizing here,
+        # and the real check now R_spec_status-blocks this unmapped-label
+        # OPT open (the retired structure); the subject of THIS test is
+        # only the TINY_PAPER qty cap.
         with _patch_all_emits():
             with patch("trading_agent.learning.soak.tiny_paper_qty_cap", return_value=1):
-                with patch("trading_agent.sizing.check", return_value=[]):
-                    with patch("trading_agent.sizing.blockers", return_value=[]):
+                with patch("trading_agent.graph.nodes.trade_nodes.sizing_check", return_value=[]):
+                    with patch("trading_agent.graph.nodes.trade_nodes.blockers", return_value=[]):
                         with patch("trading_agent.sectors.known_count", return_value=10):
                             with patch("trading_agent.sectors.lookup", return_value="Technology"):
                                 from trading_agent.graph.nodes.trade_nodes import deterministic_sizing
@@ -2097,7 +2103,11 @@ def _synth_output(**proposal_overrides):
 
 
 class TestSpecBandBackstop:
-    def _run_node(self, synth):
+    def _run_node(self, synth, quote_row=None):
+        """quote_row stubs the shadow-quote capture (order_guard.
+        fetch_option_quote); default None = no live quote available, which
+        must degrade to recording the proposal without one. Always patched
+        so no test ever touches OpenD."""
         state = _base_state(
             trigger="candidate_entry",
             research={"target_ticker": "CRNX"},
@@ -2112,8 +2122,10 @@ class TestSpecBandBackstop:
                 with patch("trading_agent.shadow.persist.insert_shadow_proposal",
                            return_value=77) as mock_insert:
                     with patch("trading_agent.shadow.persist.finalize_shadow_proposal") as mock_fin:
-                        from trading_agent.graph.nodes.trade_nodes import build_trade_proposal
-                        result = build_trade_proposal(state)
+                        with patch("trading_agent.order_guard.fetch_option_quote",
+                                   return_value=quote_row):
+                            from trading_agent.graph.nodes.trade_nodes import build_trade_proposal
+                            result = build_trade_proposal(state)
         return result, mock_emit, mock_insert, mock_fin
 
     def test_crnx_2026_07_08_replay_is_rejected(self):
@@ -2146,11 +2158,15 @@ class TestSpecBandBackstop:
         assert payload["violations"][0]["spec"] == "convexity_long_premium"
 
     def test_compliant_proposal_passes_through(self):
-        # Unmapped legacy label inside the global R5 band: no spec, no
-        # status gate — flows through to sizing as before.
+        # A STOCK proposal under an unmapped legacy label: no spec, no
+        # status gate, no structure fallback (OPT-only) — flows through to
+        # sizing as before. (An unmapped-label OPT proposal no longer
+        # passes: it IS the retired long-premium structure — see
+        # TestSpecStatusShadowOnly.test_unmapped_label_opt_goes_shadow_only.)
         result, mock_emit, mock_insert, mock_fin = self._run_node(_synth_output(
-            strategy_label="mean_reversion_pairs", option_dte=30,
-            option_delta=0.45,
+            strategy_label="mean_reversion_pairs", asset_type="STK",
+            symbol="US.CRNX", direction="LONG",
+            option_delta=None, option_dte=None, option_iv=None,
         ))
         assert result["proposal"]["ticker"] == "CRNX"
         assert result["shadow_proposal_id"] == 77
@@ -2195,6 +2211,54 @@ class TestSpecStatusShadowOnly:
         assert p["strategy_label"] == "directional_long_call"
         assert p["option_dte"] == 30 and p["option_delta"] == 0.45
         assert p["entry_price"] == 2.0 and p["stop"] == 1.0 and p["target"] == 5.0
+        # No live quote available (fetch stubbed to None) → the record
+        # degrades to today's shape, no shadow_quote key.
+        assert "shadow_quote" not in p
+        assert payload["label_unmapped"] is False
+
+    def test_unmapped_label_opt_goes_shadow_only(self):
+        """The retirement bypass (finding 2026-07-20): an in-band single-leg
+        OPT proposal under an off-prefix label is EXACTLY the retired
+        long-premium structure — it must be governed by the convexity spec,
+        recorded SHADOW_ONLY (valid counterfactual), and never reach the
+        order path. Pre-fix it flowed to sizing AND was missing from the
+        shadow book, biasing the counterfactual population toward on-prefix
+        proposals."""
+        result, mock_emit, mock_insert, mock_fin = self._run_node(_synth_output(
+            strategy_label="momentum_long_call", option_dte=30,
+            option_delta=0.45,
+        ))
+        assert "proposal" not in result           # no order path
+        assert result["research"]["trader_decline"] is True
+        mock_insert.assert_called_once()
+        mock_fin.assert_called_once_with(77, final_action="SHADOW_ONLY")
+        payload = mock_emit.call_args_list[0].kwargs["payload"]
+        assert payload["spec"] == "convexity_long_premium"
+        assert payload["spec_status"] == "shadow_only"
+        assert payload["label_unmapped"] is True
+        assert payload["proposal"]["strategy_label"] == "momentum_long_call"
+
+    def test_shadow_only_record_captures_proposal_time_quote(self):
+        """Counterfactual fidelity: the EOD chain snapshot may not contain
+        the exact proposed contract (≤4 expiries sampled) and its EOD mark
+        is not the proposal-time mark — so the SHADOW_ONLY record carries a
+        best-effort live bid/ask/last captured at proposal time, in BOTH
+        the shadow row's proposal_json and the agent event."""
+        row = {"bid_price": 1.95, "ask_price": 2.05, "last_price": 2.00,
+               "option_open_interest": 900}
+        result, mock_emit, mock_insert, mock_fin = self._run_node(
+            _synth_output(strategy_label="directional_long_call",
+                          option_dte=30, option_delta=0.45),
+            quote_row=row,
+        )
+        assert "proposal" not in result
+        # Same dict lands in the shadow insert and the event payload.
+        inserted = mock_insert.call_args.kwargs["proposal"]
+        emitted = mock_emit.call_args_list[0].kwargs["payload"]["proposal"]
+        for p in (inserted, emitted):
+            sq = p["shadow_quote"]
+            assert sq["bid"] == 1.95 and sq["ask"] == 2.05 and sq["last"] == 2.00
+            assert sq["captured_at"]  # ISO timestamp present
 
     def test_band_check_still_runs_before_status_gate(self):
         """A band-violating convexity shape is REJECTED_SPEC_BAND, not
@@ -2243,8 +2307,10 @@ class TestSpecStatusShadowOnly:
                 with patch("trading_agent.shadow.persist.insert_shadow_proposal",
                            return_value=None):
                     with patch("trading_agent.shadow.persist.finalize_shadow_proposal") as mock_fin:
-                        from trading_agent.graph.nodes.trade_nodes import build_trade_proposal
-                        result = build_trade_proposal(state)
+                        with patch("trading_agent.order_guard.fetch_option_quote",
+                                   return_value=None):
+                            from trading_agent.graph.nodes.trade_nodes import build_trade_proposal
+                            result = build_trade_proposal(state)
         assert "proposal" not in result
         mock_fin.assert_not_called()  # no row to finalize
         payload = mock_emit.call_args_list[0].kwargs["payload"]

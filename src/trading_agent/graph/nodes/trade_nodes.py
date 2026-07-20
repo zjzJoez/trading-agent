@@ -1735,9 +1735,52 @@ def build_trade_proposal(state: TradingGraphState) -> dict:
     # BLOCKED_SPEC_STATUS — there is no counterfactual book for a strategy
     # that never went live. Sizing re-enforces this at order time
     # (R_spec_status_not_tradeable); closes are exempt there.
-    from trading_agent.strategy_specs import spec_for_label
+    from trading_agent.strategy_specs import REGISTRY, spec_for_label
     _spec = spec_for_label(proposal_dict.get("strategy_label"))
+    _label_unmapped = _spec is None and proposal_dict.get("asset_type") == "OPT"
+    if _label_unmapped:
+        # Fail closed on STRUCTURE, not label: strategy_label is free-text
+        # LLM output and off-prefix labels have shipped in production
+        # (2026-07-08 CRNX 'momentum-continuation-ITM-call'). A single-leg
+        # OPT proposal under an unmapped label IS the retired long-premium
+        # structure (SELL-to-open is hard-blocked), so it is governed by
+        # the convexity spec here: recorded SHADOW_ONLY — a valid
+        # long-premium counterfactual — instead of flowing to the order
+        # path, where sizing would refuse it anyway (R_spec_status via
+        # spec_trading_block's matching structure fallback). Without this,
+        # the shadow book was silently biased toward on-prefix proposals.
+        _spec = REGISTRY["convexity_long_premium"]
     if _spec is not None and not _spec.is_tradeable:
+        # Best-effort proposal-time quote capture (counterfactual replay
+        # fidelity): the EOD option_chain_snapshots job samples at most 4
+        # expiries x ~12 strikes per side, so the exact proposed contract
+        # can be absent from tonight's snapshot — and even when present,
+        # the EOD mark is not the proposal-time mark. Reuse the order
+        # guard's hang-proof fetch (thread + timeout, swallows every
+        # failure) rather than a bare get_quote: an unsubscribed contract
+        # can hang the raw call, and the shadow book must never stall the
+        # graph. Attached BEFORE insert/emit so the quote lands in BOTH
+        # shadow_proposals.proposal_json and the agent event. Any failure
+        # degrades to recording the proposal without a quote.
+        if proposal_dict.get("asset_type") == "OPT":
+            _q_sym = _to_moomoo_option_symbol(proposal_dict.get("symbol") or "")
+            if _q_sym:
+                try:
+                    from trading_agent.order_guard import fetch_option_quote
+                    _q_row = fetch_option_quote(_q_sym)
+                except Exception as e:  # noqa: BLE001 — shadow path never raises
+                    log.warning("[build_trade_proposal] shadow-quote fetch "
+                                "failed: %s", e)
+                    _q_row = None
+                if _q_row:
+                    from datetime import datetime, timezone
+                    proposal_dict["shadow_quote"] = {
+                        "bid": _q_row.get("bid_price") or _q_row.get("bid"),
+                        "ask": _q_row.get("ask_price") or _q_row.get("ask"),
+                        "last": (_q_row.get("last_price")
+                                 or _q_row.get("cur_price")),
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                    }
         from trading_agent.shadow.persist import (
             finalize_shadow_proposal,
             insert_shadow_proposal,
@@ -1758,6 +1801,11 @@ def build_trade_proposal(state: TradingGraphState) -> dict:
             payload={
                 "spec": _spec.name,
                 "spec_status": _spec.status,
+                # True when an unmapped-label OPT proposal was governed by
+                # the convexity spec via the structure fallback — lets the
+                # counterfactual analysis separate declared convexity
+                # proposals from off-prefix ones.
+                "label_unmapped": _label_unmapped,
                 "final_action": final_action,
                 "shadow_proposal_id": sid,
                 "regime": {

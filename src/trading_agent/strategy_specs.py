@@ -393,7 +393,11 @@ def spec_for_label(label: str | None) -> StrategySpec | None:
 # ---------------------------------------------------------------------------
 
 
-def spec_trading_block(strategy_label: str | None) -> dict[str, Any] | None:
+def spec_trading_block(
+    strategy_label: str | None,
+    *,
+    asset_type: str | None = None,
+) -> dict[str, Any] | None:
     """Return a structured block descriptor when ``strategy_label`` maps to a
     non-tradeable spec, else None.
 
@@ -405,10 +409,38 @@ def spec_trading_block(strategy_label: str | None) -> dict[str, Any] | None:
 
     ONLY opening paths may call this — closes (intent=='close') must never
     be status-gated: retiring a strategy while stranding its open positions
-    is strictly worse than either state. Unmapped/legacy labels return None
-    (they are governed by the global R5/R7 gates, not by a spec status).
+    is strictly worse than either state.
+
+    ``asset_type`` opts the caller into the STRUCTURE fallback, which fails
+    closed for the structure, not the label: strategy_label is free-text
+    LLM output (the trader-synthesizer has already invented off-prefix
+    labels in production — 2026-07-08 CRNX 'momentum-continuation-ITM-call'),
+    so an UNMAPPED (or absent) label must not be a retirement bypass.
+    Single-leg SELL-to-open is hard-blocked at the order layer, which makes
+    an unmapped-label single-leg OPT open EXACTLY the retired long-premium
+    structure — it is therefore governed by the convexity spec's status.
+    Unmapped STOCK opens stay governed by the global R1-R8 gates only, and
+    the combo path (its own label families + the R5e structural proof)
+    passes no asset_type, so both are unaffected.
     """
     spec = spec_for_label(strategy_label)
+    if spec is None and (asset_type or "").strip().upper() == "OPT":
+        fallback = REGISTRY["convexity_long_premium"]
+        if fallback.is_tradeable:
+            return None
+        return {
+            "spec": fallback.name,
+            "status": fallback.status,
+            "strategy_label": strategy_label,
+            "unmapped_label": True,
+            "message": (
+                f"unmapped strategy_label {strategy_label!r} cannot "
+                f"BUY-to-open a single-leg option while '{fallback.name}' is "
+                f"{fallback.status} — single-leg SELL-to-open is hard-blocked, "
+                f"so an unmapped-label option open is exactly the retired "
+                f"long-premium structure; map the label or register a spec"
+            ),
+        }
     if spec is None or spec.is_tradeable:
         return None
     return {

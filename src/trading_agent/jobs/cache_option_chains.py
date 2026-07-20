@@ -4,7 +4,9 @@ Moomoo's free tier has no historical option quotes — once a session ends,
 the chain the agent saw is gone. This job runs after US close (systemd
 timer, 21:15 UTC weekdays, before the 21:30 eod_review) and persists a
 near-the-money slice of every chain the system could plausibly trade:
-today's watchlist UNION the underlyings of OPEN journal trades. That makes
+today's watchlist UNION the underlyings of OPEN journal trades UNION the
+underlyings of today's SHADOW_ONLY proposals (the retired-strategy
+counterfactual book must have its contracts priced). That makes
 the strategies actually traded backtestable someday — "what would the
 other strike/expiry have cost" stops being unanswerable.
 
@@ -114,11 +116,46 @@ def _open_trade_underlyings() -> list[str]:
     return out
 
 
+def _shadow_underlyings() -> list[str]:
+    """Underlyings of TODAY's SHADOW_ONLY shadow_proposals rows — the
+    retired-strategy counterfactual book (convexity_long_premium,
+    docs/REVIVAL_PLAN_2026-07-20.md). A shadow proposal's underlying can be
+    absent from both the watchlist and the open-trade set (nothing was ever
+    opened), and counterfactual replay needs the proposed contract itself
+    priced in tonight's snapshot, not a neighbour's. Best-effort like
+    _open_trade_underlyings: an unreachable store means one lost day of
+    coverage, not a trading decision."""
+    out: list[str] = []
+    try:
+        with postgres.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ticker, symbol FROM shadow_proposals "
+                "WHERE final_action = 'SHADOW_ONLY' "
+                "  AND proposal_ts::date = CURRENT_DATE"
+            )
+            for r in cur.fetchall() or []:
+                if isinstance(r, dict):
+                    tick, sym = r.get("ticker"), r.get("symbol")
+                else:
+                    tick, sym = r[0], r[1]
+                t = ((tick or "").strip().upper()
+                     or (ticker_from_any_symbol(sym or "") or "").upper())
+                if t:
+                    out.append(t)
+    except Exception as e:  # noqa: BLE001 — cache job, never fatal
+        log.warning("[cache_option_chains] shadow_proposals unreadable — "
+                    "skipping shadow-book underlyings: %s", e)
+        return []
+    return out
+
+
 def build_underlying_set(override: str | None = None) -> list[str]:
     """Sorted, deduped underlying tickers for today's snapshot."""
     if override:
         return sorted({t.strip().upper() for t in override.split(",") if t.strip()})
-    return sorted(set(_watchlist_underlyings()) | set(_open_trade_underlyings()))
+    return sorted(set(_watchlist_underlyings())
+                  | set(_open_trade_underlyings())
+                  | set(_shadow_underlyings()))
 
 
 def _pick_expiries(expiry_rows: list[dict], today: date) -> list[str]:

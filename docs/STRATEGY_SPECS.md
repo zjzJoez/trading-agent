@@ -34,8 +34,12 @@ not constants, and move when `data/execution_costs.json` is recalibrated.
   operator-approved 2026-07-20, `docs/REVIVAL_PLAN_2026-07-20.md` sleeve 3).
   `build_trade_proposal` records in-band proposals to `shadow_proposals`
   (`final_action=SHADOW_ONLY`) plus a `shadow_proposal_recorded` agent event
-  carrying the full proposal payload for option-level counterfactual replay;
-  sizing refuses opens (`R_spec_status_not_tradeable`). Closes stay allowed.
+  carrying the full proposal payload — including a best-effort proposal-time
+  `shadow_quote` (bid/ask/last, hang-proof fetch) since the EOD chain snapshot
+  may not sample the exact contract — for option-level counterfactual replay;
+  the EOD `cache_option_chains` job also force-includes the day's SHADOW_ONLY
+  underlyings. Sizing refuses opens (`R_spec_status_not_tradeable`). Closes
+  stay allowed.
 - **pending_prereqs** — declared but blocked on prerequisites
   (`credit_vertical_index_30_45` until every M1-0 item is green); not
   tradeable through any consumer, no shadow book (`BLOCKED_SPEC_STATUS`).
@@ -56,3 +60,16 @@ level (conservative), and a first-class combo-CLOSE path is a follow-up.
 `pullback_` / `breakout_` → `convexity_long_premium`; `credit_put_spread*` →
 `credit_put_spread_30_45`; `credit_vertical*` → `credit_vertical_index_30_45`;
 exact spec names resolve directly; everything else → `None` (legacy, ungraded).
+
+**Unmapped labels fail closed on structure** (`spec_trading_block(...,
+asset_type=...)`): `strategy_label` is free-text LLM output, and off-prefix
+labels have shipped in production (2026-07-08 CRNX
+`momentum-continuation-ITM-call`). Because single-leg SELL-to-open is
+hard-blocked, an unmapped-label (or label-less) **single-leg OPT open is
+exactly the retired long-premium structure** — it is governed by the
+`convexity_long_premium` status: sizing refuses the open
+(`R_spec_status_not_tradeable`) and `build_trade_proposal` records it
+`SHADOW_ONLY` (with `label_unmapped: true` in the event payload) so the
+counterfactual book is not biased toward on-prefix proposals. Unmapped STOCK
+opens and the combo path (own label families + R5e structural proof) are
+unaffected; closes are always exempt.

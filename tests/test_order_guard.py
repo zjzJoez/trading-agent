@@ -46,13 +46,13 @@ def _insert_thesis(ticker: str, minutes_ago: float = 0.0, status: str = "open") 
 
 
 def _insert_open_trade(symbol: str, asset_type: str = "OPT", qty: float = 1,
-                       entry_price: float = 1.0) -> int:
+                       entry_price: float = 1.0, side: str = "BUY") -> int:
     from trading_agent.db import connection
     with connection() as conn:
         cur = conn.execute(
             "INSERT INTO trades (symbol, asset_type, side, qty, entry_price, "
-            "opened_at, outcome, is_paper) VALUES (?, ?, 'BUY', ?, ?, ?, 'OPEN', 1)",
-            (symbol, asset_type, qty, entry_price,
+            "opened_at, outcome, is_paper) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', 1)",
+            (symbol, asset_type, side, qty, entry_price,
              datetime.now(timezone.utc).isoformat()),
         )
         return int(cur.lastrowid)
@@ -71,6 +71,22 @@ def _patch_quote(monkeypatch, row):
     """Stub the R5d live-snapshot fetch — tests must never touch OpenD."""
     from trading_agent import order_guard as og
     monkeypatch.setattr(og, "fetch_option_quote", lambda code, timeout_s=5.0: row)
+
+
+@pytest.fixture()
+def spec_gate_off(monkeypatch):
+    """Neutralize the R_spec_status retirement gate (2026-07-20).
+
+    With convexity_long_premium shadow_only, EVERY single-leg OPT open is
+    refused — mapped label, unmapped label, or no label at all (the
+    structure fallback in spec_trading_block). The tests using this fixture
+    exercise the machinery BEHIND that gate (thesis freshness, R5d
+    liquidity, audit) which must keep working the day a single-leg spec is
+    revived; they switch the gate off rather than pinning some label that
+    happens to slip through."""
+    monkeypatch.setattr(
+        "trading_agent.strategy_specs.spec_trading_block",
+        lambda *a, **k: None)
 
 
 def _future_opt(ticker: str = "MRVL", days: int = 30, right: str = "C",
@@ -141,7 +157,7 @@ def test_stale_thesis_blocked(guard_db):
     assert "no open thesis" in d.reason
 
 
-def test_fresh_thesis_buy_option_allowed(guard_db, monkeypatch):
+def test_fresh_thesis_buy_option_allowed(guard_db, monkeypatch, spec_gate_off):
     tid = _insert_thesis("MRVL")
     _patch_quote(monkeypatch, GOOD_QUOTE)
     d = _eval("option", {
@@ -195,6 +211,78 @@ def test_convexity_close_still_allowed_after_retirement(guard_db):
     assert d.intent == "close"
 
 
+@pytest.mark.parametrize("label", ["swing_call", "momentum_long_call", None])
+def test_unmapped_label_opt_open_blocked(guard_db, monkeypatch, label):
+    """The retirement is on the STRUCTURE, not the label: a free-text label
+    outside the prefix table (or no label at all) must not BUY-to-open a
+    single-leg option — that shape IS the retired long-premium strategy."""
+    from trading_agent.sizing import R_SPEC_STATUS
+    _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, GOOD_QUOTE)
+    params = {
+        "option_symbol": _MRVL_OPT, "side": "BUY",
+        "contracts": 1, "price": 1.00, "delta": 0.40,
+    }
+    if label is not None:
+        params["strategy_label"] = label
+    d = _eval("option", params)
+    assert not d.allowed
+    assert d.intent == "open"
+    hits = [v for v in d.violations if v.rule == R_SPEC_STATUS]
+    assert len(hits) == 1 and "unmapped" in hits[0].message
+
+
+def test_buy_add_to_held_long_convexity_option_refused_as_open(guard_db, monkeypatch):
+    """BUY-to-ADD to a held LONG option is an OPEN, not a close: pre-fix,
+    has_existing_open_for ignored the position's side, so adding 10 more
+    contracts to a legacy convexity long skipped the status gate, thesis
+    gate, R5d and every opening sizing rule. Even with a fresh thesis and a
+    liquid quote, the add-on must die on R_spec_status_not_tradeable."""
+    from trading_agent.sizing import R_SPEC_STATUS
+    _insert_open_trade(_MRVL_OPT, qty=1, entry_price=1.0, side="BUY")
+    _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, GOOD_QUOTE)
+    d = _eval("option", {
+        "option_symbol": _MRVL_OPT, "side": "BUY",
+        "contracts": 10, "price": 1.00, "delta": 0.40,
+        "strategy_label": "directional_long_call",
+    })
+    assert d.intent == "open"          # side-aware: add-on, not a buy-back
+    assert not d.allowed
+    assert any(v.rule == R_SPEC_STATUS for v in d.violations)
+
+
+def test_buy_add_without_thesis_hits_thesis_gate_first(guard_db):
+    """Same add-on shape without a fresh thesis: the opening gates apply in
+    order — pre-fix this was intent='close' and skipped them all."""
+    _insert_open_trade(_MRVL_OPT, qty=1, entry_price=1.0, side="BUY")
+    d = _eval("option", {
+        "option_symbol": _MRVL_OPT, "side": "BUY",
+        "contracts": 10, "price": 1.00,
+    })
+    assert not d.allowed
+    assert d.intent == "open"
+    assert "no open thesis" in d.reason
+
+
+def test_buy_back_of_short_position_still_close(guard_db, monkeypatch):
+    """BUY against an existing SHORT row (e.g. a combo's short leg,
+    journaled side=SELL) is a buy-back: intent='close', no thesis gate, no
+    status gate — closing must never be trapped by the retirement."""
+    sym = "US.AAPL260720P00300000"
+    _insert_open_trade(sym, qty=1, entry_price=2.0, side="SELL")
+
+    def _must_not_fetch(code, timeout_s=5.0):
+        raise AssertionError("R5d fetched a quote for a CLOSING order")
+    monkeypatch.setattr(
+        "trading_agent.order_guard.fetch_option_quote", _must_not_fetch)
+    d = _eval("option", {
+        "option_symbol": sym, "side": "BUY", "contracts": 1, "price": 2.20,
+    })
+    assert d.allowed, d.violations_json()
+    assert d.intent == "close"
+
+
 # ---------------------------------------------------------------------------
 # Sizing pass-through (R1)
 # ---------------------------------------------------------------------------
@@ -217,7 +305,7 @@ def test_r1_oversize_stock_blocked(guard_db):
 # ---------------------------------------------------------------------------
 
 
-def test_audit_decision_writes_db_and_jsonl(guard_db, tmp_path, monkeypatch):
+def test_audit_decision_writes_db_and_jsonl(guard_db, tmp_path, monkeypatch, spec_gate_off):
     from trading_agent import order_guard as og
     from trading_agent.db import connection
 
@@ -277,7 +365,7 @@ def _buy_open_option(**over):
     return params
 
 
-def test_r5d_wide_spread_blocked(guard_db, monkeypatch):
+def test_r5d_wide_spread_blocked(guard_db, monkeypatch, spec_gate_off):
     from trading_agent.order_guard import R5D
     _insert_thesis("MRVL")
     # spread 0.20 on mid 1.10 = 18.2% of mid — way past the 5% cap.
@@ -312,7 +400,7 @@ def test_r5d_alternate_field_spellings_handled(guard_db, monkeypatch):
     assert any(v.rule == R5D for v in d.violations)
 
 
-def test_r5d_liquid_contract_allowed(guard_db, monkeypatch):
+def test_r5d_liquid_contract_allowed(guard_db, monkeypatch, spec_gate_off):
     _insert_thesis("MRVL")
     _patch_quote(monkeypatch, GOOD_QUOTE)
     d = _eval("option", _buy_open_option())
@@ -346,7 +434,7 @@ def test_r5d_zero_bid_blocks_unquotable(guard_db, monkeypatch):
     assert any(v.rule == R5D_UNQUOTABLE for v in d.violations)
 
 
-def test_r5d_oi_missing_warns_not_blocks(guard_db, monkeypatch):
+def test_r5d_oi_missing_warns_not_blocks(guard_db, monkeypatch, spec_gate_off):
     """Some snapshots omit OI entirely; spread is the primary protection,
     so a tight-spread contract passes with a warn."""
     from trading_agent.order_guard import R5D_OI_UNKNOWN
@@ -390,7 +478,7 @@ def test_r5d_stock_orders_unaffected(guard_db, monkeypatch):
     assert d.allowed, d.violations_json()
 
 
-def test_r5d_caller_supplied_quote_skips_fetch(guard_db, monkeypatch):
+def test_r5d_caller_supplied_quote_skips_fetch(guard_db, monkeypatch, spec_gate_off):
     """A caller that already holds a fresh snapshot passes it through via
     option_quote= — evaluate_order must not double-fetch."""
     _insert_thesis("MRVL")
@@ -504,6 +592,44 @@ def test_sell_intent_open_when_sqlite_says_no_and_postgres_unreachable(guard_db,
         raise ConnectionError("no postgres on this box")
     monkeypatch.setattr("trading_agent.store.postgres.cursor", _boom)
     assert og.has_existing_open_for("US.QQQ260626C734000") is False
+
+
+def test_open_position_side_from_sqlite(guard_db, monkeypatch):
+    """Side-aware lookup: the journal row's side drives BUY intent (BUY vs
+    an open LONG = add-on/open; BUY vs an open SHORT = buy-back/close)."""
+    from trading_agent import order_guard as og
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.cursor", lambda: _PgCtx([]))
+    _insert_open_trade("US.QQQ260626C00734000", side="BUY")
+    _insert_open_trade("US.QQQ260626P00600000", side="SELL")
+    assert og.open_position_side_for("US.QQQ260626C00734000") == "BUY"
+    assert og.open_position_side_for("US.QQQ260626P00600000") == "SELL"
+    assert og.open_position_side_for("US.QQQ260626P00999000") is None
+
+
+def test_open_position_side_from_postgres_only_row(guard_db, monkeypatch):
+    from trading_agent import order_guard as og
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.cursor", lambda: _PgCtx([("SELL",)]))
+    assert og.open_position_side_for("US.QQQ260626C734000") == "SELL"
+
+
+def test_open_position_side_unknown_when_both_stores_blind(guard_db, monkeypatch):
+    """SQLite errored AND Postgres unreachable: a position may exist unseen
+    → SIDE_UNKNOWN. SELL then fails open to close (never hard-block a real
+    exit as SELL-to-open); BUY fails CLOSED to open (all gates apply)."""
+    from trading_agent import order_guard as og
+
+    def _sqlite_boom(*a, **k):
+        raise RuntimeError("sqlite unavailable")
+
+    def _pg_boom():
+        raise ConnectionError("no postgres on this box")
+    monkeypatch.setattr(og, "connection", _sqlite_boom)
+    monkeypatch.setattr("trading_agent.store.postgres.cursor", _pg_boom)
+    assert og.open_position_side_for("US.QQQ260626C734000") == og.SIDE_UNKNOWN
+    # and the boolean wrapper keeps its historical fail-open-to-close answer
+    assert og.has_existing_open_for("US.QQQ260626C734000") is True
 
 
 # ---------------------------------------------------------------------------

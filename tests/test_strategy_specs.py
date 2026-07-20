@@ -402,19 +402,48 @@ def test_spec_status_blocks_convexity_opens(label):
 
 @pytest.mark.parametrize("label", [
     "directional_long_call", "credit_vertical_spy_put",
+    "mean_reversion_pairs",  # unmapped — the structure fallback must not
+    None,                    # gate closes either (exit engine passes no label)
 ])
 def test_spec_status_never_blocks_closes(label):
     """Retirement must never strand an open position: SELL-to-close of a
-    legacy convexity position (or any non-active label) stays allowed."""
+    legacy convexity position (or any non-active/unmapped/absent label)
+    stays allowed."""
     vs = check(_ctx(), _opt_trade(label, intent="close", side="SELL"))
     assert not any(v.rule == R_SPEC_STATUS for v in vs)
     assert not any(v.severity == "block" for v in vs)
 
 
-def test_spec_status_allows_active_and_unmapped_opens():
+@pytest.mark.parametrize("label", [
+    "mean_reversion_pairs", "momentum_long_call", "swing_call",
+    "momentum-continuation-ITM-call",  # the 2026-07-08 CRNX label
+    None,                              # bare tool call with no label at all
+])
+def test_spec_status_blocks_unmapped_opt_opens(label):
+    """Fail closed on the STRUCTURE, not the label: single-leg SELL-to-open
+    is hard-blocked, so an unmapped-label (or label-less) single-leg OPT
+    open is exactly the retired long-premium structure — a free-text label
+    the prefix table doesn't know must not bypass the retirement."""
+    vs = [v for v in check(_ctx(), _opt_trade(label)) if v.rule == R_SPEC_STATUS]
+    assert len(vs) == 1 and vs[0].severity == "block"
+    assert "unmapped" in vs[0].message
+    assert "shadow_only" in vs[0].message
+
+
+def test_spec_status_allows_unmapped_stock_opens():
+    """The structure fallback is OPT-only: unmapped-label STOCK opens stay
+    governed by the global R1-R8 gates, not by any spec status."""
     assert not any(
         v.rule == R_SPEC_STATUS
-        for v in check(_ctx(), _opt_trade("mean_reversion_pairs")))
+        for v in check(_ctx(), _trade("mean_reversion_pairs")))
+
+
+def test_spec_status_allows_active_mapped_opens():
+    """A label mapping to an ACTIVE spec passes the status gate (the band /
+    R5 / R7 gates still apply downstream)."""
+    assert not any(
+        v.rule == R_SPEC_STATUS
+        for v in check(_ctx(), _opt_trade("credit_put_spread_30_45")))
 
 
 def test_spec_status_registry_failure_degrades_open():
