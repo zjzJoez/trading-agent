@@ -146,10 +146,79 @@ def trading_days_between(start_utc: datetime, end_utc: datetime | None = None) -
         return n
 
 
+def _overlap_hours(lo_a: datetime, hi_a: datetime,
+                   lo_b: datetime, hi_b: datetime) -> float:
+    lo = max(lo_a, lo_b)
+    hi = min(hi_a, hi_b)
+    if hi <= lo:
+        return 0.0
+    return (hi - lo).total_seconds() / 3600.0
+
+
+def _fallback_hours_between(start_utc: datetime, end_utc: datetime) -> float:
+    """Exchange-local window sum: Mon-Fri 09:30-16:00 ET sessions in
+    [start, end].
+
+    Sessions are built in America/New_York via stdlib zoneinfo and compared
+    as aware datetimes, so DST is handled year-round (a fixed 13:30-20:00
+    UTC window is EDT-only — one hour off through the whole EST winter).
+    Holidays are still ignored; that precision belongs to the mcal path.
+    """
+    total = 0.0
+    day = start_utc.astimezone(ET).date()
+    last_day = end_utc.astimezone(ET).date()
+    while day <= last_day:
+        if day.weekday() < 5:
+            sess_open = datetime.combine(day, time(9, 30), tzinfo=ET)
+            sess_close = datetime.combine(day, time(16, 0), tzinfo=ET)
+            total += _overlap_hours(start_utc, end_utc, sess_open, sess_close)
+        day += timedelta(days=1)
+    return total
+
+
+def market_hours_between(start_utc: datetime, end_utc: datetime) -> float:
+    """Cumulative REGULAR-SESSION hours between two instants.
+
+    Overnight, weekend, and holiday time contributes zero — so "24
+    market-hours of silence" means roughly 3.7 trading days, and a long
+    weekend can never trip a market-hours threshold on its own. Used by
+    the deadman escalation in health_nodes (the 6/20→7/8 OAuth-expiry
+    incident measured its silence in exactly these units).
+
+    Best-effort: any calendar error degrades to the UTC-window fallback.
+    Never raises. Naive inputs are interpreted as UTC.
+    """
+    if start_utc.tzinfo is None:
+        start_utc = start_utc.replace(tzinfo=timezone.utc)
+    if end_utc.tzinfo is None:
+        end_utc = end_utc.replace(tzinfo=timezone.utc)
+    if end_utc <= start_utc:
+        return 0.0
+    try:
+        import pandas_market_calendars as mcal
+
+        cal = mcal.get_calendar("XNYS")  # NYSE regular hours
+        sched = cal.schedule(
+            start_date=start_utc.date().isoformat(),
+            end_date=end_utc.date().isoformat(),
+        )
+        total = 0.0
+        for _, row in sched.iterrows():
+            sess_open = row["market_open"].to_pydatetime()
+            sess_close = row["market_close"].to_pydatetime()
+            total += _overlap_hours(start_utc, end_utc, sess_open, sess_close)
+        return total
+    except Exception as e:
+        log.warning("[market_calendar] mcal hours-between failed (%s) — "
+                    "UTC fallback", e)
+        return _fallback_hours_between(start_utc, end_utc)
+
+
 __all__ = [
     "is_us_market_open",
     "us_session_bounds",
     "minutes_since_open",
     "is_us_trading_day",
     "trading_days_between",
+    "market_hours_between",
 ]
