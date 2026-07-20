@@ -8,9 +8,12 @@ to DEFER on schema failure.
 """
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+log = logging.getLogger(__name__)
 
 
 class _Strict(BaseModel):
@@ -433,6 +436,52 @@ class TraderProposal(_Strict):
                     f"Tighten stop OR widen target until reward/risk >= "
                     f"{min_rr}."
                 )
+
+        # Greeks are MANDATORY on OPT proposals (fail-closed). The spec-band
+        # gate below, build_trade_proposal's backstop AND sizing's R5 all
+        # skip a None dte/delta — so a model that simply drops the fields
+        # would evade every band check. The retry loop feeds this error
+        # back to the LLM, which always has the chain data to re-emit.
+        if self.asset_type == "OPT":
+            missing = [
+                name for name in ("option_delta", "option_dte")
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"{', '.join(missing)} missing: option_delta and "
+                    f"option_dte are mandatory for OPT proposals — the "
+                    f"DTE/delta band gates cannot run without them. "
+                    f"Re-emit the proposal with the contract's delta and "
+                    f"DTE from the option chain."
+                )
+
+        # Spec-band gate (Week-1 Step 6b): a label mapped to a StrategySpec
+        # must sit inside the spec's declared DTE/delta bands; an UNMAPPED
+        # label on an OPT proposal falls back to the global R5 band — no
+        # label is a free pass. Raising HERE keeps the failure inside the
+        # router's schema-retry loop (same rationale as _effective_min_rr):
+        # the LLM can pick a compliant contract in-flight instead of dying
+        # at build_trade_proposal's post-parse backstop.
+        try:
+            from trading_agent.strategy_specs import spec_band_violations
+            band_violations = spec_band_violations(
+                strategy_label=self.strategy_label,
+                asset_type=self.asset_type,
+                option_dte=self.option_dte,
+                option_delta=self.option_delta,
+            )
+        except Exception as exc:  # noqa: BLE001 — schema validation must never crash
+            log.warning(
+                "spec-band schema check crashed, deferring to "
+                "build_trade_proposal backstop: %s", exc,
+            )
+            band_violations = []
+        if band_violations:
+            raise ValueError(
+                "; ".join(str(v["message"]) for v in band_violations)
+                + ". Pick a contract inside the band."
+            )
 
         # If exit_plan is supplied, its hard_stop/hard_target should match
         # the top-level stop/target, AND its direction must match.
