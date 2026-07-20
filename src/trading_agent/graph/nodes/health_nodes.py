@@ -421,6 +421,29 @@ DEADMAN_PUSH_MARKET_HOURS = 24.0
 DEADMAN_HALT_MARKET_HOURS = 48.0
 DEADMAN_PUSH_COOLDOWN_HOURS = 6
 
+# Heartbeat set for the deadman rungs (24h push, 48h auto-halt).
+#
+# The deadman detects WHOLE-PIPELINE death — the 6/20 OAuth class where the
+# box emits ZERO events of any kind. A healthy-but-deliberately-idle engine
+# can go multi-week stretches emitting only candidate_entry_skipped (regime
+# gate, soak read-only, operator halt, outside_regular_hours,
+# below_score_threshold, no_candidates, ...) or candidate_skipped_cooldown —
+# every one of those proves the pipeline is alive, so they all count as
+# heartbeats and re-arm the ladder. halt_resumed (emitted by the /resume
+# endpoint) counts too: an operator resume attests liveness, which breaks the
+# halt/resume ratchet — without it, /resume during a long benign silence
+# would be re-halted by the very next hourly healthcheck, forever (and the
+# flag itself blocks the dispatches that would end the silence).
+# Executing-SCAN-specific death (scans that should dispatch but don't) is
+# the scan_dispatch_liveness check's job (same-day 17:00 ET, added on the
+# scan-windows branch), not the deadman's.
+DEADMAN_HEARTBEAT_EVENTS = (
+    "candidate_entry_dispatched",
+    "candidate_entry_skipped",     # ALL reasons — benign idleness heartbeats
+    "candidate_skipped_cooldown",
+    "halt_resumed",                # operator resume attests liveness
+)
+
 
 def _was_deadman_push_recent() -> bool:
     """True iff a deadman_silence_push landed within the de-bounce window.
@@ -446,10 +469,12 @@ def _was_deadman_push_recent() -> bool:
         return False
 
 
-def _deadman_escalation(run_id: str, trigger: str, last_dispatch_ts) -> None:
+def _deadman_escalation(run_id: str, trigger: str, last_heartbeat_ts) -> None:
     """Escalation ladder on top of the basic 4-day silence alert.
 
-    ``silence`` = market-open hours since the last candidate_entry dispatch.
+    ``silence`` = market-open hours since the last pipeline heartbeat —
+    MAX(ts) over DEADMAN_HEARTBEAT_EVENTS (dispatches, skips of every
+    reason, cooldown skips, and operator halt_resumed).
 
     > DEADMAN_PUSH_MARKET_HOURS: priority-5 ops push, de-bounced to one per
       DEADMAN_PUSH_COOLDOWN_HOURS via the deadman_silence_push event. Keeps
@@ -464,18 +489,20 @@ def _deadman_escalation(run_id: str, trigger: str, last_dispatch_ts) -> None:
       MANUAL ONLY: POST /resume on the halt endpoint (or remove
       data/halt.flag by hand). This node never deletes the flag, even after
       dispatches resume — the operator must look at what died first.
+      (A post-halt /resume emits halt_resumed, which IS a heartbeat, so a
+      resume re-arms the ladder from zero instead of re-halting next tick.)
 
-    An empty dispatch history (fresh deploy) skips escalation: there is no
+    An empty event history (fresh deploy) skips escalation: there is no
     heartbeat to measure from, and auto-halting a brand-new deployment
     fails in the wrong direction.
     """
-    if last_dispatch_ts is None:
+    if last_heartbeat_ts is None:
         return
     from datetime import datetime, timezone
 
     from trading_agent.market_calendar import market_hours_between
 
-    ts = last_dispatch_ts
+    ts = last_heartbeat_ts
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     silent_hours = market_hours_between(ts, datetime.now(timezone.utc))
@@ -501,7 +528,8 @@ def _deadman_escalation(run_id: str, trigger: str, last_dispatch_ts) -> None:
                 title=(f"DEADMAN AUTO-HALT — engine silent "
                        f"{silent_hours:.0f} market-hours"),
                 body=(
-                    f"No candidate_entry dispatch for {silent_hours:.1f} "
+                    f"No pipeline heartbeat (dispatch/skip/resume event) "
+                    f"for {silent_hours:.1f} "
                     f"market-open hours (> {DEADMAN_HALT_MARKET_HOURS:.0f}h "
                     f"rung). data/halt.flag created — NEW opens are blocked "
                     f"through the standard halt channel.\n\n"
@@ -530,7 +558,8 @@ def _deadman_escalation(run_id: str, trigger: str, last_dispatch_ts) -> None:
         title=(f"DEADMAN — trade engine silent "
                f"{silent_hours:.0f} market-hours"),
         body=(
-            f"No candidate_entry dispatch for {silent_hours:.1f} market-open "
+            f"No pipeline heartbeat (dispatch/skip/resume event) for "
+            f"{silent_hours:.1f} market-open "
             f"hours (> {DEADMAN_PUSH_MARKET_HOURS:.0f}h rung; auto-halt at "
             f"{DEADMAN_HALT_MARKET_HOURS:.0f}h).\n\n"
             f"Check LLM channel liveness first (the 6/20 OAuth expiry "
@@ -573,13 +602,17 @@ def trade_engine_silence_check(state: TradingGraphState) -> dict:
     Looks at agent_events for the most recent `candidate_entry_dispatched`
     event. If older than TRADE_ENGINE_SILENCE_ALERT_DAYS, emits sev=2
     + ntfy (rate-limited to one alert per SILENCE_ALERT_COOLDOWN_HOURS).
+    This informational alert stays dispatches-only on purpose: "no trades
+    in a week" is worth a note even when the pipeline is alive.
 
     On top of that sits the deadman escalation (_deadman_escalation),
-    measured in MARKET-OPEN hours of silence: > 24h → priority-5 push
-    (de-bounced to one per 6h); > 48h → AUTO-HALT of new opens via the
-    same data/halt.flag the /halt endpoint writes. Open positions are
-    never auto-closed. Un-halt is MANUAL only — POST /resume on the halt
-    endpoint (existing semantics); nothing here ever removes the flag.
+    measured in MARKET-OPEN hours since the last heartbeat over
+    DEADMAN_HEARTBEAT_EVENTS (dispatches + skips of any reason + cooldown
+    skips + halt_resumed): > 24h → priority-5 push (de-bounced to one per
+    6h); > 48h → AUTO-HALT of new opens via the same data/halt.flag the
+    /halt endpoint writes. Open positions are never auto-closed. Un-halt
+    is MANUAL only — POST /resume on the halt endpoint (existing
+    semantics); nothing here ever removes the flag.
     """
     run_id = state["run_id"]
     trigger = state["trigger"]
@@ -598,9 +631,21 @@ def trade_engine_silence_check(state: TradingGraphState) -> dict:
                 """
             )
             row = cur.fetchone()
+            # Deadman heartbeat: newest event across the whole heartbeat
+            # set, not just dispatches — see DEADMAN_HEARTBEAT_EVENTS.
+            cur.execute(
+                """
+                SELECT MAX(ts) FROM agent_events
+                WHERE event_type = ANY(%s)
+                """,
+                (list(DEADMAN_HEARTBEAT_EVENTS),),
+            )
+            hb_row = cur.fetchone()
     except Exception as e:
         log.warning("[silence_check] query failed: %s", e)
         return {}
+
+    heartbeat_ts = hb_row[0] if hb_row else None
 
     if row is None:
         last_ts = None
@@ -614,10 +659,11 @@ def trade_engine_silence_check(state: TradingGraphState) -> dict:
     # Deadman escalation runs BEFORE the wall-clock early-return below:
     # its rungs are market-hours based (24 market-hours ≈ 3.7 trading
     # days) and can trip while wall-clock days_ago is still under the
-    # 4-day alert threshold. Best-effort — escalation failure must not
-    # take down the rest of healthcheck.
+    # 4-day alert threshold. It measures from the broad heartbeat set,
+    # NOT last_ts (dispatches only). Best-effort — escalation failure
+    # must not take down the rest of healthcheck.
     try:
-        _deadman_escalation(run_id, trigger, last_ts)
+        _deadman_escalation(run_id, trigger, heartbeat_ts)
     except Exception as e:
         log.warning("[silence_check] deadman escalation failed: %s", e)
 

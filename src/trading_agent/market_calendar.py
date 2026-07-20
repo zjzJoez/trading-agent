@@ -64,13 +64,24 @@ def _overlap_hours(lo_a: datetime, hi_a: datetime,
 
 
 def _fallback_hours_between(start_utc: datetime, end_utc: datetime) -> float:
-    """Plain UTC window sum: Mon-Fri 13:30-20:00 UTC sessions in [start, end]."""
+    """Exchange-local window sum: Mon-Fri 09:30-16:00 ET sessions in
+    [start, end].
+
+    Sessions are built in America/New_York via stdlib zoneinfo and compared
+    as aware datetimes, so DST is handled year-round (a fixed 13:30-20:00
+    UTC window is EDT-only — one hour off through the whole EST winter).
+    Holidays are still ignored; that precision belongs to the mcal path.
+    """
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
     total = 0.0
-    day = start_utc.date()
-    while day <= end_utc.date():
+    day = start_utc.astimezone(et).date()
+    last_day = end_utc.astimezone(et).date()
+    while day <= last_day:
         if day.weekday() < 5:
-            sess_open = datetime.combine(day, time(13, 30), tzinfo=timezone.utc)
-            sess_close = datetime.combine(day, time(20, 0), tzinfo=timezone.utc)
+            sess_open = datetime.combine(day, time(9, 30), tzinfo=et)
+            sess_close = datetime.combine(day, time(16, 0), tzinfo=et)
             total += _overlap_hours(start_utc, end_utc, sess_open, sess_close)
         day += timedelta(days=1)
     return total

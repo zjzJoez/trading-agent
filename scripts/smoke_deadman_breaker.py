@@ -9,7 +9,7 @@ real data/trader.db, never real ntfy, never the real halt flag):
      R8_daily_loss_breaker; a SELL-to-close of an open position must pass.
 
   2. 48h deadman auto-halt: feed the REAL escalation ladder a
-     last-dispatch timestamp 30 days old (>> 48 market-hours through the
+     last-heartbeat timestamp 30 days old (>> 48 market-hours through the
      real market calendar) and verify it creates the SAME halt flag the
      /halt endpoint writes, emits deadman_auto_halt {silent_hours}, and
      never touches open positions. Un-halt stays manual — the script
@@ -101,7 +101,7 @@ def simulate_breaker() -> None:
 
 
 def simulate_deadman_halt() -> None:
-    print("\n== 2. 48h deadman auto-halt (last dispatch 30 days ago) ==")
+    print("\n== 2. 48h deadman auto-halt (last heartbeat 30 days ago) ==")
     from unittest.mock import patch
 
     from trading_agent import halt_endpoint
