@@ -438,12 +438,31 @@ def test_spec_status_allows_unmapped_stock_opens():
         for v in check(_ctx(), _trade("mean_reversion_pairs")))
 
 
-def test_spec_status_allows_active_mapped_opens():
-    """A label mapping to an ACTIVE spec passes the status gate (the band /
-    R5 / R7 gates still apply downstream)."""
-    assert not any(
-        v.rule == R_SPEC_STATUS
-        for v in check(_ctx(), _opt_trade("credit_put_spread_30_45")))
+def test_single_leg_open_cannot_borrow_a_vertical_spec_label():
+    """A SINGLE-LEG option open labeled as an active vertical spec is a
+    structure mismatch, not an authorization: relabeling a long single-leg
+    as a credit spec would reopen exactly the structure convexity's
+    retirement closed (and the retry loop makes label-shopping a live
+    path). Verticals open via place_paper_option_combo only."""
+    for label in ("credit_put_spread_30_45", "credit_vertical_index_30_45"):
+        vs = [v for v in check(_ctx(), _opt_trade(label))
+              if v.rule == R_SPEC_STATUS]
+        assert vs, f"{label} single-leg open must be blocked"
+        assert "structure" in vs[0].message
+
+
+def test_spec_status_allows_active_single_leg_mapped_opens():
+    """A label mapping to an ACTIVE spec passes the status gate when the
+    spec's structure actually IS single-leg (band / R5 / R7 gates still
+    apply downstream). No such spec exists while convexity is retired, so
+    pin the contract with a temporary registry entry."""
+    from trading_agent import strategy_specs as ss
+    active_single = dataclasses.replace(
+        ss.REGISTRY["convexity_long_premium"], status="active")
+    with patch.object(ss, "spec_for_label", return_value=active_single):
+        assert not any(
+            v.rule == R_SPEC_STATUS
+            for v in check(_ctx(), _opt_trade("directional_long_call")))
 
 
 def test_spec_status_registry_failure_degrades_open():

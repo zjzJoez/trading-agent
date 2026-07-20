@@ -139,6 +139,14 @@ class StrategySpec:
     name: str
     status: Literal["active", "shadow_only", "pending_prereqs", "blocked"]
     structure: str
+    # Machine-readable shape of ``structure`` (free text is for humans).
+    # spec_trading_block uses it to refuse a SINGLE-LEG order whose label
+    # maps to a vertical spec: with convexity retired, relabeling a long
+    # single-leg as an active credit spec would otherwise reopen the exact
+    # structure the retirement closed (the retry loop feeds validation
+    # errors back to the LLM, which makes label-shopping a live path,
+    # not a hypothetical).
+    structure_kind: Literal["single_leg", "vertical"] = "single_leg"
     entry_gates: Mapping[str, Any] = field(default_factory=dict)
     allowed_regimes: tuple[str, ...] = ()
     expectancy_profile: ExpectancyProfile | None = None
@@ -249,6 +257,7 @@ def _credit_put_spread_spec() -> StrategySpec:
             "Short put vertical, 30–45 DTE: sell a 0.20–0.30 |delta| put, "
             "buy a further-OTM put; max loss defined by the width."
         ),
+        structure_kind="vertical",
         entry_gates={
             "dte_range": (30, 45),
             "abs_delta_range": (0.20, 0.30),   # short leg
@@ -299,6 +308,7 @@ def _credit_vertical_index_spec() -> StrategySpec:
             "hard executor: 50% profit-take or 21-DTE force-close, no "
             "mid-trade stop."
         ),
+        structure_kind="vertical",
         entry_gates={
             # M1-1 revised gates — ALL PLACEHOLDERS pending M1-0.4 replay.
             "underlying_whitelist": ("SPY", "QQQ"),  # IWM pending M1-0.3
@@ -439,6 +449,29 @@ def spec_trading_block(
                 f"{fallback.status} — single-leg SELL-to-open is hard-blocked, "
                 f"so an unmapped-label option open is exactly the retired "
                 f"long-premium structure; map the label or register a spec"
+            ),
+        }
+    if (
+        spec is not None
+        and (asset_type or "").strip().upper() == "OPT"
+        and spec.structure_kind != "single_leg"
+    ):
+        # Structure/shape mismatch: the caller is opening a SINGLE-LEG
+        # option, but the label maps to a vertical spec. Whatever that
+        # spec's status, it cannot authorize this shape — otherwise
+        # relabeling a long single-leg as a credit spec reopens the exact
+        # structure convexity's retirement closed.
+        return {
+            "spec": spec.name,
+            "status": spec.status,
+            "strategy_label": strategy_label,
+            "structure_mismatch": True,
+            "message": (
+                f"strategy_label {strategy_label!r} maps to spec "
+                f"'{spec.name}' whose structure is '{spec.structure_kind}' — "
+                f"a single-leg option open cannot be authorized by a "
+                f"vertical spec; use place_paper_option_combo for verticals, "
+                f"or a single-leg label (governed by its own spec status)"
             ),
         }
     if spec is None or spec.is_tradeable:
