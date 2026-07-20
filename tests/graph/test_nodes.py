@@ -2261,6 +2261,12 @@ class TestDetectExitTriggersCombo:
                 "trading_agent.graph.nodes.intraday_nodes."
                 "_no_plan_alerted_today", return_value=False))
             stack.enter_context(patch(
+                "trading_agent.graph.nodes.intraday_nodes."
+                "_alerted_today", return_value=False))
+            stack.enter_context(patch(
+                "trading_agent.exits.fill_confirm."
+                "pending_close_trade_ids_pg", return_value=set()))
+            stack.enter_context(patch(
                 "trading_agent.mcp_servers.moomoo.server.get_quote",
                 return_value={"rows": []}))
             from trading_agent.graph.nodes.intraday_nodes import (
@@ -2693,8 +2699,10 @@ class TestRouteExitOrHoldCombo:
         assert len(skipped) == 1 and skipped[0]["severity"] == 1
 
     def test_build_pending_state_shape_unchanged(self):
-        """No-behavior-change lock: the single-leg pending state's key set
-        is exactly what it was before combos landed."""
+        """Shape lock: the single-leg pending state's key set is what it was
+        before combos landed, plus expected_qty_before_close (the vanished-
+        order branch's qty-aware reconciliation anchor — None when the
+        caller doesn't record it, which preserves legacy behavior)."""
         from trading_agent.exits.fill_confirm import build_pending_state
         state = build_pending_state(
             order_id="EX-1", symbol="US.AAPL260626C325000",
@@ -2707,7 +2715,9 @@ class TestRouteExitOrHoldCombo:
             "side", "asset_type", "requested_exit_price", "quoted_bid",
             "quoted_ask", "thesis_id", "source", "placed_at", "attempts",
             "missing_ticks", "exhausted_alerted", "blocked_alerted",
+            "expected_qty_before_close",
         }
+        assert state["expected_qty_before_close"] is None  # legacy default
         assert "combo" not in state
 
 
@@ -2730,9 +2740,11 @@ class TestSyncFillStatusCombo:
         cur.execute = MagicMock()
         return cur
 
-    def _run(self, order_rows, capture=None):
+    def _run(self, order_rows, capture=None, combo_payload=...):
+        if combo_payload is ...:
+            combo_payload = self._combo_payload()
         # broker_order_id column carries the LONG leg's id (long placed first)
-        pg = self._pg([(15, self.SHORT, "L1", 1.2, self._combo_payload())])
+        pg = self._pg([(15, self.SHORT, "L1", 1.2, combo_payload)])
         from contextlib import ExitStack
         with ExitStack() as stack:
             if capture is not None:
@@ -2743,6 +2755,9 @@ class TestSyncFillStatusCombo:
                 stack.enter_context(_patch_all_emits())
             stack.enter_context(patch(
                 "trading_agent.store.postgres.cursor", return_value=pg))
+            stack.enter_context(patch(
+                "trading_agent.graph.nodes.intraday_nodes."
+                "_alerted_today", return_value=False))
             stack.enter_context(patch(
                 "trading_agent.mcp_servers.moomoo.server.get_orders",
                 return_value={"rows": order_rows}))
@@ -2784,6 +2799,26 @@ class TestSyncFillStatusCombo:
         assert len(updates) == 1
         # actual net credit = 2.05 − 0.85 = 1.20
         assert updates[0].args[1][0] == pytest.approx(1.20)
+
+    def test_sync_combo_unparseable_payload_skips_single_order_branch(self):
+        """Combo payload PRESENT but unparseable → fail closed: the single-
+        order branch (keyed on broker_order_id = the LONG leg's id) must NOT
+        clobber entry_price (the net credit) with one leg's dealt price."""
+        captured: list[dict] = []
+        pg = self._run(
+            [{"order_id": "L1", "code": self.LONG,
+              "order_status": "FILLED_ALL", "dealt_qty": 2,
+              "dealt_avg_price": 0.85}],
+            capture=captured,
+            combo_payload={"combo": True},  # legs/net_credit stripped
+        )
+        updates = [c.args[0] for c in pg.execute.call_args_list
+                   if c.args and "UPDATE journal_trades" in c.args[0]]
+        assert updates == [], (
+            f"degraded combo row must not sync single-order: {updates}")
+        events = [e for e in captured
+                  if e.get("event_type") == "combo_payload_unparseable"]
+        assert len(events) == 1 and events[0]["severity"] == 2
 
     def test_sync_combo_mixed_legs_alerts_not_unfilled(self):
         captured: list[dict] = []

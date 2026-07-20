@@ -81,6 +81,7 @@ def build_pending_state(
     quoted_ask: float | None,
     thesis_id: int | None,
     source: str,
+    expected_qty_before_close: float | None = None,
 ) -> dict[str, Any]:
     return {
         "order_id": str(order_id),
@@ -101,6 +102,12 @@ def build_pending_state(
         "missing_ticks": 0,
         "exhausted_alerted": False,
         "blocked_alerted": False,
+        # Broker qty at placement — lets the vanished-order branch tell a
+        # late invisible fill (qty reduced) from a dead order (qty intact)
+        # instead of guessing from bare position presence.
+        "expected_qty_before_close": (
+            float(expected_qty_before_close)
+            if expected_qty_before_close is not None else None),
     }
 
 
@@ -124,6 +131,7 @@ def build_pending_combo_state(
     long_ask: float | None,
     thesis_id: int | None,
     source: str,
+    broker_qty_before: float | None = None,
 ) -> dict[str, Any]:
     """Two-leg pending close state for one combo (M1-0.1).
 
@@ -132,6 +140,12 @@ def build_pending_combo_state(
     unchanged — one pending close per trade, either shape. A leg with
     ``order_id`` None is re-placed by ``_finalize_combo_close`` (e.g. the
     long-leg close after a leg-2 rejection at placement time).
+
+    ``broker_qty_before``: per-leg broker quantity at placement time. The
+    vanished-order reconciliation compares the live broker qty against it —
+    for a TRIM the position is never flat after the close, so bare
+    position-presence ("held?") can never detect a late invisible fill and
+    would re-place the close, over-trimming one extra unit.
     """
     now = _now_iso()
 
@@ -144,6 +158,9 @@ def build_pending_combo_state(
             "quoted_bid": bid, "quoted_ask": ask,
             "placed_at": now, "attempts": 0, "missing_ticks": 0,
             "exhausted_alerted": False, "blocked_alerted": False,
+            "expected_qty_before_close": (
+                float(broker_qty_before)
+                if broker_qty_before is not None else None),
         }
 
     return {
@@ -661,18 +678,52 @@ def _reprice(trade_id: int, state: dict, order_row: dict, run_id: str,
     _place_remainder(trade_id, state, run_id, trigger)
 
 
-def _position_still_held(symbol: str) -> bool | None:
-    """True/False from live broker positions; None when unknowable."""
+def _position_qty(symbol: str, expected_side: str | None = None) -> float | None:
+    """Absolute live broker quantity for ``symbol``; None when unknowable.
+
+    Quantity is ALWAYS taken as ``abs(qty)`` — the codebase is inconsistent
+    about broker qty sign for shorts (reconcile_order_guard normalizes via
+    position_side, trade_nodes infers side from a negative qty), and a raw
+    ``qty > 0`` check would misread a negative-qty short as flat, falsely
+    booking its close as filled (the inverse orphan: a naked short left at
+    the broker while the journal row settles closed).
+
+    ``expected_side``: "SHORT"/"LONG" — rows whose side (position_side, or a
+    negative raw qty) disagrees are ignored, so a long position on the same
+    symbol can't masquerade as the short leg still being held.
+    """
     try:
         from trading_agent.mcp_servers.moomoo.server import get_positions
+        total = 0.0
         for r in (get_positions().get("rows") or []):
             code = str(r.get("code") or r.get("symbol") or "")
-            if code == symbol and float(r.get("qty") or 0) > 0:
-                return True
-        return False
+            if code != symbol:
+                continue
+            try:
+                raw = float(r.get("qty") or 0)
+            except (TypeError, ValueError):
+                continue
+            qty = abs(raw)
+            if qty <= 0:
+                continue
+            if expected_side is not None:
+                side = str(r.get("position_side") or "LONG").upper()
+                is_short = side.startswith("SHORT") or raw < 0
+                if str(expected_side).upper().startswith("SHORT") != is_short:
+                    continue
+            total += qty
+        return total
     except Exception as e:
-        log.warning("_position_still_held(%s) failed: %s", symbol, e)
+        log.warning("_position_qty(%s) failed: %s", symbol, e)
         return None
+
+
+def _position_still_held(symbol: str, expected_side: str | None = None) -> bool | None:
+    """True/False from live broker positions; None when unknowable."""
+    qty = _position_qty(symbol, expected_side)
+    if qty is None:
+        return None
+    return qty > 0
 
 
 # ---------------------------------------------------------------------------
@@ -822,16 +873,54 @@ def _advance_combo_leg(trade_id: int, state: dict, leg: dict,
                      or order.get("order_status_str") or "").upper()
 
     if order is None:
-        # get_orders is today-only. Reconcile per-leg against live positions
-        # after MAX_MISSING_TICKS: short leg flat = its close filled; long
-        # leg flat = its close filled.
+        # get_orders is today-only. Reconcile per-leg against live broker
+        # QUANTITY after MAX_MISSING_TICKS — presence alone is qty-blind:
+        # a TRIM's position is never flat after a partial close, so "still
+        # held" would re-place a close that actually filled late and
+        # over-trim one extra unit.
         leg["missing_ticks"] = int(leg.get("missing_ticks") or 0) + 1
         if leg["missing_ticks"] < MAX_MISSING_TICKS:
             return
-        held = _position_still_held(leg["symbol"])
-        if held is False:
+        expected_side = ("SHORT" if leg.get("leg") == "short_close"
+                         else "LONG")
+        qty_now = _position_qty(leg["symbol"], expected_side)
+        if qty_now is None:
+            # Broker unreachable; try again next tick.
+            return
+        remaining = _leg_remaining(leg)
+        before = leg.get("expected_qty_before_close")
+        filled_invisibly: bool | None
+        if before is not None:
+            dealt = _leg_dealt_qty(leg)
+            after_fill = float(before) - dealt - remaining
+            after_dead = float(before) - dealt
+            if abs(qty_now - after_fill) <= 1e-6:
+                filled_invisibly = True
+            elif abs(qty_now - after_dead) <= 1e-6:
+                filled_invisibly = False
+            else:
+                # Neither state matches (manual interference?) — never
+                # guess with broker orders: alert once, retry next tick.
+                filled_invisibly = None
+                if not leg.get("ambiguous_alerted"):
+                    leg["ambiguous_alerted"] = True
+                    emit(run_id=run_id, trigger=trigger,
+                         agent="finalize_pending_exits",
+                         event_type="combo_close_leg_ambiguous", severity=2,
+                         payload={"trade_id": trade_id,
+                                  "symbol": leg["symbol"],
+                                  "combo_leg": leg.get("leg"),
+                                  "order_id": order_id,
+                                  "broker_qty": qty_now,
+                                  "expected_before": before,
+                                  "dealt": dealt, "remaining": remaining})
+                return
+        else:
+            # Legacy states without the recorded qty: flat = filled.
+            filled_invisibly = qty_now <= 0
+        if filled_invisibly:
             leg.setdefault("dealt_legs", []).append(
-                {"qty": _leg_remaining(leg),
+                {"qty": remaining,
                  "price": float(leg["requested_exit_price"])})
             leg["unconfirmed"] = True
             leg["order_id"] = None
@@ -841,11 +930,10 @@ def _advance_combo_leg(trade_id: int, state: dict, leg: dict,
                  payload={"trade_id": trade_id, "symbol": leg["symbol"],
                           "combo_leg": leg.get("leg"), "order_id": order_id,
                           "settled_at": leg["requested_exit_price"]})
-        elif held is True:
+        else:
             leg["order_id"] = None
             leg["missing_ticks"] = 0
             _replace_combo_leg(trade_id, state, leg, run_id, trigger)
-        # held is None → broker unreachable; try again next tick.
         return
 
     if status in _FILLED:
@@ -923,6 +1011,70 @@ def _advance_combo_leg(trade_id: int, state: dict, leg: dict,
         _replace_combo_leg(trade_id, state, leg, run_id, trigger)
 
 
+def _close_sqlite_combo_twin(state: dict, net_debit: float,
+                             net_pnl: float) -> None:
+    """Best-effort: settle the SQLite mirror of an engine-closed combo.
+
+    The posttool hook dual-writes every combo into BOTH stores; the engine
+    settles only the Postgres row. Leaving the SQLite twin OPEN forever
+    means combo.open_combo_long_legs keeps returning the wing (a future
+    SELL on that exact symbol classifies as intent='close' and bypasses
+    R_NO_SHORT_OPEN / R5d — a naked SELL-to-open sails through the guard),
+    _find_matching_open_combo keeps counting the closed units as journal
+    proof, and reconcile_order_guard false-alarms nightly.
+
+    Matching is strict: an OPEN SQLite row on the short-leg symbol whose
+    latest combo snapshot payload names the SAME short AND long legs.
+    Failures degrade to a log line (the EC2 engine host may not share the
+    Mac hook's SQLite file — nightly reconcile then surfaces the drift).
+    """
+    legs = state.get("legs") or []
+    short_leg = next((x for x in legs if x.get("leg") == "short_close"), None)
+    long_leg = next((x for x in legs if x.get("leg") == "long_close"), None)
+    if short_leg is None or long_leg is None:
+        return
+    short_sym = str(short_leg.get("symbol") or "")
+    long_sym = str(long_leg.get("symbol") or "")
+    if not short_sym or not long_sym:
+        return
+    try:
+        from trading_agent.combo import combo_meta, sqlite_combo_payloads
+        from trading_agent.db import connection
+        with connection() as conn:
+            ids = [int(r[0]) for r in conn.execute(
+                "SELECT id FROM trades WHERE outcome = 'OPEN' AND symbol = ?",
+                (short_sym,)).fetchall()]
+        if not ids:
+            return
+        matched: int | None = None
+        for tid, payload in sqlite_combo_payloads(ids).items():
+            meta = combo_meta(payload)
+            if (meta is not None and meta.short_leg == short_sym
+                    and meta.long_leg == long_sym):
+                matched = tid
+                break
+        if matched is None:
+            return
+        from trading_agent.mcp_servers.journal.server import close_trade
+        try:
+            from trading_agent.execution_costs import fees_per_side
+            exit_fees = fees_per_side(float(state.get("qty") or 0), "OPT") * 2
+        except Exception:
+            exit_fees = 0.0
+        close_trade(
+            trade_id=matched,
+            exit_price=float(net_debit),
+            outcome=_outcome_for_pnl(net_pnl),
+            pnl=float(net_pnl),
+            exit_fees=exit_fees,
+        )
+        log.info("_close_sqlite_combo_twin: closed sqlite trade %s (%s/%s)",
+                 matched, short_sym, long_sym)
+    except Exception as e:
+        log.warning("_close_sqlite_combo_twin(%s/%s) failed: %s",
+                    short_sym, long_sym, e)
+
+
 def _finalize_combo_close(trade_id: int, state: dict,
                           order_map: dict[str, dict], run_id: str,
                           trigger: str) -> None:
@@ -985,6 +1137,11 @@ def _finalize_combo_close(trade_id: int, state: dict,
     ok, net = _settle(trade_id, state, units, net_debit,
                       unconfirmed=unconfirmed, n_legs=2)
     if ok:
+        # Settle the SQLite twin (the posttool hook dual-writes combos into
+        # BOTH stores; leaving the twin OPEN lets order_guard classify a
+        # future SELL on the wing as intent='close' — bypassing
+        # R_NO_SHORT_OPEN — and double-counts journal proof for closes).
+        _close_sqlite_combo_twin(state, net_debit, net)
         emit(
             run_id=run_id, trigger=trigger, agent="finalize_pending_exits",
             event_type="position_closed",
@@ -1041,11 +1198,43 @@ def finalize_pending_exits(order_map: dict[str, dict], run_id: str,
                 write_pending_close(trade_id, state)
                 waiting += 1
                 continue
-            held = _position_still_held(state["symbol"])
-            if held is False:
-                # Position is flat — the vanished order almost certainly
-                # filled, but we never saw the dealt price. Settle at the
-                # requested limit, FLAGGED UNCONFIRMED (the soak gate
+            qty_now = _position_qty(state["symbol"])
+            filled_invisibly: bool | None = None
+            if qty_now is not None:
+                before = state.get("expected_qty_before_close")
+                if before is not None:
+                    # Qty-aware: distinguish a late invisible fill (broker
+                    # qty reduced by the close amount) from a dead order
+                    # (qty intact) — presence alone can't tell them apart
+                    # when the close is smaller than the position.
+                    dealt = _legs_qty(state)
+                    remaining = _remaining_qty(state)
+                    after_fill = float(before) - dealt - remaining
+                    after_dead = float(before) - dealt
+                    if abs(qty_now - after_fill) <= 1e-6:
+                        filled_invisibly = True
+                    elif abs(qty_now - after_dead) <= 1e-6:
+                        filled_invisibly = False
+                    else:
+                        if not state.get("ambiguous_alerted"):
+                            state["ambiguous_alerted"] = True
+                            emit(run_id=run_id, trigger=trigger,
+                                 agent="finalize_pending_exits",
+                                 event_type="exit_close_qty_ambiguous",
+                                 severity=2,
+                                 payload={"trade_id": trade_id,
+                                          "symbol": state["symbol"],
+                                          "order_id": order_id,
+                                          "broker_qty": qty_now,
+                                          "expected_before": before,
+                                          "dealt": dealt,
+                                          "remaining": remaining})
+                else:
+                    filled_invisibly = qty_now <= 0
+            if filled_invisibly is True:
+                # Position reduced as expected — the vanished order almost
+                # certainly filled, but we never saw the dealt price. Settle
+                # at the requested limit, FLAGGED UNCONFIRMED (the soak gate
                 # rejects unconfirmed closes; the operator resolves them).
                 ok, net = _settle(
                     trade_id, state, _remaining_qty(state),
@@ -1056,15 +1245,15 @@ def finalize_pending_exits(order_map: dict[str, dict], run_id: str,
                      event_type="exit_settled_unconfirmed", severity=2,
                      payload={"trade_id": trade_id, "symbol": state["symbol"],
                               "order_id": order_id, "ok": ok, "net_pnl": net})
-            elif held is True:
-                # Still holding — the order died invisibly. Re-place.
+            elif filled_invisibly is False:
+                # Still holding the full amount — the order died invisibly.
                 state["order_id"] = None
                 state["missing_ticks"] = 0
                 write_pending_close(trade_id, state)
                 _place_remainder(trade_id, state, run_id, trigger)
                 replaced += 1
             else:
-                # Broker unreachable for positions too — try again next tick.
+                # Broker unreachable, or ambiguous qty — try again next tick.
                 write_pending_close(trade_id, state)
                 waiting += 1
             continue

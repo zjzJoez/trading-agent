@@ -74,12 +74,14 @@ class _CloseStubCtx:
     """Stubs position_list_query + place_order + modify_order for the tool."""
 
     def __init__(self, positions=None, reject_leg_indexes=(),
-                 leg1_dealt_qty=0.0, cancel_fails=False):
+                 leg1_dealt_qty=0.0, cancel_fails=False,
+                 raise_leg_indexes=()):
         self.positions = positions if positions is not None else [
             {"code": SHORT_PUT, "qty": 2, "position_side": "SHORT"},
             {"code": LONG_PUT, "qty": 2, "position_side": "LONG"},
         ]
         self.reject_leg_indexes = set(reject_leg_indexes)
+        self.raise_leg_indexes = set(raise_leg_indexes)
         self.leg1_dealt_qty = leg1_dealt_qty
         self.cancel_fails = cancel_fails
         self.place_order_calls: list[dict] = []
@@ -92,6 +94,8 @@ class _CloseStubCtx:
     def place_order(self, **kw):
         idx = len(self.place_order_calls)
         self.place_order_calls.append(kw)
+        if idx in self.raise_leg_indexes:
+            raise ConnectionError(f"simulated SDK exception on leg {idx}")
         if idx in self.reject_leg_indexes:
             return -1, f"simulated rejection of leg {idx}"
         dealt = self.leg1_dealt_qty if idx == 0 else 0.0
@@ -277,6 +281,75 @@ def test_cancel_failed_racing_fill_reports_partial_with_order_id(close_db, monke
     _journal_open_combo()
     _swap_ctx(monkeypatch, _CloseStubCtx(
         reject_leg_indexes={1}, cancel_fails=True))
+    resp = server.close_paper_option_combo(
+        short_leg_symbol=SHORT_PUT, long_leg_symbol=LONG_PUT,
+        contracts=2, short_price=0.60, long_price=0.20)
+    assert resp["combo_close"] is False
+    assert resp["partial"] is True
+    assert resp["short_close_order_id"] == "CLOSE-0"
+    assert resp["rollback_action"] == "cancel_failed_racing_fill"
+
+
+def test_leg1_exception_funnels_to_nothing_placed(close_db, monkeypatch):
+    """An SDK/network exception on leg 1 must route through the SAME matrix
+    as a broker rejection — never propagate out of the tool."""
+    from trading_agent.mcp_servers.moomoo import server
+    _journal_open_combo()
+    ctx = _swap_ctx(monkeypatch, _CloseStubCtx(raise_leg_indexes={0}))
+    resp = server.close_paper_option_combo(
+        short_leg_symbol=SHORT_PUT, long_leg_symbol=LONG_PUT,
+        contracts=2, short_price=0.60, long_price=0.20)
+    assert resp["combo_close"] is False
+    assert resp["nothing_placed"] is True
+    assert "exception" in resp["reason"]
+    assert len(ctx.place_order_calls) == 1
+    assert ctx.modify_order_calls == []
+
+
+def test_leg2_exception_with_dealt_short_reports_partial(close_db, monkeypatch):
+    """Leg-2 exception with the BTC (partly) dealt: the live BTC order MUST
+    come back as the combo_close='partial' shape so the caller writes a
+    pending state — an unhandled raise would leave it untracked forever
+    (combo_close_possible_orphan deferrals, then broker_position_mismatch
+    on every retry once the BTC fills)."""
+    from trading_agent.mcp_servers.moomoo import server
+    _journal_open_combo()
+    ctx = _swap_ctx(monkeypatch, _CloseStubCtx(
+        raise_leg_indexes={1}, leg1_dealt_qty=2.0))
+    resp = server.close_paper_option_combo(
+        short_leg_symbol=SHORT_PUT, long_leg_symbol=LONG_PUT,
+        contracts=2, short_price=0.60, long_price=0.20)
+    assert resp["combo_close"] == "partial"
+    assert resp["long_leg_unclosed"] is True
+    assert resp["short_close_order_id"] == "CLOSE-0"
+    assert "exception" in resp["reason"]
+    assert ctx.modify_order_calls == []  # dealt BTC is never cancelled
+
+
+def test_leg2_exception_zero_dealt_cancels_working_short(close_db, monkeypatch):
+    """Leg-2 exception with zero dealt → same clean cancel-rollback as a
+    leg-2 rejection: the working BTC order is cancelled, nothing changed."""
+    from trading_agent.mcp_servers.moomoo import server
+    _journal_open_combo()
+    ctx = _swap_ctx(monkeypatch, _CloseStubCtx(raise_leg_indexes={1}))
+    resp = server.close_paper_option_combo(
+        short_leg_symbol=SHORT_PUT, long_leg_symbol=LONG_PUT,
+        contracts=2, short_price=0.60, long_price=0.20)
+    assert resp["combo_close"] is False
+    assert resp["combo_rollback"] is True
+    assert resp["rollback_action"] == "cancelled_working_short_close"
+    assert len(ctx.modify_order_calls) == 1
+    assert ctx.modify_order_calls[0]["order_id"] == "CLOSE-0"
+
+
+def test_leg2_exception_cancel_fails_reports_partial_with_order_id(
+        close_db, monkeypatch):
+    """Leg-2 exception AND the cancel racing a fill → hand the live BTC
+    order to the pending machinery (identical to the rejection path)."""
+    from trading_agent.mcp_servers.moomoo import server
+    _journal_open_combo()
+    _swap_ctx(monkeypatch, _CloseStubCtx(
+        raise_leg_indexes={1}, cancel_fails=True))
     resp = server.close_paper_option_combo(
         short_leg_symbol=SHORT_PUT, long_leg_symbol=LONG_PUT,
         contracts=2, short_price=0.60, long_price=0.20)

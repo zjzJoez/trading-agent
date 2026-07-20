@@ -923,10 +923,17 @@ def close_paper_option_combo(
     )
 
     # ---- leg 1: BUY-to-close the SHORT leg (assignment risk goes first) ----
-    ret_s, df_s = _trade().place_order(
-        price=short_price, qty=contracts, code=short_leg_symbol,
-        trd_side=TrdSide.BUY, order_type=OrderType.NORMAL, trd_env=PAPER_ENV,
-    )
+    # SDK/network exceptions funnel into the SAME rejection matrix as broker
+    # rejections (ret != RET_OK): an exception here must never propagate with
+    # broker state changed and no handle returned — the caller's generic
+    # except would write no pending state and the order would be untracked.
+    try:
+        ret_s, df_s = _trade().place_order(
+            price=short_price, qty=contracts, code=short_leg_symbol,
+            trd_side=TrdSide.BUY, order_type=OrderType.NORMAL, trd_env=PAPER_ENV,
+        )
+    except Exception as e:
+        ret_s, df_s = None, f"exception placing short-leg buy-back: {e!r}"
     if ret_s != RET_OK:
         return {
             "combo_close": False, "nothing_placed": True,
@@ -940,10 +947,17 @@ def close_paper_option_combo(
     btc_dealt = float(btc_row.get("dealt_qty") or 0)
 
     # ---- leg 2: SELL-to-close the LONG leg ----
-    ret_l, df_l = _trade().place_order(
-        price=long_price, qty=contracts, code=long_leg_symbol,
-        trd_side=TrdSide.SELL, order_type=OrderType.NORMAL, trd_env=PAPER_ENV,
-    )
+    # Exceptions route through the identical matrix: the leg-1 BTC order is
+    # LIVE at this point, so an unhandled raise would leave it with no cancel
+    # attempt and no partial handle — permanently trapping the exit once the
+    # BTC fills (broker_position_mismatch on every retry).
+    try:
+        ret_l, df_l = _trade().place_order(
+            price=long_price, qty=contracts, code=long_leg_symbol,
+            trd_side=TrdSide.SELL, order_type=OrderType.NORMAL, trd_env=PAPER_ENV,
+        )
+    except Exception as e:
+        ret_l, df_l = None, f"exception placing long-leg close: {e!r}"
     if ret_l != RET_OK:
         if btc_dealt > 0:
             # Short already (partly) bought back — risk REDUCED. Never

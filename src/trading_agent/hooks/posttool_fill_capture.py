@@ -269,6 +269,17 @@ def main() -> int:
         reasoning = (f"combo defined-risk vertical: short={short_sym} "
                      f"long={long_sym} net_credit={net_credit} width={width} "
                      f"max_loss={max_loss}")
+        combo_payload = {
+            "combo": True, "short_leg": short_sym, "long_leg": long_sym,
+            "broker_order_ids": order_ids, "net_credit": net_credit,
+            "width": width, "max_loss": max_loss, "contracts": contracts,
+        }
+        # Each store's write is independently try/excepted: a Mac-side
+        # SQLite hiccup must NOT abort the Postgres dual-write — the PG row
+        # is the engine-visibility write (exit plan, 21-DTE, 50%-PT), which
+        # is the more safety-critical of the two. Both outcomes are audited.
+        trade_id = None
+        sqlite_error = None
         try:
             trade_id = _insert_trade_row(
                 thesis_id=combo_thesis, symbol=short_sym, asset_type="OPT",
@@ -277,15 +288,15 @@ def main() -> int:
                 broker_order_id=order_ids[0] if order_ids else "",
                 reasoning=reasoning,
             )
-            _insert_snapshot(trade_id, {
-                "combo": True, "short_leg": short_sym, "long_leg": long_sym,
-                "broker_order_ids": order_ids, "net_credit": net_credit,
-                "width": width, "max_loss": max_loss, "contracts": contracts,
-            })
+            _insert_snapshot(trade_id, dict(combo_payload))
         except Exception as e:
-            _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
-                    "decision": "error", "reason": f"combo insert failed: {e!r}"})
-            return 0
+            sqlite_error = repr(e)
+            _audit({"ts": _now(), "hook": "posttool_fill_capture",
+                    "tool": tool_name, "decision": "error",
+                    "phase": "combo_sqlite_insert",
+                    "reason": f"combo insert failed: {e!r}",
+                    "note": "attempting the Postgres dual-write anyway — "
+                            "engine visibility is safety-critical"})
         # D2 dual-write: the exit engine enriches/resolves EXCLUSIVELY from
         # Postgres get_open_journal_trades — a combo journaled only in SQLite
         # never reaches detect_exit_triggers at all (both legs would surface
@@ -298,12 +309,7 @@ def main() -> int:
                 contracts=contracts, net_credit=float(net_credit or 0),
                 width=float(width or 0), strategy_label=combo_label,
                 order_ids=order_ids,
-                snapshot_payload={
-                    "combo": True, "short_leg": short_sym, "long_leg": long_sym,
-                    "broker_order_ids": order_ids, "net_credit": net_credit,
-                    "width": width, "max_loss": max_loss,
-                    "contracts": contracts,
-                },
+                snapshot_payload=dict(combo_payload),
             )
             pg_written = True
         except Exception as e:
@@ -316,7 +322,8 @@ def main() -> int:
         _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
                 "decision": "combo_insert", "trade_id": trade_id,
                 "short_leg": short_sym, "long_leg": long_sym,
-                "broker_order_ids": order_ids, "pg_dual_write": pg_written})
+                "broker_order_ids": order_ids, "pg_dual_write": pg_written,
+                "sqlite_error": sqlite_error})
         return 0
 
     is_option = tool_name.endswith("__place_paper_option_order")

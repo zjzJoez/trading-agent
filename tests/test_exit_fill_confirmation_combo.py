@@ -17,7 +17,8 @@ import pytest
 
 def _combo_state(*, short_oid="BTC-1", long_oid="STC-1", units=2.0,
                  settle_mode="full", net_credit=1.2,
-                 short_px=0.66, long_px=0.19) -> dict:
+                 short_px=0.66, long_px=0.19,
+                 broker_qty_before=None) -> dict:
     from trading_agent.exits.fill_confirm import build_pending_combo_state
     state = build_pending_combo_state(
         symbol="US.SPY261016P00100000",
@@ -36,6 +37,7 @@ def _combo_state(*, short_oid="BTC-1", long_oid="STC-1", units=2.0,
         long_bid=0.20, long_ask=0.24,
         thesis_id=9,
         source="postgres",
+        broker_qty_before=broker_qty_before,
     )
     return state
 
@@ -338,6 +340,208 @@ def test_long_leg_replacement_passes_guard_or_alerts(cap, fake_moomoo, monkeypat
                if e.get("event_type") == "exit_order_blocked_by_guard"]
     assert len(blocked) == 1
     assert cap.settles == []
+
+
+def test_negative_qty_short_leg_not_settled_as_filled(cap, fake_moomoo,
+                                                      monkeypatch):
+    """Broker reports the short via NEGATIVE qty: the short leg is STILL
+    held — the vanished BTC must be re-placed, never falsely booked as
+    dealt-unconfirmed (which would settle the row while a naked short
+    remains at the broker — the inverse orphan)."""
+    from trading_agent.exits import fill_confirm as fc
+    _patch_settle(monkeypatch, cap)
+    fake_moomoo.positions_rows = [
+        {"code": "US.SPY261016P00100000", "qty": -2,
+         "position_side": "SHORT"}]
+    state = _combo_state()
+    order_map = {
+        "STC-1": {"order_status": "FILLED_ALL",
+                  "dealt_qty": 2, "dealt_avg_price": 0.21},
+        # BTC-1 absent (vanished)
+    }
+    fc._finalize_combo_close(7, state, order_map, "r", "t")   # miss #1
+    fc._finalize_combo_close(7, state, {}, "r", "t")          # miss #2
+    assert "combo_close_leg_unconfirmed" not in cap.types()
+    assert cap.settles == []
+    assert len(fake_moomoo.placed) == 1                       # re-placed
+    assert fake_moomoo.placed[0]["option_symbol"] == "US.SPY261016P00100000"
+    assert fake_moomoo.placed[0]["side"] == "BUY"
+
+
+def test_trim_vanished_leg_qty_reduced_books_unconfirmed(cap, fake_moomoo,
+                                                         monkeypatch):
+    """TRIM: the leg order fills late then vanishes from the today-only
+    map. The position is never flat after a partial close, so presence
+    alone would re-place and over-trim — the broker qty already being
+    reduced by the trim amount is the 'filled' signal."""
+    from trading_agent.exits import fill_confirm as fc
+    _patch_settle(monkeypatch, cap)
+    # trim 1 of 2: short leg already reduced 2 → 1 at the broker
+    fake_moomoo.positions_rows = [
+        {"code": "US.SPY261016P00100000", "qty": 1,
+         "position_side": "SHORT"},
+        {"code": "US.SPY261016P00095000", "qty": 1,
+         "position_side": "LONG"}]
+    state = _combo_state(units=1.0, settle_mode="trim",
+                         broker_qty_before=2.0)
+    order_map = {
+        "STC-1": {"order_status": "FILLED_ALL",
+                  "dealt_qty": 1, "dealt_avg_price": 0.20},
+        # BTC-1 absent (filled after the day's last tick)
+    }
+    fc._finalize_combo_close(7, state, order_map, "r", "t")   # miss #1
+    fc._finalize_combo_close(7, state, {}, "r", "t")          # miss #2
+    assert fake_moomoo.placed == [], "re-placing would over-trim one unit"
+    assert "combo_close_leg_unconfirmed" in cap.types()
+    trimmed = [e for e in cap.events
+               if e.get("event_type") == "combo_trimmed"]
+    assert len(trimmed) == 1
+    assert trimmed[0]["payload"]["unconfirmed"] is True
+    assert cap.cleared == [7]                    # trim completes, row OPEN
+
+
+def test_trim_vanished_leg_qty_intact_replaces(cap, fake_moomoo, monkeypatch):
+    """TRIM: order vanished with the broker qty UNREDUCED → it died
+    invisibly; re-place the leg close for the trim amount."""
+    from trading_agent.exits import fill_confirm as fc
+    _patch_settle(monkeypatch, cap)
+    fake_moomoo.positions_rows = [
+        {"code": "US.SPY261016P00100000", "qty": 2,
+         "position_side": "SHORT"},
+        {"code": "US.SPY261016P00095000", "qty": 2,
+         "position_side": "LONG"}]
+    state = _combo_state(units=1.0, settle_mode="trim",
+                         broker_qty_before=2.0)
+    order_map = {
+        "STC-1": {"order_status": "FILLED_ALL",
+                  "dealt_qty": 1, "dealt_avg_price": 0.20},
+    }
+    fc._finalize_combo_close(7, state, order_map, "r", "t")   # miss #1
+    fc._finalize_combo_close(7, state, {}, "r", "t")          # miss #2
+    assert "combo_close_leg_unconfirmed" not in cap.types()
+    assert len(fake_moomoo.placed) == 1
+    assert fake_moomoo.placed[0]["option_symbol"] == "US.SPY261016P00100000"
+    assert fake_moomoo.placed[0]["contracts"] == 1            # trim amount
+
+
+def test_trim_vanished_leg_ambiguous_qty_alerts_and_waits(cap, fake_moomoo,
+                                                          monkeypatch):
+    """Neither expected state matches (manual interference?) — never guess
+    with broker orders: sev-2 once, retry next tick."""
+    from trading_agent.exits import fill_confirm as fc
+    _patch_settle(monkeypatch, cap)
+    fake_moomoo.positions_rows = [
+        {"code": "US.SPY261016P00100000", "qty": 5,   # neither 1 nor 2
+         "position_side": "SHORT"}]
+    state = _combo_state(units=1.0, settle_mode="trim",
+                         broker_qty_before=2.0)
+    order_map = {
+        "STC-1": {"order_status": "FILLED_ALL",
+                  "dealt_qty": 1, "dealt_avg_price": 0.20},
+    }
+    fc._finalize_combo_close(7, state, order_map, "r", "t")   # miss #1
+    fc._finalize_combo_close(7, state, {}, "r", "t")          # miss #2
+    fc._finalize_combo_close(7, state, {}, "r", "t")          # miss #3
+    assert fake_moomoo.placed == []
+    assert cap.settles == []
+    ambiguous = [e for e in cap.events
+                 if e.get("event_type") == "combo_close_leg_ambiguous"]
+    assert len(ambiguous) == 1 and ambiguous[0]["severity"] == 2
+
+
+@pytest.fixture()
+def twin_db(tmp_path, monkeypatch):
+    """Real tmp SQLite (both stores' twin-close path); Postgres dark."""
+    import dataclasses
+    from trading_agent import config as config_mod
+    from trading_agent import db as db_mod
+    db_file = tmp_path / "trader_test.db"
+    new_cfg = dataclasses.replace(config_mod.CONFIG, db_path=db_file)
+    monkeypatch.setattr(config_mod, "CONFIG", new_cfg)
+    monkeypatch.setattr(db_mod, "CONFIG", new_cfg)
+    db_mod.migrate(db_file)
+
+    def _boom():
+        raise ConnectionError("no postgres in tests")
+    monkeypatch.setattr("trading_agent.store.postgres.cursor", _boom)
+    yield db_file
+
+
+def _insert_sqlite_twin(short: str, long: str, qty: float = 2.0) -> int:
+    import json as _json
+    from datetime import datetime, timezone
+    from trading_agent.db import connection
+    now = datetime.now(timezone.utc).isoformat()
+    with connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO trades (symbol, asset_type, side, qty, entry_price, "
+            "opened_at, outcome, is_paper) VALUES (?, 'OPT', 'SELL', ?, 1.2, "
+            "?, 'OPEN', 1)", (short, qty, now))
+        tid = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO market_snapshots (trade_id, taken_at, payload) "
+            "VALUES (?, ?, ?)",
+            (tid, now, _json.dumps({
+                "combo": True, "short_leg": short, "long_leg": long,
+                "net_credit": 1.2, "width": 5.0, "max_loss": 760.0,
+                "contracts": qty, "broker_order_ids": ["L1", "S1"]})))
+        conn.commit()
+    return tid
+
+
+def test_full_settle_closes_sqlite_twin_and_frees_wing(cap, twin_db,
+                                                       monkeypatch):
+    """An engine combo close settles the PG row AND the SQLite twin the
+    posttool hook dual-wrote — leaving the twin OPEN keeps the wing in
+    open_combo_long_legs forever, letting a future SELL on that exact
+    symbol classify as intent='close' and bypass R_NO_SHORT_OPEN."""
+    from trading_agent.combo import open_combo_long_legs
+    from trading_agent.db import connection
+    from trading_agent.exits import fill_confirm as fc
+    _patch_settle(monkeypatch, cap, ok=True, net=146.0)
+    short, long = "US.SPY261016P00100000", "US.SPY261016P00095000"
+    tid = _insert_sqlite_twin(short, long)
+    assert long in open_combo_long_legs()
+    state = _combo_state()
+    order_map = {
+        "BTC-1": {"order_status": "FILLED_ALL",
+                  "dealt_qty": 2, "dealt_avg_price": 0.64},
+        "STC-1": {"order_status": "FILLED_ALL",
+                  "dealt_qty": 2, "dealt_avg_price": 0.21},
+    }
+    fc._finalize_combo_close(7, state, order_map, "r", "t")
+    assert len(cap.settles) == 1                 # PG row settled
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT outcome, exit_price, pnl FROM trades WHERE id = ?",
+            (tid,)).fetchone()
+    assert row["outcome"] == "WIN"
+    assert row["exit_price"] == pytest.approx(0.43)
+    assert row["pnl"] == pytest.approx(146.0)
+    assert long not in open_combo_long_legs()    # wing freed
+
+
+def test_trim_settle_leaves_sqlite_twin_open(cap, twin_db, monkeypatch):
+    """A TRIM must NOT close the twin — the residual units stay open in
+    both stores."""
+    from trading_agent.db import connection
+    from trading_agent.exits import fill_confirm as fc
+    _patch_settle(monkeypatch, cap)
+    short, long = "US.SPY261016P00100000", "US.SPY261016P00095000"
+    tid = _insert_sqlite_twin(short, long)
+    state = _combo_state(units=1.0, settle_mode="trim",
+                         broker_qty_before=2.0)
+    order_map = {
+        "BTC-1": {"order_status": "FILLED_ALL",
+                  "dealt_qty": 1, "dealt_avg_price": 0.60},
+        "STC-1": {"order_status": "FILLED_ALL",
+                  "dealt_qty": 1, "dealt_avg_price": 0.20},
+    }
+    fc._finalize_combo_close(7, state, order_map, "r", "t")
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT outcome FROM trades WHERE id = ?", (tid,)).fetchone()
+    assert row["outcome"] == "OPEN"
 
 
 def test_finalize_dispatches_combo_states(monkeypatch):

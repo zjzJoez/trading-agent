@@ -80,6 +80,7 @@ class _Sim:
         self.single_leg_orders: list[dict] = []
         self.pending_writes: list[tuple] = []
         self.events: list[dict] = []
+        self.pending_ids: set[int] = set()
 
     def _fake_close_tool(self, **kw):
         self.close_calls.append(kw)
@@ -122,7 +123,10 @@ class _Sim:
                 return_value=pg_cursor))
             stack.enter_context(patch(
                 "trading_agent.exits.fill_confirm.pending_close_trade_ids_pg",
-                return_value=set()))
+                side_effect=lambda: set(self.pending_ids)))
+            stack.enter_context(patch(
+                "trading_agent.graph.nodes.intraday_nodes._alerted_today",
+                return_value=False))
             stack.enter_context(patch(
                 "trading_agent.mcp_servers.moomoo.server."
                 "close_paper_option_combo",
@@ -322,12 +326,192 @@ def test_excursions_mark_combo_net_of_legs():
     assert len(updates) == 1
     u = updates[0]
     # spread mid = 0.40; R_unit = 5% × 1.2 = 0.06 (implicit stop);
-    # realized_R = (0.40 − 1.2)/0.06 — favorable for a short credit
-    assert u.realized_R_now == pytest.approx((0.40 - 1.2) / 0.06)
+    # SHORT polarity: realized_R = (1.2 − 0.40)/0.06 — the spread decaying
+    # BELOW the net credit is favorable, so it must record as positive MFE.
+    assert u.realized_R_now == pytest.approx((1.2 - 0.40) / 0.06)
+    assert u.mfe_so_far == pytest.approx((1.2 - 0.40) / 0.06)
     write = [c for c in pg_cursor.execute.call_args_list
              if c.args and "SET mae_so_far" in c.args[0]]
     assert len(write) == 1
     assert write[0].args[1][3] == pytest.approx(0.40)   # last_quote_price
+
+
+def test_degraded_combo_payload_holds_and_places_nothing():
+    """M1-0.1 degrade contract: a PG combo row whose combo payload is
+    present-but-unparseable must HOLD + alert — NEVER fall through to
+    single-leg management (which would BUY back the short leg alone and
+    orphan the wing)."""
+    sim = _Sim()
+    sim.journal_row["combo"] = {"combo": True}   # legs/net_credit stripped
+    sim.run_intraday_tick()
+    short_decs = [d for d in sim.decisions if d["symbol"] == sim.short_sym]
+    assert len(short_decs) == 1
+    assert short_decs[0]["action"] == "HOLD"
+    assert short_decs[0]["reason"] == "combo_payload_unparseable"
+    # nothing reached the broker via ANY path
+    assert sim.close_calls == []
+    assert sim.single_leg_orders == []
+    assert sim.pending_writes == []
+    alerts = [e for e in sim.events
+              if e.get("event_type") == "combo_payload_unparseable"]
+    assert len(alerts) == 1 and alerts[0]["severity"] == 2
+
+
+def test_route_backstop_refuses_single_leg_short_close():
+    """Even with a fabricated EXIT decision, route must refuse a single-leg
+    close on a SHORT-direction plan with no combo meta (degraded combo)."""
+    from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+    short_sym, _long_sym = _syms(40)
+    events: list[dict] = []
+    placed: list[dict] = []
+    state = _base_state(
+        positions=[{"symbol": short_sym, "asset_type": "OPT", "qty": 2,
+                    "entry_price": 1.2, "mark": 0.9, "bid": 0.85,
+                    "ask": 0.95,
+                    "exit_plan": {"direction": "SHORT"}}],
+        journal={"exit_decisions": [
+            {"symbol": short_sym, "action": "EXIT_STOP",
+             "exit_qty_factor": 1.0, "reason": "fabricated"}]},
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "trading_agent.graph.nodes.intraday_nodes.emit",
+            side_effect=lambda **kw: events.append(kw)))
+        stack.enter_context(patch(
+            "trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
+            side_effect=lambda **kw: placed.append(kw)))
+        stack.enter_context(patch(
+            "trading_agent.mcp_servers.moomoo.server.place_paper_order",
+            side_effect=lambda **kw: placed.append(kw)))
+        stack.enter_context(patch(
+            "trading_agent.mcp_servers.moomoo.server.get_orders",
+            return_value={"rows": []}))
+        stack.enter_context(patch(
+            "trading_agent.store.postgres.get_open_journal_trades",
+            return_value=[{"symbol": short_sym, "trade_id": 15,
+                           "thesis_id": 4}]))
+        stack.enter_context(patch(
+            "trading_agent.exits.fill_confirm.pending_close_trade_ids_pg",
+            return_value=set()))
+        stack.enter_context(patch("trading_agent.notify.send"))
+        route_exit_or_hold(state)
+    assert placed == [], "single-leg close on a degraded combo row placed!"
+    refused = [e for e in events
+               if e.get("event_type") == "combo_single_leg_close_refused"]
+    assert len(refused) == 1 and refused[0]["severity"] == 2
+
+
+def test_combo_qty_mismatch_during_pending_close_holds_quietly():
+    """Leg qtys diverging while a combo close is in flight is a NORMAL
+    pending state (trim legs filling across a tick boundary) — HOLD with
+    no sev-2 page."""
+    sim = _Sim()
+    sim.pending_ids = {15}
+    sim.broker_positions[0]["qty"] = 1      # short trimmed 2→1
+    sim.broker_positions[1]["qty"] = 2      # long STC still working
+    sim.run_intraday_tick()
+    dec = next(d for d in sim.decisions if d["symbol"] == sim.short_sym)
+    assert dec["action"] == "HOLD"
+    assert dec["reason"] == "combo_close_in_flight"
+    mismatches = [e for e in sim.events
+                  if e.get("event_type") == "combo_leg_qty_mismatch"]
+    assert mismatches == []
+    # route also placed nothing (trade already pending)
+    assert sim.close_calls == []
+
+
+def test_combo_qty_mismatch_without_pending_close_still_pages():
+    sim = _Sim()
+    sim.broker_positions[0]["qty"] = 1
+    sim.run_intraday_tick()
+    dec = next(d for d in sim.decisions if d["symbol"] == sim.short_sym)
+    assert dec["action"] == "HOLD"
+    assert dec["reason"] == "combo_leg_qty_mismatch"
+    mismatches = [e for e in sim.events
+                  if e.get("event_type") == "combo_leg_qty_mismatch"]
+    assert len(mismatches) == 1 and mismatches[0]["severity"] == 2
+
+
+def test_residual_wing_during_pending_close_no_manual_alert():
+    """Short leg closed before the wing: the residual wing surfacing alone
+    at the broker mid-close must not fire the manual-trade alert."""
+    sim = _Sim()
+    sim.pending_ids = {15}
+    sim.broker_positions = [sim.broker_positions[1]]   # only the wing left
+    sim.run_intraday_tick()
+    wing_dec = next(d for d in sim.decisions
+                    if d["symbol"] == sim.long_sym)
+    assert wing_dec["action"] == "HOLD"
+    assert wing_dec["reason"] == "combo_close_in_flight_residual_leg"
+    no_plan = [e for e in sim.events
+               if e.get("event_type") == "position_no_exit_plan"]
+    assert no_plan == []
+
+
+def test_eod_mark_to_market_marks_combo_net_of_legs_short_polarity():
+    """EOD marks: a combo row is marked short_last − long_last with SHORT
+    polarity — the short leg's price alone with LONG polarity reports a
+    healthy credit spread as a loss (sign-inverted AND wing-blind)."""
+    from trading_agent.graph.nodes import eod_nodes
+    short_sym, long_sym = _syms(40)
+    trade = {
+        "symbol": short_sym, "entry_price": 1.2, "qty": 2.0, "side": "SELL",
+        "stop": None, "target": None, "thesis_id": 4,
+        "strategy_label": "credit_put_spread_30_45",
+        "combo": {"combo": True, "short_leg": short_sym,
+                  "long_leg": long_sym, "net_credit": 1.2, "width": 5.0,
+                  "max_loss": 760.0, "contracts": 2.0,
+                  "broker_order_ids": ["L1", "S1"]},
+    }
+    events: list[dict] = []
+    state = _base_state(journal={"open_trades": [trade]})
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "trading_agent.graph.nodes.eod_nodes.emit",
+            side_effect=lambda **kw: events.append(kw)))
+        stack.enter_context(patch(
+            "trading_agent.mcp_servers.moomoo.server.get_quote",
+            return_value={"rows": [
+                {"code": short_sym, "last_price": 0.62},
+                {"code": long_sym, "last_price": 0.22},
+            ]}))
+        out = eod_nodes.mark_to_market(state)
+    marked = out["journal"]["marked_positions"]
+    assert len(marked) == 1
+    assert marked[0]["combo"] is True
+    assert marked[0]["mark"] == pytest.approx(0.40)
+    # SHORT polarity: (1.2 − 0.40) × 2 × 100 = +160 (the spread DECAYING is
+    # the win) — the old single-leg math reported (0.62−1.2)×2×100 = −116.
+    assert marked[0]["unrealized_pnl"] == pytest.approx(160.0)
+    assert out["journal"]["total_unrealized_pnl"] == pytest.approx(160.0)
+
+
+def test_eod_mark_to_market_skips_combo_with_unquotable_leg():
+    from trading_agent.graph.nodes import eod_nodes
+    short_sym, long_sym = _syms(40)
+    trade = {
+        "symbol": short_sym, "entry_price": 1.2, "qty": 2.0, "side": "SELL",
+        "combo": {"combo": True, "short_leg": short_sym,
+                  "long_leg": long_sym, "net_credit": 1.2,
+                  "contracts": 2.0},
+    }
+    events: list[dict] = []
+    state = _base_state(journal={"open_trades": [trade]})
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "trading_agent.graph.nodes.eod_nodes.emit",
+            side_effect=lambda **kw: events.append(kw)))
+        stack.enter_context(patch(
+            "trading_agent.mcp_servers.moomoo.server.get_quote",
+            return_value={"rows": [
+                {"code": short_sym, "last_price": 0.62},   # wing unquoted
+            ]}))
+        out = eod_nodes.mark_to_market(state)
+    assert out["journal"]["marked_positions"] == []
+    assert out["journal"]["total_unrealized_pnl"] == 0.0
+    computed = next(e for e in events
+                    if e.get("event_type") == "marks_computed")
+    assert computed["payload"]["combo_skipped_unquotable"] == 1
 
 
 def test_excursions_skip_combo_when_leg_unquotable():

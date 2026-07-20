@@ -160,6 +160,29 @@ def test_combo_dual_writes_postgres_row_with_combo_plan(post_db, monkeypatch):
     assert fill["entry_fees"] == 2.0               # 2 legs × $1 × 1 contract
 
 
+def test_combo_sqlite_failure_still_attempts_pg_dual_write(post_db, monkeypatch):
+    """A Mac-side SQLite hiccup must NOT abort the Postgres dual-write —
+    the PG row is the engine-visibility write (exit plan, 21-DTE, 50%-PT),
+    the more safety-critical of the two. Without it the freshly-opened combo
+    is invisible to the exit engine entirely."""
+    from trading_agent.hooks import posttool_fill_capture as pf
+
+    def _sqlite_boom(**kw):
+        raise RuntimeError("sqlite locked")
+    monkeypatch.setattr(pf, "_insert_trade_row", _sqlite_boom)
+    _PgCaptureCtx.calls = []
+    monkeypatch.setattr("trading_agent.store.postgres.cursor",
+                        lambda: _PgCaptureCtx())
+    tid = _insert_thesis("SPY")
+    rc = _run_post(monkeypatch, _combo_payload(thesis_id=tid))
+    assert rc == 0
+    inserts = [(sql, p) for sql, p in _PgCaptureCtx.calls
+               if "INSERT INTO journal_trades" in sql]
+    assert len(inserts) == 1, "PG dual-write must run despite SQLite failure"
+    symbol = inserts[0][1][0]
+    assert symbol == "US.SPY260717P00100000"
+
+
 def test_combo_pg_dual_write_failure_keeps_sqlite_row_and_exits_zero(post_db, monkeypatch):
     """The hook is telemetry, never a gate: Postgres down → audit line,
     exit 0, SQLite combo row still lands."""

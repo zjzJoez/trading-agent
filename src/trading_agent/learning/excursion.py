@@ -207,7 +207,14 @@ def update_excursions_once(now: datetime | None = None) -> list[ExcursionUpdate]
         if mid is None:
             continue
         R_unit = _R_per_unit(entry_f, _safe_float(stop))
-        realized_R = (mid - entry_f) / R_unit
+        if meta is not None:
+            # Combo rows are SHORT the spread: entry is the net CREDIT and a
+            # FALLING spread value is favorable. LONG polarity here would
+            # record every winning combo as a large negative realized_R
+            # (MAE/MFE semantically swapped for all combo learning data).
+            realized_R = (entry_f - mid) / R_unit
+        else:
+            realized_R = (mid - entry_f) / R_unit
         prev_mae = float(mae) if mae is not None else realized_R
         prev_mfe = float(mfe) if mfe is not None else realized_R
         new_mae = min(prev_mae, realized_R)
