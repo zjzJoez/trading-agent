@@ -229,6 +229,39 @@ def default_exit_plan(
     )
 
 
+def combo_exit_plan(net_credit: float, width: float) -> ExitPlan:
+    """Exit plan for a defined-risk credit vertical, baked at OPEN time.
+
+    The plan is written against the WHOLE spread: entry = net_credit, mark =
+    spread value (short mark − long mark), direction SHORT. The hard executor
+    then prices both M1-0.1 triggers with zero code change:
+
+      * 50% profit-take: ``hard_target = 0.5 × net_credit`` — the SHORT
+        target branch fires on ``mark <= target``.
+      * 21-DTE force-close: ``force_exit_at_dte = 21`` — the SHORT DTE
+        branch fires from the short leg's symbol (the synthetic combo
+        position keeps the short-leg symbol for DTE parsing).
+
+    ``hard_stop = width`` is deliberately inert: a vertical's spread value
+    cannot exceed its width — the defined-risk structure IS the stop.
+
+    Do NOT use ``default_exit_plan(direction="SHORT")`` here: it attaches a
+    0.5 scale-out rung + trailing stop, which violates "whole units only /
+    never leg apart" on 1–2 lot verticals (a rung would try to close half
+    a spread). No ladder, no trail — full closes and P0b whole-unit trims
+    only.
+    """
+    return ExitPlan(
+        direction="SHORT",
+        hard_stop=width,
+        hard_target=round(0.5 * net_credit, 2),
+        scale_out_ladder=[],
+        trail_stop=None,
+        dte_rules=DteRulesConfig(force_exit_at_dte=21),
+        time_in_trade_max_days=60,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Regime
 # -----------------------------------------------------------------------------

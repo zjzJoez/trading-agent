@@ -110,3 +110,67 @@ def test_combo_rollback_response_journals_nothing(post_db, monkeypatch):
     with connection() as conn:
         n = conn.execute("SELECT COUNT(*) AS c FROM trades").fetchone()["c"]
     assert n == 0
+
+
+class _PgCaptureCtx:
+    calls: list[tuple] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        _PgCaptureCtx.calls.append((sql, params))
+
+
+def test_combo_dual_writes_postgres_row_with_combo_plan(post_db, monkeypatch):
+    """D2: the exit engine reads ONLY Postgres journal_trades — the combo
+    branch must dual-write an engine-visible row there: symbol=short leg,
+    side=SELL, entry_price=net_credit, exit_plan=combo_exit_plan (50%-PT +
+    21-DTE), broker_fill_json.combo = canonical payload, 2-leg entry fees."""
+    _PgCaptureCtx.calls = []
+    monkeypatch.setattr("trading_agent.store.postgres.cursor",
+                        lambda: _PgCaptureCtx())
+    tid = _insert_thesis("SPY")
+    rc = _run_post(monkeypatch, _combo_payload(thesis_id=tid))
+    assert rc == 0
+    inserts = [(sql, p) for sql, p in _PgCaptureCtx.calls
+               if "INSERT INTO journal_trades" in sql]
+    assert len(inserts) == 1
+    _sql, params = inserts[0]
+    symbol, qty, entry_price, boid, plan_json, fill_json = params
+    assert symbol == "US.SPY260717P00100000"       # short leg anchors
+    assert qty == 1.0
+    assert entry_price == 1.2                      # net credit
+    assert boid == "L1"                            # long leg placed first
+    plan = json.loads(plan_json)
+    assert plan["direction"] == "SHORT"
+    assert plan["hard_target"] == 0.6              # 50% of net credit
+    assert plan["hard_stop"] == 5.0                # width (inert)
+    assert plan["dte_rules"]["force_exit_at_dte"] == 21
+    assert plan["scale_out_ladder"] == []          # whole units only (C7)
+    assert plan["trail_stop"] is None
+    fill = json.loads(fill_json)
+    assert fill["combo"]["short_leg"] == "US.SPY260717P00100000"
+    assert fill["combo"]["long_leg"] == "US.SPY260717P00095000"
+    assert fill["combo"]["broker_order_ids"] == ["L1", "S1"]
+    assert fill["provenance"] == "agent"
+    assert fill["entry_fees"] == 2.0               # 2 legs × $1 × 1 contract
+
+
+def test_combo_pg_dual_write_failure_keeps_sqlite_row_and_exits_zero(post_db, monkeypatch):
+    """The hook is telemetry, never a gate: Postgres down → audit line,
+    exit 0, SQLite combo row still lands."""
+    from trading_agent.db import connection
+
+    def _boom():
+        raise ConnectionError("no postgres on this box")
+    monkeypatch.setattr("trading_agent.store.postgres.cursor", _boom)
+    tid = _insert_thesis("SPY")
+    rc = _run_post(monkeypatch, _combo_payload(thesis_id=tid))
+    assert rc == 0
+    with connection() as conn:
+        n = conn.execute("SELECT COUNT(*) AS c FROM trades").fetchone()["c"]
+    assert n == 1

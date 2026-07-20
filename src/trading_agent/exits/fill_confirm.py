@@ -104,6 +104,68 @@ def build_pending_state(
     }
 
 
+def build_pending_combo_state(
+    *,
+    symbol: str,
+    action: str,
+    reason: str,
+    units: float,
+    settle_mode: str,               # "full" | "trim"
+    net_credit: float,
+    short_leg: str,
+    long_leg: str,
+    short_order_id: str | None,
+    long_order_id: str | None,
+    short_price: float,
+    long_price: float,
+    short_bid: float | None,
+    short_ask: float | None,
+    long_bid: float | None,
+    long_ask: float | None,
+    thesis_id: int | None,
+    source: str,
+) -> dict[str, Any]:
+    """Two-leg pending close state for one combo (M1-0.1).
+
+    Stored under the SAME ``PENDING_KEY`` as single-leg states, so
+    ``pending_close_trade_ids_*`` and the route-side duplicate guard work
+    unchanged — one pending close per trade, either shape. A leg with
+    ``order_id`` None is re-placed by ``_finalize_combo_close`` (e.g. the
+    long-leg close after a leg-2 rejection at placement time).
+    """
+    now = _now_iso()
+
+    def _leg(name: str, leg_symbol: str, side: str, order_id: str | None,
+             px: float, bid: float | None, ask: float | None) -> dict:
+        return {
+            "leg": name, "symbol": leg_symbol, "side": side,
+            "qty": float(units), "order_id": order_id, "dealt_legs": [],
+            "requested_exit_price": float(px),
+            "quoted_bid": bid, "quoted_ask": ask,
+            "placed_at": now, "attempts": 0, "missing_ticks": 0,
+            "exhausted_alerted": False, "blocked_alerted": False,
+        }
+
+    return {
+        "combo": True,
+        "settle_mode": settle_mode,
+        "symbol": symbol,
+        "action": action,
+        "reason": reason[:280],
+        "qty": float(units),
+        "net_credit": float(net_credit),
+        "thesis_id": thesis_id,
+        "source": source,
+        "placed_at": now,
+        "legs": [
+            _leg("short_close", short_leg, "BUY", short_order_id,
+                 short_price, short_bid, short_ask),
+            _leg("long_close", long_leg, "SELL", long_order_id,
+                 long_price, long_bid, long_ask),
+        ],
+    }
+
+
 def _legs_qty(state: dict) -> float:
     return sum(float(leg.get("qty") or 0) for leg in (state.get("dealt_legs") or []))
 
@@ -287,22 +349,27 @@ def _net_pnl_for_close(
     asset_type: str,
     side_opened: str,
     entry_fees: float | None,
+    n_legs: int = 1,
 ) -> tuple[float, float]:
-    """(net_pnl, exit_fees). Both prices are dealt — only fees apply."""
+    """(net_pnl, exit_fees). Both prices are dealt — only fees apply.
+
+    ``n_legs``: broker legs per unit — a two-leg vertical pays commission on
+    BOTH legs per side (C6). Default 1 keeps existing callers bit-identical.
+    """
     from trading_agent.execution_costs import fees_per_side
     mult = 100.0 if str(asset_type).upper() == "OPT" else 1.0
     if str(side_opened).upper() == "SELL":
         gross = (entry_price - dealt_exit_price) * qty * mult
     else:
         gross = (dealt_exit_price - entry_price) * qty * mult
-    exit_fees = fees_per_side(qty, asset_type)
+    exit_fees = fees_per_side(qty, asset_type) * n_legs
     if entry_fees is None:
-        entry_fees = fees_per_side(qty, asset_type)
+        entry_fees = fees_per_side(qty, asset_type) * n_legs
     return round(gross - float(entry_fees) - exit_fees, 2), exit_fees
 
 
 def _settle(trade_id: int, state: dict, final_qty: float, final_price: float,
-            *, unconfirmed: bool = False) -> tuple[bool, float]:
+            *, unconfirmed: bool = False, n_legs: int = 1) -> tuple[bool, float]:
     """Close the journal row over the TOTAL dealt quantity (legs + final fill)
     at the blended exit price. Returns (ok, net_pnl)."""
     total_qty, avg_price = _blended_exit(state, final_qty, final_price)
@@ -312,11 +379,12 @@ def _settle(trade_id: int, state: dict, final_qty: float, final_price: float,
         return _close_sqlite(trade_id, state, avg_price, total_qty,
                              unconfirmed=unconfirmed)
     return _close_pg(trade_id, state, avg_price, total_qty,
-                     unconfirmed=unconfirmed)
+                     unconfirmed=unconfirmed, n_legs=n_legs)
 
 
 def _close_pg(trade_id: int, state: dict, dealt_price: float,
-              dealt_qty: float, *, unconfirmed: bool = False) -> tuple[bool, float]:
+              dealt_qty: float, *, unconfirmed: bool = False,
+              n_legs: int = 1) -> tuple[bool, float]:
     """Close a Postgres journal row at the dealt price. Returns (ok, net_pnl)."""
     try:
         from trading_agent.store.postgres import cursor
@@ -342,6 +410,7 @@ def _close_pg(trade_id: int, state: dict, dealt_price: float,
             asset_type=str(asset_type or "OPT"),
             side_opened=str(side or "BUY"),
             entry_fees=float(entry_fees) if entry_fees is not None else None,
+            n_legs=n_legs,
         )
         outcome = _outcome_for_pnl(net)
         close_reason = state.get("action") or "EXIT"
@@ -647,6 +716,293 @@ def _iter_pending() -> list[tuple[int, dict]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Two-leg (combo) pending close — per-leg state machine
+# ---------------------------------------------------------------------------
+
+def _leg_dealt_qty(leg: dict) -> float:
+    return sum(float(x.get("qty") or 0) for x in (leg.get("dealt_legs") or []))
+
+
+def _leg_remaining(leg: dict) -> float:
+    return max(0.0, float(leg.get("qty") or 0) - _leg_dealt_qty(leg))
+
+
+def _leg_avg_price(leg: dict) -> float | None:
+    legs = leg.get("dealt_legs") or []
+    total = sum(float(x.get("qty") or 0) for x in legs)
+    if total <= 0:
+        return None
+    return sum(float(x["qty"]) * float(x["price"]) for x in legs) / total
+
+
+def _replace_combo_leg(trade_id: int, state: dict, leg: dict,
+                       run_id: str, trigger: str) -> None:
+    """Place a fresh close order for one combo leg's not-yet-dealt remainder.
+
+    BTC the short leg / STC the long leg via place_paper_option_order at a
+    fresh per-leg marketable limit. Sized target − dealt so a partial
+    terminal can never over-close. An ``order_blocked`` reply is always a
+    bug (order_guard must classify combo-leg closes as intent='close' —
+    open_combo_long_legs awareness) → sev-2 alert once per leg.
+    """
+    remaining = _leg_remaining(leg)
+    if remaining <= 0:
+        return
+    try:
+        from trading_agent.mcp_servers.moomoo.server import (
+            place_paper_option_order,
+        )
+    except Exception as e:
+        log.warning("_replace_combo_leg: moomoo import failed: %s", e)
+        return
+
+    new_limit, bid, ask = _fresh_marketable_exit(
+        leg["symbol"], leg["side"], float(leg["requested_exit_price"]))
+    try:
+        result = place_paper_option_order(
+            option_symbol=leg["symbol"], side=leg["side"],
+            contracts=int(remaining), price=new_limit,
+            thesis_id=int(trade_id), strategy_label=None,
+        )
+    except Exception as e:
+        log.warning("_replace_combo_leg %s failed: %s", leg["symbol"], e)
+        return
+
+    if result.get("order_blocked"):
+        if not leg.get("blocked_alerted"):
+            leg["blocked_alerted"] = True
+            emit(run_id=run_id, trigger=trigger, agent="finalize_pending_exits",
+                 event_type="exit_order_blocked_by_guard", severity=2,
+                 payload={"trade_id": trade_id, "symbol": leg["symbol"],
+                          "combo_leg": leg.get("leg"),
+                          "violations": result.get("violations")})
+        return
+
+    rows = result.get("rows") or []
+    new_id = str(rows[0].get("order_id") or rows[0].get("orderID") or "").strip() if rows else ""
+    if new_id:
+        leg.update({
+            "order_id": new_id,
+            "requested_exit_price": new_limit,
+            "quoted_bid": bid,
+            "quoted_ask": ask,
+            "placed_at": _now_iso(),
+            "missing_ticks": 0,
+        })
+        emit(run_id=run_id, trigger=trigger, agent="finalize_pending_exits",
+             event_type="exit_order_replaced",
+             payload={"trade_id": trade_id, "symbol": leg["symbol"],
+                      "combo_leg": leg.get("leg"), "new_order_id": new_id,
+                      "new_limit": new_limit, "remaining_qty": remaining})
+    else:
+        leg["order_id"] = None
+        emit(run_id=run_id, trigger=trigger, agent="finalize_pending_exits",
+             event_type="exit_replace_failed", severity=2,
+             payload={"trade_id": trade_id, "symbol": leg["symbol"],
+                      "combo_leg": leg.get("leg")})
+
+
+def _advance_combo_leg(trade_id: int, state: dict, leg: dict,
+                       order_map: dict[str, dict], run_id: str,
+                       trigger: str) -> None:
+    """One tick of the per-leg state machine (same shape as the single-leg
+    machine, at leg scope). Mutates ``leg`` in place; the caller persists."""
+    if _leg_remaining(leg) <= 0:
+        leg["order_id"] = None
+        return
+    order_id = leg.get("order_id")
+    if not order_id:
+        _replace_combo_leg(trade_id, state, leg, run_id, trigger)
+        return
+    order = order_map.get(str(order_id))
+    status = ""
+    if order:
+        status = str(order.get("order_status")
+                     or order.get("order_status_str") or "").upper()
+
+    if order is None:
+        # get_orders is today-only. Reconcile per-leg against live positions
+        # after MAX_MISSING_TICKS: short leg flat = its close filled; long
+        # leg flat = its close filled.
+        leg["missing_ticks"] = int(leg.get("missing_ticks") or 0) + 1
+        if leg["missing_ticks"] < MAX_MISSING_TICKS:
+            return
+        held = _position_still_held(leg["symbol"])
+        if held is False:
+            leg.setdefault("dealt_legs", []).append(
+                {"qty": _leg_remaining(leg),
+                 "price": float(leg["requested_exit_price"])})
+            leg["unconfirmed"] = True
+            leg["order_id"] = None
+            emit(run_id=run_id, trigger=trigger,
+                 agent="finalize_pending_exits",
+                 event_type="combo_close_leg_unconfirmed", severity=2,
+                 payload={"trade_id": trade_id, "symbol": leg["symbol"],
+                          "combo_leg": leg.get("leg"), "order_id": order_id,
+                          "settled_at": leg["requested_exit_price"]})
+        elif held is True:
+            leg["order_id"] = None
+            leg["missing_ticks"] = 0
+            _replace_combo_leg(trade_id, state, leg, run_id, trigger)
+        # held is None → broker unreachable; try again next tick.
+        return
+
+    if status in _FILLED:
+        dealt = order.get("dealt_avg_price") or order.get("dealt_avg_px")
+        dealt_qty = order.get("dealt_qty") or order.get("qty") or _leg_remaining(leg)
+        try:
+            dealt_f = float(dealt)
+        except (TypeError, ValueError):
+            dealt_f = float(leg["requested_exit_price"])
+        leg.setdefault("dealt_legs", []).append(
+            {"qty": float(dealt_qty), "price": dealt_f})
+        leg["order_id"] = None
+    elif status in _DEAD:
+        dealt_qty = 0.0
+        try:
+            dealt_qty = float(order.get("dealt_qty") or 0)
+        except (TypeError, ValueError):
+            pass
+        if dealt_qty > 0:
+            dealt = order.get("dealt_avg_price") or order.get("dealt_avg_px")
+            try:
+                leg_price = float(dealt)
+            except (TypeError, ValueError):
+                leg_price = float(leg["requested_exit_price"])
+            leg.setdefault("dealt_legs", []).append(
+                {"qty": dealt_qty, "price": leg_price})
+            emit(run_id=run_id, trigger=trigger,
+                 agent="finalize_pending_exits",
+                 event_type="exit_partial_terminal", severity=1,
+                 payload={"trade_id": trade_id, "symbol": leg["symbol"],
+                          "combo_leg": leg.get("leg"), "order_id": order_id,
+                          "dealt_qty": dealt_qty, "dealt_price": leg_price,
+                          "remaining": _leg_remaining(leg)})
+        leg["order_id"] = None
+        _replace_combo_leg(trade_id, state, leg, run_id, trigger)
+    elif status in _PARTIAL:
+        # Partially filled and still working — NEVER cancel; legs enter the
+        # books only from terminal states.
+        return
+    else:
+        # Still resting. Reprice when stale (zero-fill only).
+        if leg.get("missing_ticks"):
+            leg["missing_ticks"] = 0
+        age = _age_seconds(leg.get("placed_at") or state.get("placed_at"))
+        if age is None or age < REPRICE_AFTER_SECONDS:
+            return
+        attempts = int(leg.get("attempts") or 0)
+        if attempts >= MAX_REPRICE_ATTEMPTS:
+            if not leg.get("exhausted_alerted"):
+                leg["exhausted_alerted"] = True
+                emit(run_id=run_id, trigger=trigger,
+                     agent="finalize_pending_exits",
+                     event_type="combo_close_leg_stuck", severity=2,
+                     payload={"trade_id": trade_id, "symbol": leg["symbol"],
+                              "combo_leg": leg.get("leg"),
+                              "order_id": order_id, "attempts": attempts})
+            return
+        dealt_now = 0.0
+        try:
+            dealt_now = float(order.get("dealt_qty") or 0)
+        except (TypeError, ValueError):
+            pass
+        if dealt_now > 0:
+            return  # any dealt quantity → never cancel
+        try:
+            from trading_agent.mcp_servers.moomoo.server import (
+                cancel_paper_order,
+            )
+            cancel_paper_order(order_id=order_id)
+        except Exception as e:
+            log.warning("combo leg reprice cancel %s failed: %s", order_id, e)
+            return
+        leg["attempts"] = attempts + 1
+        leg["order_id"] = None
+        _replace_combo_leg(trade_id, state, leg, run_id, trigger)
+
+
+def _finalize_combo_close(trade_id: int, state: dict,
+                          order_map: dict[str, dict], run_id: str,
+                          trigger: str) -> None:
+    """Advance both legs of a pending combo close; settle ONLY when BOTH
+    legs are fully dealt (invariant: the journal row is never settled while
+    any leg has a live broker order).
+
+    Settlement: ``net_debit = short_avg − long_avg`` (per-leg blended avgs).
+      * settle_mode "full" → journal close at dealt_price=net_debit,
+        dealt_qty=units, 2-leg exit fees. SHORT side_opened math gives
+        gross = (net_credit − net_debit) × qty × 100. Thesis flip as today.
+      * settle_mode "trim" → clear pending, row stays OPEN, emit
+        ``combo_trimmed`` (trim P&L is event-only, matching single-leg
+        scale-out behavior — C8).
+    """
+    legs = state.get("legs") or []
+    short_leg = next((x for x in legs if x.get("leg") == "short_close"), None)
+    long_leg = next((x for x in legs if x.get("leg") == "long_close"), None)
+    if short_leg is None or long_leg is None:
+        emit(run_id=run_id, trigger=trigger, agent="finalize_pending_exits",
+             event_type="combo_pending_state_malformed", severity=2,
+             payload={"trade_id": trade_id, "state_keys": sorted(state)})
+        return
+
+    for leg in (short_leg, long_leg):
+        _advance_combo_leg(trade_id, state, leg, order_map, run_id, trigger)
+
+    if (_leg_remaining(short_leg) > 0 or _leg_remaining(long_leg) > 0
+            or short_leg.get("order_id") or long_leg.get("order_id")):
+        # Not settleable yet — persist leg progress and wait.
+        write_pending_close(trade_id, state)
+        return
+
+    short_avg = _leg_avg_price(short_leg)
+    long_avg = _leg_avg_price(long_leg)
+    if short_avg is None or long_avg is None:
+        write_pending_close(trade_id, state)
+        return
+    net_debit = round(short_avg - long_avg, 4)
+    units = float(state.get("qty") or 0)
+    unconfirmed = bool(short_leg.get("unconfirmed")
+                       or long_leg.get("unconfirmed"))
+
+    if state.get("settle_mode") == "trim":
+        try:
+            from trading_agent.execution_costs import fees_per_side
+            exit_fees = fees_per_side(units, "OPT") * 2
+        except Exception:
+            exit_fees = 0.0
+        net_credit = float(state.get("net_credit") or 0)
+        realized = round((net_credit - net_debit) * units * 100.0 - exit_fees, 2)
+        _clear_pending(trade_id, state)
+        emit(run_id=run_id, trigger=trigger, agent="finalize_pending_exits",
+             event_type="combo_trimmed",
+             payload={"trade_id": trade_id, "symbol": state.get("symbol"),
+                      "units": units, "net_debit": net_debit,
+                      "realized": realized, "unconfirmed": unconfirmed})
+        return
+
+    ok, net = _settle(trade_id, state, units, net_debit,
+                      unconfirmed=unconfirmed, n_legs=2)
+    if ok:
+        emit(
+            run_id=run_id, trigger=trigger, agent="finalize_pending_exits",
+            event_type="position_closed",
+            payload={
+                "trade_id": trade_id, "symbol": state.get("symbol"),
+                "action": state.get("action"), "qty_closed": units,
+                "exit_price": net_debit, "net_pnl": net,
+                "reason": state.get("reason"), "combo": True,
+                "fill_confirmed": not unconfirmed,
+            },
+        )
+        _notify_exit_filled(state, net_debit, net)
+    else:
+        # Row vanished / store error — state may already be cleared by
+        # _close_pg's double-finalize guard; nothing more to do this tick.
+        log.warning("_finalize_combo_close(%s): settle failed", trade_id)
+
+
 def finalize_pending_exits(order_map: dict[str, dict], run_id: str,
                            trigger: str) -> dict:
     """Settle every in-flight close against the live broker order map.
@@ -654,7 +1010,14 @@ def finalize_pending_exits(order_map: dict[str, dict], run_id: str,
     Returns counters for the caller's audit event.
     """
     confirmed = repriced = dead = waiting = replaced = unresolved = 0
+    combo_count = 0
     for trade_id, state in _iter_pending():
+        # Combo states run their own two-leg machine; everything below is
+        # byte-identical for single-leg states.
+        if state.get("combo"):
+            _finalize_combo_close(trade_id, state, order_map, run_id, trigger)
+            combo_count += 1
+            continue
         order_id = state.get("order_id")
 
         # No live order (previous one died / replacement failed) → re-place.
@@ -775,7 +1138,8 @@ def finalize_pending_exits(order_map: dict[str, dict], run_id: str,
             else:
                 waiting += 1
     return {"confirmed": confirmed, "repriced": repriced, "dead": dead,
-            "waiting": waiting, "replaced": replaced, "unresolved": unresolved}
+            "waiting": waiting, "replaced": replaced, "unresolved": unresolved,
+            "combo": combo_count}
 
 
 def _age_seconds(placed_at_iso: Any) -> float | None:
@@ -812,6 +1176,7 @@ __all__ = [
     "MAX_REPRICE_ATTEMPTS",
     "PENDING_KEY",
     "REPRICE_AFTER_SECONDS",
+    "build_pending_combo_state",
     "build_pending_state",
     "finalize_pending_exits",
     "find_adoptable_close_order",

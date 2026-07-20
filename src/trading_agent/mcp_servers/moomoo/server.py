@@ -40,6 +40,7 @@ from trading_agent.order_guard import (
     audit_decision,
     evaluate_combo,
     evaluate_order,
+    parse_option_symbol,
 )
 
 # ---------------------------------------------------------------------------
@@ -745,6 +746,255 @@ def place_paper_option_combo(
         "width": summary.get("width"),
         "max_loss": summary.get("max_loss"),
         "combo_rows": long_rows + _df_records(df_s),
+    }
+
+
+def _combo_close_refusal(reason: str, symbol: str, detail: str | None = None) -> dict:
+    """Audit + return one close-combo refusal. Response deliberately carries
+    neither ``combo: True`` nor ``rows`` so posttool_fill_capture can never
+    journal a refused close as a new position."""
+    decision = GuardDecision(allowed=False, reason=reason, symbol=symbol,
+                             intent="close")
+    audit_decision(decision, guard_name="server_order_guard",
+                   tool_name="close_paper_option_combo")
+    out = {"combo_close_blocked": True, "reason": reason}
+    if detail:
+        out["detail"] = detail
+    return out
+
+
+def _find_matching_open_combo(short_leg: str, long_leg: str) -> float:
+    """Best OPEN journaled combo units matching BOTH legs, across stores.
+
+    Returns the largest open unit count found (0.0 when no store has a
+    matching OPEN combo row). Store errors degrade to "that store
+    contributes nothing" — with both stores dark the result is 0.0 and the
+    caller refuses (never close what the journal doesn't know)."""
+    from trading_agent.combo import combo_meta, sqlite_combo_payloads
+    best = 0.0
+    try:
+        from trading_agent.db import connection
+        with connection() as conn:
+            rows = conn.execute(
+                "SELECT id, qty FROM trades WHERE outcome = 'OPEN'"
+            ).fetchall()
+        qty_by_id = {int(r["id"]): float(r["qty"] or 0) for r in rows}
+        for tid, payload in sqlite_combo_payloads(list(qty_by_id)).items():
+            meta = combo_meta(payload)
+            if (meta is not None and meta.short_leg == short_leg
+                    and meta.long_leg == long_leg):
+                best = max(best, qty_by_id.get(tid, 0.0))
+    except Exception as e:
+        print(f"[close_paper_option_combo] sqlite journal probe failed: {e}",
+              file=sys.stderr)
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                "SELECT qty, broker_fill_json->'combo' FROM journal_trades "
+                "WHERE outcome = 'OPEN' AND broker_fill_json ? 'combo'",
+            )
+            for qty, payload in cur.fetchall():
+                meta = combo_meta(payload)
+                if (meta is not None and meta.short_leg == short_leg
+                        and meta.long_leg == long_leg):
+                    best = max(best, float(qty or 0))
+    except Exception as e:
+        print(f"[close_paper_option_combo] postgres journal probe failed: {e}",
+              file=sys.stderr)
+    return best
+
+
+@mcp.tool()
+def close_paper_option_combo(
+    short_leg_symbol: str,
+    long_leg_symbol: str,
+    contracts: int,
+    short_price: float,
+    long_price: float,
+    trade_id: int | None = None,
+) -> dict:
+    """Atomically CLOSE a defined-risk two-leg vertical on the PAPER account.
+
+    The ONLY sanctioned close path for a journaled combo. Places the
+    BUY-to-close of the SHORT leg FIRST (removes assignment risk before
+    touching the wing), then the SELL-to-close of the LONG leg.
+
+    Its own gate — evaluate_order/evaluate_combo are deliberately NOT used
+    (both would misfire on a close): (1) legs must parse and be a real
+    vertical (same underlying + expiry + right, long caps short); (2) an
+    OPEN journaled combo matching BOTH legs with units >= contracts must
+    exist (never close what the journal doesn't know); (3) the broker must
+    actually hold SHORT >= contracts on the short leg AND LONG >= contracts
+    on the long leg (a BUY on a flat short leg would OPEN a long; a SELL on
+    a flat long leg would OPEN a short). Every evaluation — allow and block
+    — is audited to hook_audit_log.
+
+    Failure/rollback matrix (deliberate asymmetry with the OPEN path's
+    rollback: re-SELLING a just-bought-back short to "undo" would re-open
+    the exact assignment risk this ordering removes, and is a SELL-to-open
+    by every guard definition — the residual after a leg-2 failure is a
+    fully-paid LONG wing, defined risk, retried via the pending machinery):
+
+      * leg1 rejected           → nothing changed; ``nothing_placed: True``.
+      * leg1 working, leg2 rejected → cancel the working BTC order (clean
+        rollback). Cancel fails (racing a fill) → ``partial: True`` with the
+        BTC order id; caller writes pending state and finalize reconciles.
+      * leg1 dealt (fully/partly), leg2 rejected → DO NOT re-sell the short.
+        ``combo_close: "partial"``; caller MUST write a pending combo state
+        so finalize retries the long-leg close until dealt.
+      * both accepted           → ``combo_close: True`` + both order ids.
+
+    The response carries neither ``combo: True`` nor ``rows``, and this
+    tool name is not in posttool_fill_capture's ORDER_TOOL_RE — a close can
+    never be journaled as a new position.
+    """
+    _assert_paper()
+    symbol = f"{short_leg_symbol}+{long_leg_symbol}"
+
+    # ---- 1. structural validation ----
+    sp = parse_option_symbol(short_leg_symbol)
+    lp = parse_option_symbol(long_leg_symbol)
+    if not sp or not lp:
+        return _combo_close_refusal("unparseable_leg_symbol", symbol)
+    s_tkr, s_dte, s_right, s_strike = sp
+    l_tkr, l_dte, l_right, l_strike = lp
+    if s_tkr != l_tkr:
+        return _combo_close_refusal("legs_span_different_underlyings", symbol)
+    if s_dte != l_dte:
+        return _combo_close_refusal("legs_span_different_expiries", symbol)
+    if s_right != l_right:
+        return _combo_close_refusal("legs_span_different_rights", symbol)
+    caps = (l_strike < s_strike) if s_right == "P" else (l_strike > s_strike)
+    if not caps:
+        return _combo_close_refusal("long_leg_does_not_cap_short", symbol)
+    try:
+        contracts = int(contracts)
+    except (TypeError, ValueError):
+        return _combo_close_refusal("contracts_not_integer", symbol)
+    if contracts < 1:
+        return _combo_close_refusal("contracts_below_one", symbol)
+
+    # ---- 2. journal proof ----
+    open_units = _find_matching_open_combo(short_leg_symbol, long_leg_symbol)
+    if open_units < contracts:
+        return _combo_close_refusal(
+            "no_matching_open_combo", symbol,
+            detail=f"journal open units={open_units:g}, requested={contracts}")
+
+    # ---- 3. broker proof ----
+    try:
+        df = _require_ok(*_trade().position_list_query(trd_env=PAPER_ENV),
+                         op="position_list_query")
+        pos_rows = _df_records(df)
+    except Exception as e:
+        return _combo_close_refusal("broker_positions_unreadable", symbol,
+                                    detail=repr(e))
+    short_held = long_held = 0.0
+    for r in pos_rows:
+        code = str(r.get("code") or "")
+        try:
+            qty = abs(float(r.get("qty") or 0))
+        except (TypeError, ValueError):
+            continue
+        side = str(r.get("position_side") or "LONG").upper()
+        if code == short_leg_symbol and side.startswith("SHORT"):
+            short_held += qty
+        elif code == long_leg_symbol and not side.startswith("SHORT"):
+            long_held += qty
+    if short_held < contracts or long_held < contracts:
+        return _combo_close_refusal(
+            "broker_position_mismatch", symbol,
+            detail=(f"broker short={short_held:g} long={long_held:g}, "
+                    f"requested={contracts} — a close order on a flat leg "
+                    f"would OPEN a new position"))
+
+    # ---- allow: audit before touching the broker ----
+    audit_decision(
+        GuardDecision(
+            allowed=True, reason="ok", symbol=symbol, ticker=s_tkr,
+            intent="close",
+            proposed={"asset_type": "OPT_COMBO", "contracts": contracts,
+                      "short_price": short_price, "long_price": long_price,
+                      "trade_id": trade_id, "intent": "close"},
+        ),
+        guard_name="server_order_guard",
+        tool_name="close_paper_option_combo",
+    )
+
+    # ---- leg 1: BUY-to-close the SHORT leg (assignment risk goes first) ----
+    ret_s, df_s = _trade().place_order(
+        price=short_price, qty=contracts, code=short_leg_symbol,
+        trd_side=TrdSide.BUY, order_type=OrderType.NORMAL, trd_env=PAPER_ENV,
+    )
+    if ret_s != RET_OK:
+        return {
+            "combo_close": False, "nothing_placed": True,
+            "reason": str(df_s),
+            "hint": "short-leg buy-back rejected; nothing changed. "
+                    "Caller retries next tick.",
+        }
+    btc_rows = _df_records(df_s)
+    btc_row = btc_rows[0] if btc_rows else {}
+    btc_oid = str(btc_row.get("order_id") or "")
+    btc_dealt = float(btc_row.get("dealt_qty") or 0)
+
+    # ---- leg 2: SELL-to-close the LONG leg ----
+    ret_l, df_l = _trade().place_order(
+        price=long_price, qty=contracts, code=long_leg_symbol,
+        trd_side=TrdSide.SELL, order_type=OrderType.NORMAL, trd_env=PAPER_ENV,
+    )
+    if ret_l != RET_OK:
+        if btc_dealt > 0:
+            # Short already (partly) bought back — risk REDUCED. Never
+            # re-sell it: keep the paid-for long wing and let the pending
+            # machinery retry its close.
+            return {
+                "combo_close": "partial", "long_leg_unclosed": True,
+                "close_rows": btc_rows,
+                "short_close_order_id": btc_oid,
+                "reason": str(df_l),
+                "hint": "short leg dealt, long-leg close rejected. Caller "
+                        "MUST write a pending combo state so finalize "
+                        "retries the long-leg close until dealt.",
+            }
+        # BTC order still working (zero dealt) → clean rollback by cancel.
+        try:
+            rb_ret, _rb = _trade().modify_order(
+                modify_order_op=ModifyOrderOp.CANCEL, order_id=btc_oid,
+                qty=0, price=0, trd_env=PAPER_ENV,
+            )
+            cancelled = rb_ret == RET_OK
+        except Exception:
+            cancelled = False
+        if cancelled:
+            return {
+                "combo_close": False, "combo_rollback": True,
+                "rollback_action": "cancelled_working_short_close",
+                "reason": str(df_l),
+                "hint": "long-leg close rejected; the working short buy-back "
+                        "was cancelled — nothing changed. Caller retries "
+                        "next tick.",
+            }
+        # Cancel failed — probably racing a fill. Hand the live BTC order to
+        # the pending machinery instead of guessing.
+        return {
+            "combo_close": False, "partial": True,
+            "short_close_order_id": btc_oid,
+            "rollback_action": "cancel_failed_racing_fill",
+            "reason": str(df_l),
+            "hint": "long-leg close rejected AND the short buy-back cancel "
+                    "failed (racing a fill). Caller writes pending state; "
+                    "finalize reconciles.",
+        }
+
+    stc_rows = _df_records(df_l)
+    stc_row = stc_rows[0] if stc_rows else {}
+    return {
+        "combo_close": True,
+        "close_rows": btc_rows + stc_rows,
+        "short_close_order_id": btc_oid,
+        "long_close_order_id": str(stc_row.get("order_id") or ""),
     }
 
 

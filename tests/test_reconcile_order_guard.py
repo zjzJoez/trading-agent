@@ -311,3 +311,42 @@ def test_expand_combo_rows_shape(recon_db):
         "store": "sqlite", "trade_id": trade_id,
         "symbol": LONG_LEG, "side": "BUY", "qty": 3.0,
     }
+
+
+def test_expand_combo_rows_postgres_long_wing_no_false_alarm(recon_db, capsys):
+    """A Postgres-journaled vertical (combo payload inline from
+    broker_fill_json->'combo') must expand its long wing too — otherwise it
+    false-alarms position_without_journal_row nightly."""
+    from trading_agent.jobs import reconcile_order_guard as job
+    pg_rows = [{
+        "store": "postgres", "trade_id": 41, "symbol": SHORT_LEG,
+        "side": "SELL", "qty": 2.0,
+        "combo": {"combo": True, "short_leg": SHORT_LEG,
+                  "long_leg": LONG_LEG, "net_credit": 1.55, "width": 10.0,
+                  "max_loss": 845.0, "contracts": 2.0,
+                  "broker_order_ids": ["B77", "B78"]},
+    }]
+    broker = {SHORT_LEG: -2.0, LONG_LEG: 2.0}
+    with patch.object(job, "_load_broker_positions", return_value=broker), \
+         patch.object(job, "_load_open_rows_pg", return_value=pg_rows), \
+         patch.object(job, "_load_guard_rows", return_value=[]):
+        rc = job.main(["--no-notify"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["position_findings"] == []
+    assert rc == 0
+
+
+def test_expand_combo_rows_pg_row_shape(recon_db):
+    from trading_agent.jobs.reconcile_order_guard import expand_combo_rows
+    rows = [{
+        "store": "postgres", "trade_id": 41, "symbol": SHORT_LEG,
+        "side": "SELL", "qty": 3.0,
+        "combo": {"combo": True, "short_leg": SHORT_LEG,
+                  "long_leg": LONG_LEG, "contracts": 3.0},
+    }]
+    expanded = expand_combo_rows(rows)
+    synthetic = [r for r in expanded if r["symbol"] == LONG_LEG]
+    assert synthetic == [{
+        "store": "postgres", "trade_id": 41, "symbol": LONG_LEG,
+        "side": "BUY", "qty": 3.0,
+    }]

@@ -165,7 +165,8 @@ def update_excursions_once(now: datetime | None = None) -> list[ExcursionUpdate]
         with cursor() as cur:
             cur.execute(
                 """
-                SELECT id, symbol, entry_price, stop, mae_so_far, mfe_so_far
+                SELECT id, symbol, entry_price, stop, mae_so_far, mfe_so_far,
+                       broker_fill_json->'combo' AS combo
                 FROM journal_trades
                 WHERE outcome = 'OPEN'
                 """,
@@ -175,7 +176,9 @@ def update_excursions_once(now: datetime | None = None) -> list[ExcursionUpdate]
         log.warning("update_excursions_once: db read failed (%s)", e)
         return out
 
-    for tid, symbol, entry, stop, mae, mfe in rows:
+    from trading_agent.combo import combo_meta
+
+    for tid, symbol, entry, stop, mae, mfe, combo_raw in rows:
         if time.monotonic() > deadline:
             log.warning(
                 "update_excursions_once: budget %.0fs exhausted; %d positions skipped",
@@ -185,7 +188,22 @@ def update_excursions_once(now: datetime | None = None) -> list[ExcursionUpdate]
         entry_f = _safe_float(entry)
         if entry_f is None:
             continue
-        mid = _get_latest_mid(str(symbol))
+        meta = combo_meta(combo_raw)
+        if meta is not None:
+            # Combo row: entry_price is the NET CREDIT across both legs, so
+            # the mark must be net-of-legs too (short mid − long mid) or the
+            # mae/mfe fields silently change units (M1-0.1: excursions stay
+            # in units of the net credit). Either leg unquotable, or a
+            # non-positive spread mid (crossed junk) → skip this tick.
+            short_mid = _get_latest_mid(meta.short_leg)
+            long_mid = _get_latest_mid(meta.long_leg)
+            if short_mid is None or long_mid is None:
+                continue
+            mid = short_mid - long_mid
+            if mid <= 0:
+                continue
+        else:
+            mid = _get_latest_mid(str(symbol))
         if mid is None:
             continue
         R_unit = _R_per_unit(entry_f, _safe_float(stop))
