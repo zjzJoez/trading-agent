@@ -210,6 +210,66 @@ def _load_open_rows_sqlite() -> list[dict]:
     return out
 
 
+def _combo_snapshots_sqlite(trade_ids: list[int]) -> dict[int, dict]:
+    """Latest combo market_snapshot payload per sqlite trade_id.
+
+    A defined-risk vertical is journaled as ONE row keyed by the short leg's
+    OCC symbol (posttool_fill_capture combo path); both leg symbols live only
+    in the trade's market_snapshots payload (combo=True, short_leg, long_leg,
+    contracts). Best-effort: unreadable payloads are skipped — the row then
+    reconciles as a plain single-leg and the long leg surfaces as a finding,
+    which is the safe direction (alert, never mask)."""
+    if not trade_ids:
+        return {}
+    placeholders = ",".join("?" for _ in trade_ids)
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT trade_id, payload FROM market_snapshots "
+            f"WHERE trade_id IN ({placeholders}) ORDER BY id",
+            trade_ids,
+        ).fetchall()
+    out: dict[int, dict] = {}
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("combo"):
+            out[int(r["trade_id"])] = payload
+    return out
+
+
+def expand_combo_rows(rows: list[dict]) -> list[dict]:
+    """Expand combo journal rows into their broker-visible legs.
+
+    The broker holds TWO positions per vertical (short leg + protective long
+    leg) while the journal holds one SELL row on the short leg's symbol.
+    Without expansion the long leg false-alarms as position_without_journal_row
+    every night. Appends a synthetic BUY row for each combo's long leg, tagged
+    with the same trade_id/store so findings still point at the real row."""
+    sqlite_ids = [r["trade_id"] for r in rows if r["store"] == "sqlite"]
+    snapshots = _combo_snapshots_sqlite(sqlite_ids)
+    extra: list[dict] = []
+    for r in rows:
+        if r["store"] != "sqlite":
+            continue
+        snap = snapshots.get(r["trade_id"])
+        if not snap:
+            continue
+        long_sym = str(snap.get("long_leg") or "")
+        if not long_sym:
+            continue
+        try:
+            contracts = float(snap.get("contracts") or r["qty"])
+        except (TypeError, ValueError):
+            contracts = r["qty"]
+        extra.append({
+            "store": "sqlite", "trade_id": r["trade_id"],
+            "symbol": long_sym, "side": "BUY", "qty": contracts,
+        })
+    return rows + extra
+
+
 def _load_open_rows_pg() -> list[dict] | None:
     """Open rows from the Postgres journal (the EC2 brain's store). None when
     Postgres isn't configured/reachable from this host — the sqlite-only
@@ -361,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
             broker = _load_broker_positions()
             if broker is not None:
                 positions_checked = True
-                journal_rows = _load_open_rows_sqlite()
+                journal_rows = expand_combo_rows(_load_open_rows_sqlite())
                 position_stores.append("sqlite")
                 pg_rows = _load_open_rows_pg()
                 if pg_rows is not None:

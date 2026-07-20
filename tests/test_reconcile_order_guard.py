@@ -234,3 +234,80 @@ def test_missing_audit_table_is_a_finding(recon_db, capsys):
     assert _run() == 1
     out = json.loads(capsys.readouterr().out)
     assert out["findings"][0]["status"] == "audit_log_unreadable"
+
+
+# ---------------------------------------------------------------------------
+# Combo leg expansion — a vertical is ONE journal row but TWO broker legs
+# ---------------------------------------------------------------------------
+
+SHORT_LEG = "US.SPY260828P620000"
+LONG_LEG = "US.SPY260828P610000"
+
+
+def _insert_combo_fill(contracts: float = 2.0, with_snapshot: bool = True) -> int:
+    """Journal a vertical the way posttool_fill_capture's combo path does:
+    one SELL row keyed by the short leg, legs only in market_snapshots."""
+    from trading_agent.db import connection
+    opened = (_now() - timedelta(hours=2.0)).isoformat()
+    with connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO trades (symbol, asset_type, side, qty, entry_price, "
+            "opened_at, outcome, broker_order_id, strategy_label, is_paper) "
+            "VALUES (?, 'OPT', 'SELL', ?, 1.55, ?, 'OPEN', 'B77', "
+            "'credit_put_spread_30_45', 1)",
+            (SHORT_LEG, contracts, opened),
+        )
+        trade_id = int(cur.lastrowid)
+        if with_snapshot:
+            conn.execute(
+                "INSERT INTO market_snapshots (trade_id, taken_at, payload) "
+                "VALUES (?, ?, ?)",
+                (trade_id, opened, json.dumps({
+                    "combo": True, "short_leg": SHORT_LEG, "long_leg": LONG_LEG,
+                    "broker_order_ids": ["B77", "B78"], "net_credit": 1.55,
+                    "width": 10.0, "max_loss": 845.0, "contracts": contracts,
+                })),
+            )
+    return trade_id
+
+
+def test_combo_both_legs_reconcile_clean(recon_db, capsys):
+    """Broker short+long legs vs the single combo journal row: no findings."""
+    _insert_combo_fill(contracts=2.0)
+    _insert_guard_row(SHORT_LEG, hours_ago=2.0)
+    from trading_agent.jobs import reconcile_order_guard as job
+    broker = {SHORT_LEG: -2.0, LONG_LEG: 2.0}
+    with patch.object(job, "_load_broker_positions", return_value=broker), \
+         patch.object(job, "_load_open_rows_pg", return_value=[]):
+        assert job.main(["--no-notify"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["position_findings"] == []
+
+
+def test_combo_without_snapshot_still_flags_long_leg(recon_db, capsys):
+    """No snapshot -> no expansion -> the long leg alerts (safe direction)."""
+    _insert_combo_fill(contracts=2.0, with_snapshot=False)
+    _insert_guard_row(SHORT_LEG, hours_ago=2.0)
+    from trading_agent.jobs import reconcile_order_guard as job
+    broker = {SHORT_LEG: -2.0, LONG_LEG: 2.0}
+    with patch.object(job, "_load_broker_positions", return_value=broker), \
+         patch.object(job, "_load_open_rows_pg", return_value=[]):
+        assert job.main(["--no-notify"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    statuses = {(f["status"], f["symbol"]) for f in out["position_findings"]}
+    assert ("position_without_journal_row", LONG_LEG) in statuses
+
+
+def test_expand_combo_rows_shape(recon_db):
+    """Expansion appends exactly one synthetic BUY row per combo, same trade_id."""
+    trade_id = _insert_combo_fill(contracts=3.0)
+    from trading_agent.jobs.reconcile_order_guard import (
+        _load_open_rows_sqlite, expand_combo_rows,
+    )
+    rows = expand_combo_rows(_load_open_rows_sqlite())
+    synthetic = [r for r in rows if r["symbol"] == LONG_LEG]
+    assert len(synthetic) == 1
+    assert synthetic[0] == {
+        "store": "sqlite", "trade_id": trade_id,
+        "symbol": LONG_LEG, "side": "BUY", "qty": 3.0,
+    }
