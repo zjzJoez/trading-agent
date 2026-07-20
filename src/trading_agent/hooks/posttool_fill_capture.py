@@ -136,6 +136,64 @@ def _insert_snapshot(trade_id: int, payload: dict) -> None:
         conn.commit()
 
 
+def _insert_combo_pg_row(
+    *,
+    short_sym: str,
+    long_sym: str,
+    contracts: float,
+    net_credit: float,
+    width: float,
+    strategy_label: str | None,
+    order_ids: list[str],
+    snapshot_payload: dict,
+) -> None:
+    """Dual-write one engine-visible combo row into Postgres journal_trades.
+
+    The row mirrors the SQLite combo row (symbol=short leg, side=SELL,
+    entry_price=net_credit) and additionally carries:
+      * ``exit_plan`` = combo_exit_plan(net_credit, width) — 50%-PT + 21-DTE
+        priced on the whole spread (nothing else can attach a plan to a
+        combo; without it the triggers can never fire — CONFLICTS C4);
+      * ``broker_fill_json.combo`` = the canonical payload (the ONE Postgres
+        detection rule, same shape as the SQLite snapshot);
+      * 2-leg entry fees (a vertical pays commission on BOTH legs — C6).
+
+    NOTE: order_ids[0] is the LONG leg's order id (place_paper_option_combo
+    places the protective long first) — broker_order_id is a provenance
+    pointer only, never "the" order; both ids live in combo.broker_order_ids.
+    sync_fill_status's combo branch resolves legs from the combo payload,
+    never from this column.
+
+    Raises on any failure — the caller audits and swallows (telemetry hook).
+    """
+    from trading_agent.execution_costs import fees_per_side
+    from trading_agent.llm.schemas import combo_exit_plan
+    from trading_agent.store.postgres import cursor
+
+    plan = combo_exit_plan(net_credit, width)
+    fill_json = {
+        "combo": snapshot_payload,
+        "strategy_label": strategy_label,
+        "provenance": "agent",
+        "entry_fees": fees_per_side(contracts, "OPT") * 2,
+    }
+    with cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO journal_trades
+                (symbol, asset_type, side, qty, entry_price, stop, target,
+                 outcome, broker_order_id, is_paper, opened_at,
+                 exit_plan, broker_fill_json)
+            VALUES (%s, 'OPT', 'SELL', %s, %s, NULL, NULL,
+                    'OPEN', %s, TRUE, NOW(), %s::jsonb, %s::jsonb)
+            """,
+            (short_sym, contracts, net_credit,
+             order_ids[0] if order_ids else "",
+             json.dumps(plan.model_dump(), default=str),
+             json.dumps(fill_json, default=str)),
+        )
+
+
 def _best_effort_snapshot(symbol: str) -> dict:
     """Try to grab a quote (and for options a short-window chain context).
     Best-effort — any failure returns a payload marked 'unavailable'. The
@@ -211,6 +269,17 @@ def main() -> int:
         reasoning = (f"combo defined-risk vertical: short={short_sym} "
                      f"long={long_sym} net_credit={net_credit} width={width} "
                      f"max_loss={max_loss}")
+        combo_payload = {
+            "combo": True, "short_leg": short_sym, "long_leg": long_sym,
+            "broker_order_ids": order_ids, "net_credit": net_credit,
+            "width": width, "max_loss": max_loss, "contracts": contracts,
+        }
+        # Each store's write is independently try/excepted: a Mac-side
+        # SQLite hiccup must NOT abort the Postgres dual-write — the PG row
+        # is the engine-visibility write (exit plan, 21-DTE, 50%-PT), which
+        # is the more safety-critical of the two. Both outcomes are audited.
+        trade_id = None
+        sqlite_error = None
         try:
             trade_id = _insert_trade_row(
                 thesis_id=combo_thesis, symbol=short_sym, asset_type="OPT",
@@ -219,19 +288,42 @@ def main() -> int:
                 broker_order_id=order_ids[0] if order_ids else "",
                 reasoning=reasoning,
             )
-            _insert_snapshot(trade_id, {
-                "combo": True, "short_leg": short_sym, "long_leg": long_sym,
-                "broker_order_ids": order_ids, "net_credit": net_credit,
-                "width": width, "max_loss": max_loss, "contracts": contracts,
-            })
+            _insert_snapshot(trade_id, dict(combo_payload))
         except Exception as e:
-            _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
-                    "decision": "error", "reason": f"combo insert failed: {e!r}"})
-            return 0
+            sqlite_error = repr(e)
+            _audit({"ts": _now(), "hook": "posttool_fill_capture",
+                    "tool": tool_name, "decision": "error",
+                    "phase": "combo_sqlite_insert",
+                    "reason": f"combo insert failed: {e!r}",
+                    "note": "attempting the Postgres dual-write anyway — "
+                            "engine visibility is safety-critical"})
+        # D2 dual-write: the exit engine enriches/resolves EXCLUSIVELY from
+        # Postgres get_open_journal_trades — a combo journaled only in SQLite
+        # never reaches detect_exit_triggers at all (both legs would surface
+        # as unmanaged "manual" broker positions). Best-effort: Postgres
+        # unreachable (the Phase-1 Mac) → audit line, exit 0. The hook is
+        # telemetry, never a gate.
+        try:
+            _insert_combo_pg_row(
+                short_sym=short_sym, long_sym=long_sym,
+                contracts=contracts, net_credit=float(net_credit or 0),
+                width=float(width or 0), strategy_label=combo_label,
+                order_ids=order_ids,
+                snapshot_payload=dict(combo_payload),
+            )
+            pg_written = True
+        except Exception as e:
+            pg_written = False
+            _audit({"ts": _now(), "hook": "posttool_fill_capture",
+                    "tool": tool_name, "decision": "warn",
+                    "phase": "combo_pg_dual_write", "error": repr(e),
+                    "note": "combo row exists in SQLite only — the exit "
+                            "engine (Postgres-fed) will NOT manage it"})
         _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
                 "decision": "combo_insert", "trade_id": trade_id,
                 "short_leg": short_sym, "long_leg": long_sym,
-                "broker_order_ids": order_ids})
+                "broker_order_ids": order_ids, "pg_dual_write": pg_written,
+                "sqlite_error": sqlite_error})
         return 0
 
     is_option = tool_name.endswith("__place_paper_option_order")

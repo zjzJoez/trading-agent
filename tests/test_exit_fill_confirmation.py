@@ -56,7 +56,7 @@ def _open_trade(symbol="US.AAPL260626C325000", qty=2, entry=16.76,
 
 
 def _pending_state(trade_id: int, order_id="EX-1", qty=2,
-                   requested=15.50) -> dict:
+                   requested=15.50, expected_before=None) -> dict:
     from trading_agent.exits.fill_confirm import (
         build_pending_state,
         write_pending_close,
@@ -66,6 +66,7 @@ def _pending_state(trade_id: int, order_id="EX-1", qty=2,
         action="EXIT_STOP", reason="stop hit", qty=qty, side="SELL",
         asset_type="OPT", requested_exit_price=requested,
         quoted_bid=15.60, quoted_ask=16.40, thesis_id=None, source="sqlite",
+        expected_qty_before_close=expected_before,
     )
     assert write_pending_close(trade_id, state)
     return state
@@ -279,6 +280,52 @@ def test_vanished_order_replaces_when_still_held(tmp_journal_db, fake_moomoo):
     stats = finalize_pending_exits({}, run_id="t", trigger="test")  # miss #2
     assert stats["replaced"] == 1
     assert fake_moomoo.placed and fake_moomoo.placed[0]["contracts"] == 2
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT outcome FROM trades WHERE id = ?", (tid,)).fetchone()
+    assert row["outcome"] == "OPEN"
+
+
+def test_vanished_order_negative_qty_short_counts_as_held(
+        tmp_journal_db, fake_moomoo):
+    """Broker reporting a negative qty must read as STILL HELD (abs), not
+    flat — a false 'flat' would settle the close unconfirmed while the
+    position remains at the broker."""
+    from trading_agent.db import connection
+    from trading_agent.exits.fill_confirm import finalize_pending_exits
+
+    tid = _open_trade(qty=2)
+    _pending_state(tid, order_id="EX-GONE", qty=2)
+    fake_moomoo.positions_rows = [
+        {"code": "US.AAPL260626C325000", "qty": -2}]
+
+    finalize_pending_exits({}, run_id="t", trigger="test")   # miss #1
+    stats = finalize_pending_exits({}, run_id="t", trigger="test")  # miss #2
+    assert stats["replaced"] == 1
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT outcome FROM trades WHERE id = ?", (tid,)).fetchone()
+    assert row["outcome"] == "OPEN"
+
+
+def test_vanished_order_ambiguous_qty_waits_and_alerts(
+        tmp_journal_db, fake_moomoo):
+    """With the placement-time broker qty recorded, a live qty matching
+    NEITHER 'order filled' NOR 'order died' must not be guessed at — wait
+    and alert instead of re-placing (over-close) or settling (phantom)."""
+    from trading_agent.db import connection
+    from trading_agent.exits.fill_confirm import finalize_pending_exits
+
+    tid = _open_trade(qty=2)
+    _pending_state(tid, order_id="EX-GONE", qty=2, expected_before=2)
+    fake_moomoo.positions_rows = [
+        {"code": "US.AAPL260626C325000", "qty": 1}]   # neither 0 nor 2
+
+    finalize_pending_exits({}, run_id="t", trigger="test")   # miss #1
+    stats = finalize_pending_exits({}, run_id="t", trigger="test")  # miss #2
+    assert stats["waiting"] == 1
+    assert stats["replaced"] == 0 and stats["unresolved"] == 0
+    assert fake_moomoo.placed == []
     with connection() as conn:
         row = conn.execute(
             "SELECT outcome FROM trades WHERE id = ?", (tid,)).fetchone()

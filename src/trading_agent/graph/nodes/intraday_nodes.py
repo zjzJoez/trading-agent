@@ -16,6 +16,7 @@ Pipeline (intraday_monitor_graph):
 from __future__ import annotations
 
 import logging
+import math
 
 from trading_agent.events import emit
 from trading_agent.graph.state import TradingGraphState
@@ -44,6 +45,118 @@ def _bare_ticker(code: str) -> str:
 _DEAD_ORDER_STATUSES = {"CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DELETED", "EXPIRED"}
 # Statuses that mean "filled" → sync the real avg fill price into the journal.
 _FILLED_ORDER_STATUSES = {"FILLED_ALL", "FILLED_PART"}
+
+
+def _order_status_of(order: dict | None) -> str:
+    if not order:
+        return ""
+    return str(order.get("order_status")
+               or order.get("order_status_str") or "").upper()
+
+
+def _sync_combo_entry(cursor, trade_id, symbol, meta, order_map,
+                      *, run_id: str, trigger: str) -> None:
+    """Combo twin of the single-order entry sync (3a).
+
+    Resolves BOTH leg orders from the canonical combo payload and:
+      * both FILLED_ALL → entry_price = short_dealt_avg − long_dealt_avg
+        (the ACTUAL net credit), stamp fill_synced;
+      * both dead      → outcome='UNFILLED' (same as single-leg);
+      * mixed (one filled, one dead/absent) → sev-2 combo_entry_leg_mismatch,
+        touch NOTHING (an operator problem, not a sync problem).
+    Anything else (both still working, both absent) → leave alone.
+    """
+    orders_by_code: dict[str, dict] = {}
+    for oid in meta.broker_order_ids:
+        o = order_map.get(str(oid))
+        if not o:
+            continue
+        code = str(o.get("code") or o.get("symbol") or "")
+        orders_by_code.setdefault(code, o)
+    short_o = orders_by_code.get(meta.short_leg)
+    long_o = orders_by_code.get(meta.long_leg)
+    # Positional fallback (long leg is placed FIRST in place_paper_option_combo)
+    # for order rows that omit the code field.
+    if short_o is None and long_o is None and len(meta.broker_order_ids) == 2:
+        long_o = order_map.get(str(meta.broker_order_ids[0]))
+        short_o = order_map.get(str(meta.broker_order_ids[1]))
+
+    s_status = _order_status_of(short_o)
+    l_status = _order_status_of(long_o)
+    s_filled = s_status == "FILLED_ALL"
+    l_filled = l_status == "FILLED_ALL"
+    s_dead = s_status in _DEAD_ORDER_STATUSES
+    l_dead = l_status in _DEAD_ORDER_STATUSES
+
+    if s_filled and l_filled:
+        try:
+            s_avg = float(short_o.get("dealt_avg_price")
+                          or short_o.get("dealt_avg_px") or 0)
+            l_avg = float(long_o.get("dealt_avg_price")
+                          or long_o.get("dealt_avg_px") or 0)
+        except (TypeError, ValueError):
+            return
+        if s_avg <= 0 or l_avg <= 0:
+            return
+        actual_credit = round(s_avg - l_avg, 4)
+        try:
+            with cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE journal_trades
+                    SET entry_price = %s::numeric,
+                        broker_fill_json = COALESCE(broker_fill_json, '{}'::jsonb)
+                          || jsonb_build_object(
+                               'status', 'FILLED_ALL'::text,
+                               'combo_fill_synced', TRUE,
+                               'avg_fill_price', %s::numeric,
+                               'fill_synced_at', NOW()::text)
+                    WHERE id = %s AND outcome = 'OPEN'
+                    """,
+                    (actual_credit, actual_credit, int(trade_id)),
+                )
+        except Exception as e:
+            log.warning("[sync_fill_status] combo fill update id=%s failed: %s",
+                        trade_id, e)
+    elif s_dead and l_dead:
+        try:
+            with cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE journal_trades
+                    SET outcome = 'UNFILLED', closed_at = NOW(),
+                        close_reason = COALESCE(close_reason,
+                            'sync_fill_status: combo legs ' || %s)
+                    WHERE id = %s AND outcome = 'OPEN'
+                    """,
+                    (f"{s_status}/{l_status}", int(trade_id)),
+                )
+        except Exception as e:
+            log.warning("[sync_fill_status] combo unfilled update id=%s failed: %s",
+                        trade_id, e)
+    elif (s_filled and (l_dead or long_o is None)) or \
+            (l_filled and (s_dead or short_o is None)):
+        # One leg filled, the sibling dead/absent — the "vertical" is legged
+        # apart at the broker. Touch nothing; page the operator ONCE per
+        # (symbol, day) — the condition persists every tick while the
+        # operator reconciles, and repeated sev-2s train alert fatigue.
+        if _alerted_today("combo_entry_leg_mismatch", symbol):
+            log.info(
+                "[sync_fill_status] combo %s legs still mismatched "
+                "(%s/%s) — alerted today already",
+                symbol, s_status or "ABSENT", l_status or "ABSENT",
+            )
+            return
+        emit(
+            run_id=run_id, trigger=trigger, agent="sync_fill_status",
+            event_type="combo_entry_leg_mismatch", severity=2,
+            payload={"trade_id": int(trade_id), "symbol": symbol,
+                     "short_leg": meta.short_leg, "long_leg": meta.long_leg,
+                     "short_status": s_status or "ABSENT",
+                     "long_status": l_status or "ABSENT",
+                     "action_required": "reconcile legs manually — one leg "
+                                        "filled, the other is dead/absent"},
+        )
 
 
 def sync_fill_status(state: TradingGraphState) -> dict:
@@ -91,7 +204,8 @@ def sync_fill_status(state: TradingGraphState) -> dict:
         with cursor() as cur:
             cur.execute(
                 """
-                SELECT id, symbol, broker_order_id, entry_price
+                SELECT id, symbol, broker_order_id, entry_price,
+                       broker_fill_json->'combo' AS combo
                 FROM journal_trades
                 WHERE outcome = 'OPEN' AND broker_order_id IS NOT NULL
                   AND broker_order_id <> ''
@@ -101,9 +215,45 @@ def sync_fill_status(state: TradingGraphState) -> dict:
     except Exception as e:
         log.warning("[sync_fill_status] open-trades read failed: %s", e)
 
+    from trading_agent.combo import combo_meta
+
     synced_filled = 0
     marked_unfilled = 0
-    for trade_id, symbol, broker_order_id, entry_price in open_trades:
+    for row_t in open_trades:
+        trade_id, symbol, broker_order_id, entry_price = row_t[:4]
+        combo_raw = row_t[4] if len(row_t) > 4 else None
+        # Combo rows: entry_price is the NET CREDIT across BOTH legs, and the
+        # stored broker_order_id is the LONG leg's id (long is placed first in
+        # place_paper_option_combo). The single-order sync below would clobber
+        # the net credit with ONE leg's dealt price — combos resolve both leg
+        # orders from the canonical payload instead.
+        combo_m = combo_meta(combo_raw)
+        if combo_m is not None:
+            _sync_combo_entry(
+                cursor, trade_id, symbol, combo_m, order_map,
+                run_id=run_id, trigger=trigger,
+            )
+            continue
+        if combo_raw:
+            # Combo payload PRESENT but unparseable — fail closed. The
+            # single-order branch below would clobber entry_price (the net
+            # credit) with ONE leg's dealt price (broker_order_id is the
+            # LONG leg's id). Skip the row and alert once per (symbol, day).
+            log.warning(
+                "[sync_fill_status] combo payload unparseable for trade "
+                "%s (%s) — skipping single-order sync (fail closed)",
+                trade_id, symbol,
+            )
+            if not _alerted_today("combo_payload_unparseable", symbol):
+                emit(
+                    run_id=run_id, trigger=trigger, agent="sync_fill_status",
+                    event_type="combo_payload_unparseable", severity=2,
+                    payload={"trade_id": int(trade_id), "symbol": symbol,
+                             "action_required": "repair broker_fill_json"
+                                                "->'combo' on this row — the"
+                                                " engine HOLDs it until then"},
+                )
+            continue
         order = order_map.get(str(broker_order_id))
         if not order:
             continue
@@ -182,12 +332,14 @@ def sync_fill_status(state: TradingGraphState) -> dict:
     return {}
 
 
-def _no_plan_alerted_today(symbol: str) -> bool:
-    """True iff we already fired position_no_exit_plan for this symbol today.
+def _alerted_today(event_type: str, symbol: str) -> bool:
+    """True iff we already fired `event_type` for this symbol today.
 
-    Per-symbol per-day dedup — without this, every 15-min intraday tick
-    spams the same alert for a persistent manual position (6/1 incident:
-    22 events on one QQQ contract before operator noticed).
+    Per-(event_type, symbol, day) dedup — without this, every 15-min
+    intraday tick spams the same alert for a persistent condition (6/1
+    incident: 22 position_no_exit_plan events on one QQQ contract before
+    the operator noticed; same storm shape for the combo sev-2s while an
+    operator is manually reconciling a legged-apart entry).
     """
     try:
         from trading_agent.store.postgres import cursor
@@ -195,18 +347,23 @@ def _no_plan_alerted_today(symbol: str) -> bool:
             cur.execute(
                 """
                 SELECT 1 FROM agent_events
-                WHERE event_type = 'position_no_exit_plan'
+                WHERE event_type = %s
                   AND ts > DATE_TRUNC('day', NOW())
                   AND payload->>'symbol' = %s
                 LIMIT 1
                 """,
-                (symbol,),
+                (event_type, symbol),
             )
             return cur.fetchone() is not None
     except Exception:
         # On DB error, default to "yes we alerted" so we don't spam
         # if the DB is degraded.
         return True
+
+
+def _no_plan_alerted_today(symbol: str) -> bool:
+    """True iff we already fired position_no_exit_plan for this symbol today."""
+    return _alerted_today("position_no_exit_plan", symbol)
 
 
 def _is_option_code(code: str) -> bool:
@@ -358,6 +515,7 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
         return out
     if rows is None:  # store unreadable — caller falls back to legacy lookup
         return out
+    from trading_agent.combo import combo_meta
     for row in rows:
         symbol = row.get("symbol")
         if not symbol:
@@ -372,6 +530,14 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
         target = row.get("target")
         exit_plan = row.get("exit_plan")
         mfe_so_far = row.get("mfe_so_far")
+        # Combo detection is fail-closed: a malformed payload parses to None
+        # and the row degrades to "unknown" (HOLD), never to single-leg
+        # management (which would orphan the protective long wing). A payload
+        # that is PRESENT but unparseable is flagged so _merge_combo_positions
+        # can enforce the HOLD (a bare combo=None would be dropped by the
+        # enrichment merge and the row would silently manage as single-leg).
+        combo_raw = row.get("combo")
+        combo_parsed = combo_meta(combo_raw)
         out[str(symbol)] = {
             "trade_id": int(trade_id) if trade_id is not None else None,
             "thesis_id": int(thesis_id) if thesis_id is not None else None,
@@ -387,8 +553,178 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
             "direction": row.get("direction"),
             "thesis_text": row.get("thesis_text"),
             "invalidation": row.get("invalidation"),
+            "combo": combo_parsed,
+            "combo_unparseable": bool(combo_raw) and combo_parsed is None,
         }
     return out
+
+
+def _leg_quote_of(pos: dict) -> dict:
+    """{bid, ask, mark} snapshot of one broker leg position."""
+    def _f(v):
+        try:
+            f = float(v)
+            return f if f > 0 else None
+        except (TypeError, ValueError):
+            return None
+    return {"bid": _f(pos.get("bid")), "ask": _f(pos.get("ask")),
+            "mark": _f(pos.get("mark"))}
+
+
+def _merge_combo_positions(
+    positions: list[dict], *, run_id: str, trigger: str,
+    pending_ids: set[int] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Collapse each journaled combo's two broker legs into ONE synthetic
+    position marked net-of-both-legs, and remove the long wing from the
+    evaluation list entirely (it must produce no decision and no
+    ``position_no_exit_plan`` "manual trade" alert).
+
+    ``pending_ids``: journal trade ids with a combo close in flight. Leg
+    divergence is NORMAL while a trim/close's two legs fill across a tick
+    boundary — those rows HOLD quietly (info log) instead of paging sev-2.
+
+    Returns ``(merged_positions, forced_hold_decisions)``. Failure modes are
+    fail-closed HOLDs (the combo's legs are pulled from evaluation so nothing
+    downstream can single-leg-manage them):
+
+      * combo payload present but unparseable (``combo_unparseable``), or a
+        SHORT-direction exit plan with no parsed combo meta → sev-2
+        ``combo_payload_unparseable``, HOLD — the degraded row must NEVER
+        fall through to single-leg management (it would orphan the wing);
+      * long leg missing at the broker → sev-2 ``combo_long_leg_orphaned``,
+        HOLD reason ``combo_long_leg_missing``;
+      * leg qty mismatch → sev-2 ``combo_leg_qty_mismatch``, HOLD;
+      * either leg mark ≤ 0/stale, or spread mark ≤ 0 → HOLD reason
+        ``combo_mark_invalid`` (a bogus low mark would falsely fire the
+        SHORT-direction 50%-PT target — this guard is mandatory).
+
+    Sev-2 emits are deduped per (event_type, symbol, day) via
+    ``_alerted_today`` — repeats degrade to log lines.
+
+    No combos (and no degraded rows) in the list → the positions list is
+    returned unchanged (identity for single-leg flows).
+    """
+    pending_ids = pending_ids or set()
+    drop_symbols: set[str] = set()
+    synthetic_by_symbol: dict[str, dict] = {}
+    forced_holds: list[dict] = []
+
+    def _hold(symbol: str, reason: str) -> None:
+        forced_holds.append({
+            "symbol": symbol, "action": "HOLD",
+            "exit_qty_factor": 0.0, "reason": reason,
+        })
+
+    def _emit_deduped(event_type: str, symbol: str, payload: dict) -> None:
+        if _alerted_today(event_type, symbol):
+            log.info("[detect_exit_triggers] %s %s persists — alerted "
+                     "today already", event_type, symbol)
+            return
+        emit(run_id=run_id, trigger=trigger, agent="detect_exit_triggers",
+             event_type=event_type, severity=2, payload=payload)
+
+    # Fail-closed backstop (M1-0.1 degrade contract): a journal row whose
+    # combo payload is present-but-unparseable — or that carries a
+    # SHORT-direction exit plan with no combo meta (single-leg SELL-to-open
+    # is hard-blocked, so this signature can only be a degraded combo) —
+    # must HOLD, never fall through to single-leg management: the single-leg
+    # path would BUY back the short leg alone and orphan the wing.
+    for p in positions:
+        sym = p.get("symbol")
+        if not sym or p.get("combo") is not None:
+            continue
+        ep = p.get("exit_plan")
+        short_plan = isinstance(ep, dict) and ep.get("direction") == "SHORT"
+        if p.get("combo_unparseable") or short_plan:
+            drop_symbols.add(sym)
+            _hold(sym, "combo_payload_unparseable")
+            _emit_deduped(
+                "combo_payload_unparseable", sym,
+                {"symbol": sym, "trade_id": p.get("trade_id"),
+                 "note": "combo payload missing/unparseable on a SHORT row "
+                         "— held fail-closed, never single-leg managed"})
+
+    combo_shorts = [p for p in positions
+                    if p.get("combo") is not None and p.get("symbol")]
+    if not combo_shorts and not drop_symbols:
+        return positions, []
+
+    by_symbol: dict[str, dict] = {
+        p["symbol"]: p for p in positions if p.get("symbol")}
+
+    for short_pos in combo_shorts:
+        meta = short_pos["combo"]
+        symbol = short_pos["symbol"]
+        trade_id = short_pos.get("trade_id")
+        close_in_flight = trade_id is not None and trade_id in pending_ids
+        drop_symbols.add(symbol)  # short leg never evaluates as single-leg
+        long_pos = by_symbol.get(meta.long_leg)
+        if long_pos is None:
+            if close_in_flight:
+                log.info(
+                    "[detect_exit_triggers] combo %s wing absent while a "
+                    "close is in flight (trade %s) — normal pending state",
+                    symbol, trade_id,
+                )
+            else:
+                _emit_deduped(
+                    "combo_long_leg_orphaned", symbol,
+                    {"symbol": symbol, "short_leg": meta.short_leg,
+                     "long_leg": meta.long_leg,
+                     "note": "protective wing not among broker "
+                             "positions — combo held fail-closed"})
+            _hold(symbol, "combo_close_in_flight" if close_in_flight
+                  else "combo_long_leg_missing")
+            continue
+        drop_symbols.add(meta.long_leg)
+        short_qty = abs(float(short_pos.get("qty") or 0))
+        long_qty = abs(float(long_pos.get("qty") or 0))
+        if abs(short_qty - long_qty) > 0:
+            if close_in_flight:
+                log.info(
+                    "[detect_exit_triggers] combo %s leg qtys diverge "
+                    "(%g/%g) while a close is in flight (trade %s) — "
+                    "normal pending state",
+                    symbol, short_qty, long_qty, trade_id,
+                )
+            else:
+                _emit_deduped(
+                    "combo_leg_qty_mismatch", symbol,
+                    {"symbol": symbol, "short_qty": short_qty,
+                     "long_qty": long_qty, "long_leg": meta.long_leg})
+            _hold(symbol, "combo_close_in_flight" if close_in_flight
+                  else "combo_leg_qty_mismatch")
+            continue
+        short_q = _leg_quote_of(short_pos)
+        long_q = _leg_quote_of(long_pos)
+        short_mark = short_q["mark"]
+        long_mark = long_q["mark"]
+        if short_mark is None or long_mark is None:
+            _hold(symbol, "combo_mark_invalid")
+            continue
+        spread_mark = round(short_mark - long_mark, 4)
+        if spread_mark <= 0:
+            _hold(symbol, "combo_mark_invalid")
+            continue
+        synth = dict(short_pos)
+        synth["asset_type"] = "OPT"
+        synth["qty"] = short_qty                 # whole spread units
+        synth["entry_price"] = meta.net_credit   # per-unit net credit
+        synth["mark"] = spread_mark              # net-of-both-legs value
+        synth["combo_legs"] = {"short": short_q, "long": long_q}
+        synthetic_by_symbol[symbol] = synth
+
+    merged: list[dict] = []
+    for p in positions:
+        sym = p.get("symbol")
+        if sym in synthetic_by_symbol:
+            merged.append(synthetic_by_symbol.pop(sym))
+        elif sym in drop_symbols:
+            continue
+        else:
+            merged.append(p)
+    return merged, forced_holds
 
 
 def detect_exit_triggers(state: TradingGraphState) -> dict:
@@ -448,6 +784,35 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
         enriched_count, len(positions),
     )
 
+    # In-flight combo closes: leg divergence (qtys, missing wing, residual
+    # wing) is NORMAL while a close's two legs fill across a tick boundary —
+    # those rows hold quietly instead of paging sev-2 every tick. None
+    # (store unreadable) degrades to "no suppression" (alerting is the safe
+    # direction when we can't prove a close explains the divergence).
+    pending_ids: set[int] = set()
+    try:
+        from trading_agent.exits.fill_confirm import pending_close_trade_ids_pg
+        pending_ids = pending_close_trade_ids_pg() or set()
+    except Exception as e:
+        log.warning("[detect_exit_triggers] pending-close lookup failed: %s", e)
+
+    # Leg symbols of combos whose close is in flight: the residual wing (or
+    # short leg) surfacing alone at the broker mid-close must NOT fire the
+    # "manual trade" position_no_exit_plan alert.
+    in_flight_combo_legs: set[str] = set()
+    for enr in enrichment_by_symbol.values():
+        c_meta = enr.get("combo")
+        t_id = enr.get("trade_id")
+        if c_meta is not None and t_id is not None and t_id in pending_ids:
+            in_flight_combo_legs.update({c_meta.short_leg, c_meta.long_leg})
+
+    # Combo collapse: each journaled vertical's two broker legs become ONE
+    # synthetic position marked net-of-both-legs (entry=net_credit, mark=
+    # spread value); the long wing is removed from evaluation entirely.
+    # Failure modes come back as forced fail-closed HOLD decisions.
+    positions, combo_hold_decisions = _merge_combo_positions(
+        positions, run_id=run_id, trigger=trigger, pending_ids=pending_ids)
+
     # Underlying spot prices for option intrinsic-floor checks. Best effort:
     # if moomoo is down we still run with intrinsic=None and the executor
     # will skip the intrinsic-floor branch (it'll just not upgrade the stop).
@@ -480,8 +845,8 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
         return {}
 
     now_utc = datetime.now(timezone.utc)
-    decisions: list[dict] = []
-    hold_count = 0
+    decisions: list[dict] = list(combo_hold_decisions)
+    hold_count = len(combo_hold_decisions)
     exit_count = 0
     no_plan_count = 0
 
@@ -494,6 +859,18 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
             fallback_stop=pos.get("stop"),
             fallback_target=pos.get("target"),
         )
+        if plan is None and symbol in in_flight_combo_legs:
+            # Residual leg of a combo whose close is in flight (e.g. the
+            # wing still working after the short leg's BTC filled). A normal
+            # pending state, not an unmanaged manual position — HOLD quietly.
+            decisions.append({
+                "symbol": symbol,
+                "action": "HOLD",
+                "exit_qty_factor": 0.0,
+                "reason": "combo_close_in_flight_residual_leg",
+            })
+            hold_count += 1
+            continue
         if plan is None:
             # No plan, no stop, no target. This is almost always a MANUAL
             # trade: the user placed the order directly on moomoo, bypassing
@@ -550,13 +927,42 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
             qty_factor = decision.exit_qty_factor
             reason = decision.reason
 
-        # Sanity guard: a partial-exit signal on a 1-contract option position
-        # is physically impossible (options don't fractionate). The downstream
-        # route_exit_or_hold would `max(1, round(1 * 0.5)) = 1` and force a
-        # FULL close, contradicting the partial signal. Demote to HOLD so
-        # the next tick re-evaluates (likely hits target if mark stays up).
         full_qty = float(pos.get("qty") or 0)
-        if action != "HOLD" and 0.0 < qty_factor < 1.0 and full_qty <= 1:
+        decision_extra: dict = {}
+        if pos.get("combo") is not None:
+            # Combo whole-unit semantics (P0b "trim 50%" on 1–2 lot
+            # verticals): a unit is ONE spread (both legs together) — never
+            # leg apart, never fractionate. floor(), not round(): round(1.5)
+            # would trim 2 of 3 lots where the plan says floor(3/2)=1.
+            if action != "HOLD":
+                units_to_close = int(math.floor(full_qty * qty_factor)) \
+                    if qty_factor < 1.0 else int(full_qty)
+                if units_to_close >= 1:
+                    decision_extra = {"combo": True,
+                                      "close_units": units_to_close}
+                else:
+                    # qty==1 downsize: trimming half a spread is impossible.
+                    # Skip, but carry the regime label so route stamps
+                    # regime_downsized_at_label WITHOUT an order — the stamp
+                    # is both the plan's "skip (emit event)" dedup and the
+                    # once-per-episode guard.
+                    decision_extra = {"combo": True}
+                    if action == "EXIT_REGIME_DOWNSIZE":
+                        decision_extra["stamp_regime_label"] = regime_label
+                    reason = (
+                        f"combo_trim_skipped_whole_unit: {action} factor="
+                        f"{qty_factor:.2f} on qty={int(full_qty)}: "
+                        f"{reason[:120]}"
+                    )
+                    action = "HOLD"
+                    qty_factor = 0.0
+        elif action != "HOLD" and 0.0 < qty_factor < 1.0 and full_qty <= 1:
+            # Sanity guard (single-leg only): a partial-exit signal on a
+            # 1-contract option position is physically impossible (options
+            # don't fractionate). The downstream route_exit_or_hold would
+            # `max(1, round(1 * 0.5)) = 1` and force a FULL close,
+            # contradicting the partial signal. Demote to HOLD so the next
+            # tick re-evaluates (likely hits target if mark stays up).
             log.info(
                 "[detect_exit_triggers] %s demoting %s (factor=%.2f, qty=%.0f) → HOLD",
                 symbol, action, qty_factor, full_qty,
@@ -575,6 +981,7 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
             "reason": reason,
             # carried so route_exit_or_hold can stamp the downsize guard column
             "regime_label": regime_label,
+            **decision_extra,
         })
         if action == "HOLD":
             hold_count += 1
@@ -594,12 +1001,249 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
 
     journal_payload = dict(state.get("journal") or {})
     journal_payload["exit_decisions"] = decisions
-    return {"journal": journal_payload}
+    # positions is the combo-merged list: route_exit_or_hold needs the
+    # synthetic combo positions (meta + per-leg quotes) to place the atomic
+    # two-leg close. Identity when no combos are present.
+    return {"journal": journal_payload, "positions": positions}
 
 
 # ---------------------------------------------------------------------------
 # Node 3: route_exit_or_hold
 # ---------------------------------------------------------------------------
+
+def _route_combo_close(
+    *,
+    dec: dict,
+    pos: dict,
+    trade_id: int,
+    thesis_id: int | None,
+    run_id: str,
+    trigger: str,
+    broker_order_rows: dict[str, dict],
+    moomoo_available: bool,
+) -> str:
+    """Place an atomic two-leg close for one combo decision.
+
+    Returns ``"pending"`` when a pending combo state now tracks live broker
+    orders, else ``"failed"`` (deferred — detect re-fires next tick).
+
+    Invariants (fail-closed, per M1-0.1):
+      * the journal row is NEVER closed here — settlement happens in
+        fill_confirm once BOTH legs confirm;
+      * a pending-state write failure never falls back to a single-leg
+        journal close (it can't represent two legs) — sev-2 alert, row
+        stays OPEN, the live orders surface via next tick's orphan check;
+      * any live BUY on the short leg / SELL on the long leg defers the
+        close one tick (orphan adoption is not extended to combos in v1).
+    """
+    from trading_agent.exits.fill_confirm import (
+        BUY_CROSS_BUF,
+        SELL_CROSS_BUF,
+        build_pending_combo_state,
+        find_adoptable_close_order,
+        write_pending_close,
+    )
+
+    meta = pos["combo"]
+    symbol = pos.get("symbol") or meta.short_leg
+    action = dec.get("action", "")
+    reason = dec.get("reason", "")
+    legs = pos.get("combo_legs") or {}
+    short_q = legs.get("short") or {}
+    long_q = legs.get("long") or {}
+    full_qty = int(float(pos.get("qty") or 0))
+    close_units = int(dec.get("close_units") or full_qty)
+    is_trim = 0 < close_units < full_qty
+
+    # Pre-placement safety: a live close order on either leg means a previous
+    # run placed this close and died before the pending-state write. Defer
+    # one tick fail-closed rather than double-placing.
+    live_short = find_adoptable_close_order(
+        broker_order_rows, meta.short_leg, "BUY")
+    live_long = find_adoptable_close_order(
+        broker_order_rows, meta.long_leg, "SELL")
+    if live_short or live_long:
+        emit(
+            run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+            event_type="combo_close_possible_orphan", severity=1,
+            payload={"symbol": symbol, "trade_id": trade_id,
+                     "live_short_close": live_short and live_short[0],
+                     "live_long_close": live_long and live_long[0],
+                     "note": "live close order on a combo leg — deferring "
+                             "one tick (no combo orphan adoption in v1)"},
+        )
+        return "failed"
+
+    # Per-leg marketable limits toward the executable side.
+    short_base = short_q.get("ask") or short_q.get("mark")
+    long_base = long_q.get("bid") or long_q.get("mark")
+    if not short_base or not long_base or not moomoo_available:
+        emit(
+            run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+            event_type="exit_order_failed", severity=1,
+            payload={"symbol": symbol, "action": action, "reason": reason,
+                     "combo": True, "detail": "no leg quotes or moomoo down"},
+        )
+        return "failed"
+    short_price = round(float(short_base) * BUY_CROSS_BUF, 2)
+    long_price = round(float(long_base) * SELL_CROSS_BUF, 2)
+
+    try:
+        from trading_agent.mcp_servers.moomoo.server import (
+            close_paper_option_combo,
+        )
+        result = close_paper_option_combo(
+            short_leg_symbol=meta.short_leg,
+            long_leg_symbol=meta.long_leg,
+            contracts=close_units,
+            short_price=short_price,
+            long_price=long_price,
+            trade_id=int(trade_id),
+        )
+    except Exception as e:
+        log.warning("[route_exit_or_hold] combo close %s failed: %s", symbol, e)
+        emit(
+            run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+            event_type="exit_order_failed", severity=1,
+            payload={"symbol": symbol, "action": action, "reason": reason,
+                     "combo": True, "detail": repr(e)},
+        )
+        return "failed"
+
+    if result.get("combo_close_blocked") or result.get("order_blocked"):
+        # The close tool's own gate refused a journal-backed exit — always a
+        # bug worth paging on (closes must never be trapped).
+        emit(
+            run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+            event_type="exit_order_blocked_by_guard", severity=2,
+            payload={"symbol": symbol, "trade_id": trade_id, "combo": True,
+                     "reason": result.get("reason")},
+        )
+        return "failed"
+
+    cc = result.get("combo_close")
+    partial = (cc == "partial") or bool(result.get("partial"))
+    if cc is not True and not partial:
+        # Nothing live at the broker (leg1 rejected, or clean rollback of a
+        # working BTC order) — retry next tick.
+        emit(
+            run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+            event_type="exit_order_failed", severity=1,
+            payload={"symbol": symbol, "action": action, "reason": reason,
+                     "combo": True,
+                     "rollback": bool(result.get("combo_rollback")),
+                     "detail": result.get("reason")},
+        )
+        return "failed"
+
+    short_oid = result.get("short_close_order_id") or None
+    long_oid = (None if partial
+                else (result.get("long_close_order_id") or None))
+    state = build_pending_combo_state(
+        symbol=symbol,
+        action=action,
+        reason=reason,
+        units=close_units,
+        settle_mode="trim" if is_trim else "full",
+        net_credit=meta.net_credit,
+        short_leg=meta.short_leg,
+        long_leg=meta.long_leg,
+        short_order_id=short_oid,
+        long_order_id=long_oid,
+        short_price=short_price,
+        long_price=long_price,
+        short_bid=short_q.get("bid"), short_ask=short_q.get("ask"),
+        long_bid=long_q.get("bid"), long_ask=long_q.get("ask"),
+        thesis_id=thesis_id,
+        source="postgres",
+        # Per-leg broker qty at placement — the vanished-order branch
+        # reconciles TRIMS by quantity (presence alone can't detect a late
+        # invisible fill on a partial close and would over-trim).
+        broker_qty_before=full_qty,
+    )
+    if not write_pending_close(trade_id, state):
+        # The legacy "immediate cost-honest close" fallback is NOT valid for
+        # combos (it can't represent two legs). The broker orders are live;
+        # next tick's orphan check defers and the operator is paged. NEVER
+        # single-leg-close a combo row.
+        emit(
+            run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+            event_type="combo_pending_write_failed", severity=2,
+            payload={"symbol": symbol, "trade_id": trade_id,
+                     "short_close_order_id": short_oid,
+                     "long_close_order_id": long_oid,
+                     "risk": "two live close orders untracked — journal row "
+                             "left OPEN; reconcile manually"},
+        )
+        return "failed"
+
+    if partial:
+        emit(
+            run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+            event_type="combo_close_partial_leg", severity=2,
+            payload={"symbol": symbol, "trade_id": trade_id,
+                     "short_close_order_id": short_oid,
+                     "note": "short leg buy-back live/dealt, long-leg close "
+                             "not placed — fill_confirm retries the wing"},
+        )
+
+    # Trims stamp regime_downsized_at_label immediately (the stamp IS the
+    # idempotency guard; a lost stamp would re-trim next tick).
+    if is_trim and action == "EXIT_REGIME_DOWNSIZE":
+        try:
+            from trading_agent.store.postgres import cursor
+            with cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE journal_trades
+                    SET regime_downsized_at_label = %s
+                    WHERE id = %s AND outcome = 'OPEN'
+                    """,
+                    (dec.get("regime_label"), trade_id),
+                )
+        except Exception as e:
+            emit(
+                run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                event_type="downsize_guard_unpersisted", severity=1,
+                payload={"symbol": symbol, "trade_id": trade_id,
+                         "regime_label": dec.get("regime_label"),
+                         "error": repr(e),
+                         "risk": "next tick may re-trim 50% — stamp "
+                                 "regime_downsized_at_label manually"},
+            )
+
+    emit(
+        run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+        event_type="exit_order_placed",
+        payload={
+            "symbol": symbol, "action": action, "qty": close_units,
+            "combo": True, "settle_mode": "trim" if is_trim else "full",
+            "short_close_order_id": short_oid,
+            "long_close_order_id": long_oid,
+            "short_limit": short_price, "long_limit": long_price,
+            "reason": reason, "trade_id": trade_id,
+        },
+    )
+    try:
+        from trading_agent.notify import send as ntfy_send
+        ntfy_send(
+            topic="trades",
+            title=f"EXIT ORDER {action.replace('EXIT_', '')} — "
+                  f"{_bare_ticker(symbol)} vertical",
+            body=(
+                f"Spread: short {meta.short_leg} / long {meta.long_leg}\n"
+                f"Units: {close_units} ({'trim' if is_trim else 'full'})\n"
+                f"BTC short @ {short_price:.2f}, STC long @ {long_price:.2f}\n"
+                f"Awaiting broker fills — P&L records when BOTH legs confirm\n"
+                f"Reason: {reason}"
+            ),
+            priority=4,
+            tags=["rotating_light", "chart_with_downwards_trend"],
+        )
+    except Exception as e:
+        log.warning("[route_exit_or_hold] combo ntfy failed: %s", e)
+    return "pending"
+
 
 def route_exit_or_hold(state: TradingGraphState) -> dict:
     """Execute paper close orders for any EXIT_* decisions.
@@ -617,7 +1261,11 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
 
     journal = state.get("journal") or {}
     decisions: list[dict] = journal.get("exit_decisions") or []
-    exits = [d for d in decisions if d.get("action", "HOLD") != "HOLD"]
+    # stamp_regime_label rides on a combo qty==1 downsize SKIP (action HOLD):
+    # no order, but route must still stamp regime_downsized_at_label so the
+    # skip doesn't re-fire every tick — include those in the work list.
+    exits = [d for d in decisions
+             if d.get("action", "HOLD") != "HOLD" or d.get("stamp_regime_label")]
 
     if not exits:
         emit(run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
@@ -760,6 +1408,39 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             continue
         trade_id, thesis_id = resolved
 
+        # Combo stamp-only path: a qty==1 EXIT_REGIME_DOWNSIZE was skipped
+        # (whole units only — half a spread cannot trim). Stamp the guard
+        # column WITHOUT an order; the stamp is the once-per-episode dedup.
+        if dec.get("stamp_regime_label") and action == "HOLD":
+            try:
+                from trading_agent.store.postgres import cursor
+                with cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE journal_trades
+                        SET regime_downsized_at_label = %s
+                        WHERE id = %s AND outcome = 'OPEN'
+                        """,
+                        (dec["stamp_regime_label"], trade_id),
+                    )
+                emit(
+                    run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                    event_type="combo_trim_skipped_single_unit", severity=1,
+                    payload={"symbol": symbol, "trade_id": trade_id,
+                             "regime_label": dec["stamp_regime_label"],
+                             "reason": reason,
+                             "note": "1-lot vertical cannot trim 50% in whole "
+                                     "units — skipped, guard stamped"},
+                )
+            except Exception as e:
+                # No order was placed — a failed stamp just retries next
+                # tick. Nothing at the broker can double-trim.
+                log.warning(
+                    "[route_exit_or_hold] combo skip-stamp %s failed: %s",
+                    symbol, e,
+                )
+            continue
+
         if pending_ids_pg is None:
             log.warning(
                 "[route_exit_or_hold] %s: pending-close state unreadable — "
@@ -782,6 +1463,24 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             pending_symbols.append(symbol)
             continue
 
+        # Combo close path: every trigger fired on a combo (profit-take,
+        # 21-DTE, P0b trim, stop/thesis-broken) goes through the atomic
+        # two-leg close tool — never the single-leg placement below. Gated
+        # on the POSITION's meta (not just the decision flag) so a combo can
+        # never leak into single-leg placement.
+        if pos.get("combo") is not None:
+            status = _route_combo_close(
+                dec=dec, pos=pos, trade_id=trade_id, thesis_id=thesis_id,
+                run_id=run_id, trigger=trigger,
+                broker_order_rows=broker_order_rows,
+                moomoo_available=moomoo_available,
+            )
+            if status == "pending":
+                pending_symbols.append(symbol)
+            else:
+                failed_symbols.append(symbol)
+            continue
+
         full_qty = float(pos.get("qty") or 0)
         close_qty = max(1, round(full_qty * qty_factor)) if qty_factor < 1.0 else full_qty
         if close_qty <= 0:
@@ -797,6 +1496,29 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
         if isinstance(ep, dict):
             plan_dir = ep.get("direction") or "LONG"
         side_close = "BUY" if plan_dir == "SHORT" else "SELL"
+
+        # Backstop (M1-0.1 degrade contract): a SHORT-direction plan with no
+        # combo meta is a degraded combo row (single-leg SELL-to-open is
+        # hard-blocked, so no legitimate single-leg SHORT exists). Placing
+        # the single-leg BUY-back would leg the vertical apart and orphan
+        # the wing — refuse loudly instead. detect already forces HOLD for
+        # this signature; this guard catches any path that slips through.
+        if plan_dir == "SHORT" and pos.get("combo") is None:
+            log.error(
+                "[route_exit_or_hold] %s: SHORT-direction plan with no combo "
+                "meta — refusing single-leg close (would orphan the wing)",
+                symbol,
+            )
+            emit(
+                run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                event_type="combo_single_leg_close_refused", severity=2,
+                payload={"symbol": symbol, "trade_id": trade_id,
+                         "action": action, "reason": reason,
+                         "note": "degraded combo row — repair the combo "
+                                 "payload; the engine will not leg it apart"},
+            )
+            failed_symbols.append(symbol)
+            continue
         placed_order_id: str | None = None
 
         # Marketable limit toward the EXECUTABLE side. The old code priced at
@@ -1000,6 +1722,7 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
                 quoted_ask=float(quoted_ask) if quoted_ask else None,
                 thesis_id=thesis_id,
                 source="postgres",
+                expected_qty_before_close=full_qty,
             )
             if write_pending_close(trade_id, pending):
                 exit_pending = True

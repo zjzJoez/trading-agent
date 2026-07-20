@@ -341,6 +341,17 @@ def has_existing_open_for(broker_symbol: str) -> bool:
         # as a close and silently disable the SELL-to-open block in exactly
         # the environment the operator trades interactively.
         pass
+    # Combo long wings: a vertical is journaled as ONE row keyed by the SHORT
+    # leg's symbol, so a direct-symbol lookup can never see the protective
+    # LONG leg. Without this, every SELL-to-close of the wing (the atomic
+    # combo close's second leg, and every fill-confirm re-placement of it)
+    # classifies as SELL-to-OPEN and is hard-blocked by R_NO_SHORT_OPEN.
+    try:
+        from trading_agent.combo import open_combo_long_legs
+        if broker_symbol in open_combo_long_legs():
+            return True
+    except Exception:
+        pass
     if sqlite_says_no:
         return False
     # SQLite errored and Postgres found nothing / errored: fail open to

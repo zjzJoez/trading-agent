@@ -213,30 +213,14 @@ def _load_open_rows_sqlite() -> list[dict]:
 def _combo_snapshots_sqlite(trade_ids: list[int]) -> dict[int, dict]:
     """Latest combo market_snapshot payload per sqlite trade_id.
 
-    A defined-risk vertical is journaled as ONE row keyed by the short leg's
-    OCC symbol (posttool_fill_capture combo path); both leg symbols live only
-    in the trade's market_snapshots payload (combo=True, short_leg, long_leg,
-    contracts). Best-effort: unreadable payloads are skipped — the row then
-    reconciles as a plain single-leg and the long leg surfaces as a finding,
-    which is the safe direction (alert, never mask)."""
-    if not trade_ids:
-        return {}
-    placeholders = ",".join("?" for _ in trade_ids)
-    with connection() as conn:
-        rows = conn.execute(
-            "SELECT trade_id, payload FROM market_snapshots "
-            f"WHERE trade_id IN ({placeholders}) ORDER BY id",
-            trade_ids,
-        ).fetchall()
-    out: dict[int, dict] = {}
-    for r in rows:
-        try:
-            payload = json.loads(r["payload"])
-        except (TypeError, ValueError):
-            continue
-        if isinstance(payload, dict) and payload.get("combo"):
-            out[int(r["trade_id"])] = payload
-    return out
+    Thin delegation to the canonical detector (trading_agent.combo) — this
+    job used to keep a private copy of the query; the module is now the ONE
+    place the detection rule lives. Best-effort semantics unchanged:
+    unreadable payloads are skipped — the row then reconciles as a plain
+    single-leg and the long leg surfaces as a finding, which is the safe
+    direction (alert, never mask)."""
+    from trading_agent.combo import sqlite_combo_payloads
+    return sqlite_combo_payloads(trade_ids)
 
 
 def expand_combo_rows(rows: list[dict]) -> list[dict]:
@@ -246,15 +230,20 @@ def expand_combo_rows(rows: list[dict]) -> list[dict]:
     leg) while the journal holds one SELL row on the short leg's symbol.
     Without expansion the long leg false-alarms as position_without_journal_row
     every night. Appends a synthetic BUY row for each combo's long leg, tagged
-    with the same trade_id/store so findings still point at the real row."""
+    with the same trade_id/store so findings still point at the real row.
+
+    Handles BOTH stores: sqlite rows resolve their combo payload from
+    market_snapshots; Postgres rows carry it inline (the ``combo`` key,
+    selected from broker_fill_json->'combo' by _load_open_rows_pg)."""
     sqlite_ids = [r["trade_id"] for r in rows if r["store"] == "sqlite"]
     snapshots = _combo_snapshots_sqlite(sqlite_ids)
     extra: list[dict] = []
     for r in rows:
-        if r["store"] != "sqlite":
-            continue
-        snap = snapshots.get(r["trade_id"])
-        if not snap:
+        if r["store"] == "sqlite":
+            snap = snapshots.get(r["trade_id"])
+        else:
+            snap = r.get("combo")
+        if not isinstance(snap, dict) or not snap.get("combo"):
             continue
         long_sym = str(snap.get("long_leg") or "")
         if not long_sym:
@@ -264,7 +253,7 @@ def expand_combo_rows(rows: list[dict]) -> list[dict]:
         except (TypeError, ValueError):
             contracts = r["qty"]
         extra.append({
-            "store": "sqlite", "trade_id": r["trade_id"],
+            "store": r["store"], "trade_id": r["trade_id"],
             "symbol": long_sym, "side": "BUY", "qty": contracts,
         })
     return rows + extra
@@ -278,7 +267,8 @@ def _load_open_rows_pg() -> list[dict] | None:
         from trading_agent.store.postgres import cursor
         with cursor() as cur:
             cur.execute(
-                "SELECT id, symbol, side, qty, broker_order_id "
+                "SELECT id, symbol, side, qty, broker_order_id, "
+                "broker_fill_json->'combo' "
                 "FROM journal_trades WHERE outcome = 'OPEN'"
             )
             rows = cur.fetchall()
@@ -286,12 +276,13 @@ def _load_open_rows_pg() -> list[dict] | None:
         print(f"[{JOB}] postgres journal unavailable: {e}", file=sys.stderr)
         return None
     out: list[dict] = []
-    for tid, symbol, side, qty, boid in rows:
+    for tid, symbol, side, qty, boid, combo_payload in rows:
         if str(boid or "").startswith(MIRROR_PREFIX):
             continue
         out.append({
             "store": "postgres", "trade_id": int(tid), "symbol": str(symbol),
             "side": str(side or "BUY").upper(), "qty": float(qty or 0.0),
+            "combo": combo_payload if isinstance(combo_payload, dict) else None,
         })
     return out
 
@@ -421,12 +412,16 @@ def main(argv: list[str] | None = None) -> int:
             broker = _load_broker_positions()
             if broker is not None:
                 positions_checked = True
-                journal_rows = expand_combo_rows(_load_open_rows_sqlite())
+                journal_rows = _load_open_rows_sqlite()
                 position_stores.append("sqlite")
                 pg_rows = _load_open_rows_pg()
                 if pg_rows is not None:
                     journal_rows.extend(pg_rows)
                     position_stores.append("postgres")
+                # Expand AFTER both stores load: Postgres-journaled verticals
+                # need their long wing appended too, or it false-alarms
+                # position_without_journal_row nightly.
+                journal_rows = expand_combo_rows(journal_rows)
                 position_findings = compare_positions(
                     broker, journal_rows,
                     all_stores_visible=pg_rows is not None,

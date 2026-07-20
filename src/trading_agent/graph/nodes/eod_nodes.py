@@ -528,10 +528,22 @@ def mark_to_market(state: TradingGraphState) -> dict:
         log.error("[mark_to_market] moomoo import failed: %s", e)
         moomoo_ok = False
 
-    # Batch fetch all symbols in one call (signature: list[str])
+    from trading_agent.combo import combo_meta
+
+    # Batch fetch all symbols in one call (signature: list[str]). Combo rows
+    # (symbol = short leg, entry = net credit, side = SELL) need BOTH legs
+    # quoted — marking them at the short leg's price alone is sign-inverted
+    # and wing-blind (M1-0.1 net-of-legs marking).
     quote_by_symbol: dict[str, dict] = {}
     if moomoo_ok and open_trades:
-        symbols_to_fetch = [t.get("symbol") for t in open_trades if t.get("symbol")]
+        symbols_to_fetch = []
+        for t in open_trades:
+            meta = combo_meta(t.get("combo"))
+            if meta is not None:
+                symbols_to_fetch.extend([meta.short_leg, meta.long_leg])
+            elif t.get("symbol"):
+                symbols_to_fetch.append(t.get("symbol"))
+        symbols_to_fetch = list(dict.fromkeys(symbols_to_fetch))
         try:
             result = get_quote(symbols_to_fetch)
             for r in (result.get("rows") or []):
@@ -541,13 +553,57 @@ def mark_to_market(state: TradingGraphState) -> dict:
         except Exception as e:
             log.warning("[mark_to_market] get_quote batch failed: %s", e)
 
+    def _pos_last(row: dict | None) -> float | None:
+        try:
+            v = float((row or {}).get("last_price") or 0)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
     marked_positions: list[dict] = []
     total_unrealized_pnl = 0.0
+    combo_skipped = 0
 
     for trade in open_trades:
         symbol = trade.get("symbol") or ""
         entry = float(trade.get("entry_price") or 0)
         qty = float(trade.get("qty") or 0)
+
+        # Combo rows: mark net-of-both-legs with SHORT polarity. entry_price
+        # is the net CREDIT, so unrealized = (entry − spread_value) × qty ×
+        # 100 — marking the short leg alone with LONG polarity reports a
+        # healthy credit spread as a loss. Either leg unquotable → skip the
+        # row loudly (mirrors learning/excursion.py) rather than mark junk.
+        meta = combo_meta(trade.get("combo"))
+        if meta is not None:
+            short_last = _pos_last(quote_by_symbol.get(meta.short_leg))
+            long_last = _pos_last(quote_by_symbol.get(meta.long_leg))
+            if short_last is None or long_last is None:
+                combo_skipped += 1
+                log.warning(
+                    "[mark_to_market] combo %s skipped: leg unquotable "
+                    "(short=%s long=%s)", symbol, short_last, long_last,
+                )
+                continue
+            mark = round(short_last - long_last, 4)
+            unrealized_pnl = (entry - mark) * qty * 100.0
+            total_unrealized_pnl += unrealized_pnl
+            marked_positions.append({
+                "symbol": symbol,
+                "asset_type": "OPT",
+                "side": trade.get("side", "SELL"),
+                "qty": qty,
+                "entry_price": entry,
+                "mark": mark,
+                "stop": trade.get("stop"),
+                "target": trade.get("target"),
+                "unrealized_pnl": unrealized_pnl,
+                "combo": True,
+                "thesis_id": trade.get("thesis_id"),
+                "strategy_label": trade.get("strategy_label"),
+            })
+            continue
+
         is_opt = _is_option_code(symbol)
         mark = entry  # default: no change
         iv: float | None = None
@@ -599,6 +655,7 @@ def mark_to_market(state: TradingGraphState) -> dict:
         payload={
             "n_positions": len(marked_positions),
             "total_unrealized_pnl": round(total_unrealized_pnl, 2),
+            "combo_skipped_unquotable": combo_skipped,
         },
     )
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -35,7 +35,7 @@ def guard_db(tmp_path: Path, monkeypatch):
 
 def _insert_thesis(ticker: str, minutes_ago: float = 0.0, status: str = "open") -> int:
     from trading_agent.db import connection
-    created = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+    created = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat()
     with connection() as conn:
         cur = conn.execute(
             "INSERT INTO theses (created_at, ticker, direction, thesis_text, "
@@ -53,7 +53,7 @@ def _insert_open_trade(symbol: str, asset_type: str = "OPT", qty: float = 1,
             "INSERT INTO trades (symbol, asset_type, side, qty, entry_price, "
             "opened_at, outcome, is_paper) VALUES (?, ?, 'BUY', ?, ?, ?, 'OPEN', 1)",
             (symbol, asset_type, qty, entry_price,
-             datetime.now(timezone.utc).isoformat()),
+             datetime.now(UTC).isoformat()),
         )
         return int(cur.lastrowid)
 
@@ -78,7 +78,7 @@ def _future_opt(ticker: str = "MRVL", days: int = 30, right: str = "C",
     """Option symbol with a live ~`days`-DTE expiry so R5's [14,60] DTE band
     keeps passing as real time advances. (Hardcoded 260702 symbols went stale
     once their DTE fell below 14 — this keeps the fixtures evergreen.)"""
-    exp = (datetime.now(timezone.utc).date() + timedelta(days=days)).strftime("%y%m%d")
+    exp = (datetime.now(UTC).date() + timedelta(days=days)).strftime("%y%m%d")
     return f"US.{ticker}{exp}{right}{int(round(strike * 1000)):08d}"
 
 
@@ -374,6 +374,7 @@ def test_r5d_block_lands_in_audit_log(guard_db, monkeypatch):
     """R5d must be auditable like every other rule — the nightly reconcile
     joins fills against these rows."""
     import json as _json
+
     from trading_agent import order_guard as og
     from trading_agent.db import connection
     from trading_agent.order_guard import R5D
@@ -578,13 +579,13 @@ def test_open_combo_counts_at_max_loss_for_r3(guard_db):
             "opened_at, outcome, is_paper) "
             "VALUES (?, 'OPT', 'SELL', 1, 1.2, ?, 'OPEN', 1)",
             ("US.SPY260717P00100000",
-             datetime.now(timezone.utc).isoformat()),
+             datetime.now(UTC).isoformat()),
         )
         tid = int(cur.lastrowid)
         conn.execute(
             "INSERT INTO market_snapshots (trade_id, taken_at, payload) "
             "VALUES (?, ?, ?)",
-            (tid, datetime.now(timezone.utc).isoformat(),
+            (tid, datetime.now(UTC).isoformat(),
              _json.dumps({"combo": True, "max_loss": 380.0, "net_credit": 1.2})),
         )
         conn.commit()
@@ -603,3 +604,106 @@ def test_combo_response_returns_guard_verified_thesis_id(guard_db, monkeypatch):
     d = _eval_combo(_combo_params())
     assert d.allowed
     assert d.thesis_id == tid
+
+
+# ---------------------------------------------------------------------------
+# Combo long-wing close classification (M1-0.1 lane A, Section 7)
+# ---------------------------------------------------------------------------
+
+
+_COMBO_SHORT = _future_opt("SPY", 30, "P", 100.0)
+_COMBO_LONG = _future_opt("SPY", 30, "P", 95.0)
+
+
+def _insert_open_combo_row_sqlite(short=_COMBO_SHORT, long=_COMBO_LONG,
+                                  outcome="OPEN") -> int:
+    from trading_agent.db import connection
+    with connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO trades (symbol, asset_type, side, qty, entry_price, "
+            "opened_at, outcome, is_paper) VALUES (?, 'OPT', 'SELL', 1, 1.2, "
+            "?, ?, 1)",
+            (short, datetime.now(UTC).isoformat(), outcome),
+        )
+        tid = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO market_snapshots (trade_id, taken_at, payload) "
+            "VALUES (?, ?, ?)",
+            (tid, datetime.now(UTC).isoformat(), json.dumps({
+                "combo": True, "short_leg": short, "long_leg": long,
+                "net_credit": 1.2, "width": 5.0, "max_loss": 380.0,
+                "contracts": 1.0, "broker_order_ids": ["L1", "S1"],
+            })),
+        )
+        conn.commit()
+    return tid
+
+
+def test_sell_of_open_combo_long_wing_classifies_close_sqlite(guard_db, monkeypatch):
+    """The vertical is journaled as ONE row keyed by the SHORT leg — a
+    direct-symbol lookup never sees the wing. Without the combo-aware hook,
+    every SELL-to-close of the wing (the atomic close's leg 2, and every
+    fill-confirm re-placement of it) is misclassified SELL-to-OPEN and
+    hard-blocked by R_short_option_open_blocked."""
+    from trading_agent import order_guard as og
+    _insert_open_combo_row_sqlite()
+
+    def _boom():
+        raise ConnectionError("no postgres on this box")
+    monkeypatch.setattr("trading_agent.store.postgres.cursor", _boom)
+    assert og.has_existing_open_for(_COMBO_LONG) is True
+
+    # And the full guard path: the wing's SELL evaluates as a CLOSE.
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    d = _eval("option", {
+        "option_symbol": _COMBO_LONG, "side": "SELL",
+        "contracts": 1, "price": 0.20,
+    })
+    assert d.intent == "close"
+    assert d.allowed, d.violations_json()
+    assert not any(v.rule == "R_short_option_open_blocked"
+                   for v in d.violations)
+
+
+def test_sell_of_open_combo_long_wing_classifies_close_pg(guard_db, monkeypatch):
+    """Postgres-journaled combo (broker_fill_json->'combo'): the wing must
+    classify as close from that store too."""
+    from trading_agent import order_guard as og
+
+    pg_payload = {
+        "combo": True, "short_leg": _COMBO_SHORT, "long_leg": _COMBO_LONG,
+        "net_credit": 1.2, "width": 5.0, "max_loss": 380.0,
+        "contracts": 1.0, "broker_order_ids": ["L1", "S1"],
+    }
+
+    class _ComboPgCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, *a, **kw):
+            self._combo_query = "combo" in sql
+
+        def fetchone(self):
+            return None  # direct-symbol lookup misses (row keyed by short)
+
+        def fetchall(self):
+            return [(pg_payload,)]
+
+    monkeypatch.setattr("trading_agent.store.postgres.cursor",
+                        lambda: _ComboPgCtx())
+    assert og.has_existing_open_for(_COMBO_LONG) is True
+
+
+def test_closed_combo_long_wing_still_classifies_open(guard_db, monkeypatch):
+    """A CLOSED combo's wing must NOT classify as close — that would let a
+    naked SELL-to-open slip past R_NO_SHORT_OPEN."""
+    from trading_agent import order_guard as og
+    _insert_open_combo_row_sqlite(outcome="WIN")
+
+    def _boom():
+        raise ConnectionError("no postgres on this box")
+    monkeypatch.setattr("trading_agent.store.postgres.cursor", _boom)
+    assert og.has_existing_open_for(_COMBO_LONG) is False

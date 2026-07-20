@@ -13,14 +13,14 @@ Coverage:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 # A Saturday — market closed, so scout-prompt rvol uses the prior-day
 # (f=1.0) semantics regardless of when the test suite happens to run.
-_MARKET_CLOSED_NOW = datetime(2026, 7, 18, 15, 0, tzinfo=timezone.utc)
+_MARKET_CLOSED_NOW = datetime(2026, 7, 18, 15, 0, tzinfo=UTC)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -948,7 +948,9 @@ class TestRouteExitOrHold:
                                        return_value=set()):
                                 with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
                                     with patch("trading_agent.notify.send"):
-                                        from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                        from trading_agent.graph.nodes.intraday_nodes import (
+                                            route_exit_or_hold,
+                                        )
                                         route_exit_or_hold(state)
             mock_place_opt.assert_called_once()
             # Phase 0.3: SELL closes price toward the executable side —
@@ -989,7 +991,9 @@ class TestRouteExitOrHold:
                             with patch("trading_agent.exits.fill_confirm.pending_close_trade_ids_pg",
                                        return_value=set()):
                                 with patch("trading_agent.notify.send"):
-                                    from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                    from trading_agent.graph.nodes.intraday_nodes import (
+                                        route_exit_or_hold,
+                                    )
                                     route_exit_or_hold(state)
         # Postgres-only journal: the fallback close is an UPDATE journal_trades
         # at the executable-side limit with the fee-derived outcome.
@@ -1057,7 +1061,9 @@ class TestRouteExitOrHold:
                         with patch("trading_agent.mcp_servers.moomoo.server.place_paper_option_order") as mock_place_opt:
                             with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_close:
                                 with patch("trading_agent.notify.send"):
-                                    from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                    from trading_agent.graph.nodes.intraday_nodes import (
+                                        route_exit_or_hold,
+                                    )
                                     route_exit_or_hold(state)
         # No order should be placed, no journal close, no ntfy
         mock_place.assert_not_called()
@@ -1093,7 +1099,9 @@ class TestRouteExitOrHold:
                                return_value=mock_order) as mock_place_opt:
                         with patch("trading_agent.mcp_servers.journal.server.close_trade") as mock_sqlite_close:
                             with patch("trading_agent.notify.send"):
-                                from trading_agent.graph.nodes.intraday_nodes import route_exit_or_hold
+                                from trading_agent.graph.nodes.intraday_nodes import (
+                                    route_exit_or_hold,
+                                )
                                 route_exit_or_hold(state)
 
         # Order placed with the Postgres-resolved trade_id (42)
@@ -1353,7 +1361,7 @@ class TestScoutPromptDeBias:
 
 class TestRankCandidates:
     def test_llm_candidates_returned(self):
-        from trading_agent.llm.schemas import ScoutOutput, ScoutCandidate
+        from trading_agent.llm.schemas import ScoutCandidate, ScoutOutput
         state = _base_state(
             trigger="premarket_scan",
             watchlist=["AAPL", "NVDA"],
@@ -1564,7 +1572,9 @@ class TestNtfyScanDigest:
                                             started.append(cmd[-1])
                                         return MagicMock(returncode=0, stderr=b"")
                                     with patch("subprocess.run", side_effect=_fake_run):
-                                        from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                        from trading_agent.graph.nodes.premarket_nodes import (
+                                            ntfy_scan_digest,
+                                        )
                                         ntfy_scan_digest(state)
         assert started == ["trading-agent-candidate-entry@NVDA.service"], (
             f"only 1 slot remained (6-5); expected 1 dispatch, got {started}"
@@ -1598,7 +1608,9 @@ class TestNtfyScanDigest:
                                                 started.append(cmd[-1])
                                             return MagicMock(returncode=0, stderr=b"")
                                         with patch("subprocess.run", side_effect=_fake_run):
-                                            from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                            from trading_agent.graph.nodes.premarket_nodes import (
+                                                ntfy_scan_digest,
+                                            )
                                             ntfy_scan_digest(state)
         assert started == [], "recently-dispatched ticker must not re-dispatch"
         assert any(s["payload"].get("reason") == "already_dispatched_recently" for s in skipped)
@@ -1619,7 +1631,9 @@ class TestNtfyScanDigest:
                     with patch("pathlib.Path.exists", return_value=False):
                         with patch("trading_agent.learning.soak.is_new_entry_allowed", return_value=True):
                             with patch("subprocess.run") as mock_run:
-                                from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                from trading_agent.graph.nodes.premarket_nodes import (
+                                    ntfy_scan_digest,
+                                )
                                 ntfy_scan_digest(state)
         mock_run.assert_not_called()  # no dispatch when market closed
         assert any(s["payload"].get("reason") == "outside_regular_hours" for s in skipped)
@@ -1668,7 +1682,9 @@ class TestNtfyScanDigest:
                             with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown",
                                        return_value=None):
                                 with patch("subprocess.run") as mock_popen:  # dispatch uses systemctl now
-                                    from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                    from trading_agent.graph.nodes.premarket_nodes import (
+                                        ntfy_scan_digest,
+                                    )
                                     ntfy_scan_digest(state)
         mock_popen.assert_not_called()  # systemctl shouldn't be invoked when skipped
 
@@ -1689,7 +1705,9 @@ class TestNtfyScanDigest:
                             with patch("trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown",
                                        return_value={"last_ts": "2026-05-10T12:30Z", "age_days": 1.2}):
                                 with patch("subprocess.run") as mock_popen:  # dispatch uses systemctl now
-                                    from trading_agent.graph.nodes.premarket_nodes import ntfy_scan_digest
+                                    from trading_agent.graph.nodes.premarket_nodes import (
+                                        ntfy_scan_digest,
+                                    )
                                     ntfy_scan_digest(state)
         mock_popen.assert_not_called()  # systemctl shouldn't be invoked when skipped
 
@@ -1996,7 +2014,6 @@ class TestSoakGates:
 
     def test_tiny_paper_caps_qty(self):
         """In TINY_PAPER phase, deterministic_sizing must cap at 1 contract."""
-        from trading_agent.sizing import SizingContext, ProposedTrade, SizingViolation
         state = _base_state(
             trigger="candidate_entry",
             proposal={
@@ -2013,7 +2030,9 @@ class TestSoakGates:
                     with patch("trading_agent.sizing.blockers", return_value=[]):
                         with patch("trading_agent.sectors.known_count", return_value=10):
                             with patch("trading_agent.sectors.lookup", return_value="Technology"):
-                                from trading_agent.graph.nodes.trade_nodes import deterministic_sizing
+                                from trading_agent.graph.nodes.trade_nodes import (
+                                    deterministic_sizing,
+                                )
                                 result = deterministic_sizing(state)
         assert result["sizing"]["approved_qty"] == 1.0
 
@@ -2155,3 +2174,664 @@ class TestSpecBandBackstop:
         events = [c.kwargs["event_type"] for c in mock_emit.call_args_list]
         assert events == ["proposal_built"]
         mock_fin.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Combo (defined-risk vertical) exit path — M1-0.1 lane A
+# ---------------------------------------------------------------------------
+
+def _future_combo_syms(days=40):
+    from datetime import timedelta
+    exp = (datetime.now(UTC).date()
+           + timedelta(days=days)).strftime("%y%m%d")
+    short = f"US.SPY{exp}P{100_000:08d}"
+    long = f"US.SPY{exp}P{95_000:08d}"
+    return short, long
+
+
+def _combo_meta_for(short, long, net_credit=1.2, contracts=2.0):
+    from trading_agent.combo import ComboMeta
+    return ComboMeta(
+        short_leg=short, long_leg=long, net_credit=net_credit,
+        width=5.0, max_loss=(5.0 - net_credit) * 100 * contracts,
+        contracts=contracts, broker_order_ids=("L1", "S1"),
+    )
+
+
+class TestDetectExitTriggersCombo:
+    """Combo rows collapse to ONE synthetic position marked net-of-legs;
+    the long wing produces no decision and no manual-trade alert; all
+    failure modes HOLD fail-closed."""
+
+    def _positions(self, short, long, *, short_mark=0.90, long_mark=0.20,
+                   short_qty=2, long_qty=None, include_long=True):
+        pos = [{
+            "symbol": short, "asset_type": "OPT", "qty": short_qty,
+            "entry_price": 2.05, "mark": short_mark,
+            "bid": round(short_mark - 0.02, 2),
+            "ask": round(short_mark + 0.02, 2),
+        }]
+        if include_long:
+            pos.append({
+                "symbol": long, "asset_type": "OPT",
+                "qty": long_qty if long_qty is not None else short_qty,
+                "entry_price": 0.85, "mark": long_mark,
+                "bid": round(max(long_mark - 0.02, 0.01), 2),
+                "ask": round(long_mark + 0.02, 2),
+            })
+        return pos
+
+    def _enrichment(self, short, long, *, net_credit=1.2, contracts=2.0,
+                    plan=None, regime_downsized_at_label=None):
+        from trading_agent.llm.schemas import combo_exit_plan
+        if plan is None:
+            plan = combo_exit_plan(net_credit, 5.0).model_dump()
+        return {
+            short: {
+                "trade_id": 15, "thesis_id": 4, "stop": None, "target": None,
+                "exit_plan": plan, "mfe_so_far": None, "opened_at": None,
+                "scale_rungs_taken": 0,
+                "regime_downsized_at_label": regime_downsized_at_label,
+                "thesis_status": "open",
+                "combo": _combo_meta_for(short, long, net_credit=net_credit,
+                                         contracts=contracts),
+            }
+        }
+
+    def _run(self, positions, enrichment, regime_label="RANGE_LOW_VOL",
+             capture=None):
+        state = _base_state(
+            trigger="intraday_monitor",
+            positions=positions,
+            regime={"label": regime_label, "confidence": 0.8, "gate": {}},
+        )
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            if capture is not None:
+                stack.enter_context(patch(
+                    "trading_agent.graph.nodes.intraday_nodes.emit",
+                    side_effect=lambda **kw: capture.append(kw)))
+            else:
+                stack.enter_context(_patch_all_emits())
+            stack.enter_context(patch(
+                "trading_agent.graph.nodes.intraday_nodes."
+                "_load_journal_enrichment_by_symbol",
+                return_value=enrichment))
+            stack.enter_context(patch(
+                "trading_agent.graph.nodes.intraday_nodes."
+                "_no_plan_alerted_today", return_value=False))
+            stack.enter_context(patch(
+                "trading_agent.graph.nodes.intraday_nodes."
+                "_alerted_today", return_value=False))
+            stack.enter_context(patch(
+                "trading_agent.exits.fill_confirm."
+                "pending_close_trade_ids_pg", return_value=set()))
+            stack.enter_context(patch(
+                "trading_agent.mcp_servers.moomoo.server.get_quote",
+                return_value={"rows": []}))
+            from trading_agent.graph.nodes.intraday_nodes import (
+                detect_exit_triggers,
+            )
+            return detect_exit_triggers(state)
+
+    def test_combo_marks_net_of_both_legs(self):
+        short, long = _future_combo_syms()
+        result = self._run(
+            self._positions(short, long, short_mark=0.90, long_mark=0.20),
+            self._enrichment(short, long))
+        decisions = result["journal"]["exit_decisions"]
+        # ONE decision for the whole spread — the long wing evaluates nothing
+        assert len(decisions) == 1
+        assert decisions[0]["symbol"] == short
+        # spread 0.70 > 50%-PT target 0.60 and < width → HOLD
+        assert decisions[0]["action"] == "HOLD"
+        synth = [p for p in result["positions"] if p.get("combo")]
+        assert len(synth) == 1
+        assert synth[0]["mark"] == pytest.approx(0.70)
+        assert synth[0]["entry_price"] == pytest.approx(1.2)
+        assert all(p["symbol"] != long for p in result["positions"])
+
+    def test_combo_long_leg_removed_no_manual_alert(self):
+        short, long = _future_combo_syms()
+        captured: list[dict] = []
+        self._run(
+            self._positions(short, long),
+            self._enrichment(short, long), capture=captured)
+        no_plan = [e for e in captured
+                   if e.get("event_type") == "position_no_exit_plan"]
+        assert no_plan == [], (
+            "long wing must not raise the manual-trade alert")
+
+    def test_combo_50pct_profit_take_fires_on_spread_value(self):
+        short, long = _future_combo_syms()
+        # spread = 0.70 − 0.15 = 0.55 <= 0.60 = 0.5 × net_credit → PT fires
+        result = self._run(
+            self._positions(short, long, short_mark=0.70, long_mark=0.15),
+            self._enrichment(short, long))
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "EXIT_TARGET"
+        assert dec["combo"] is True
+        assert dec["close_units"] == 2
+
+    def test_combo_21dte_force_close(self):
+        short, long = _future_combo_syms(days=15)  # inside the 21-DTE window
+        result = self._run(
+            self._positions(short, long, short_mark=0.90, long_mark=0.20),
+            self._enrichment(short, long))
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "EXIT_DTE_HARD"
+        assert dec["combo"] is True
+        assert dec["close_units"] == 2
+
+    def test_combo_stale_leg_quote_holds(self):
+        short, long = _future_combo_syms()
+        positions = self._positions(short, long, short_mark=0.70)
+        positions[1]["mark"] = 0  # long leg quote stale/zero
+        result = self._run(positions, self._enrichment(short, long))
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "HOLD"
+        assert dec["reason"] == "combo_mark_invalid"
+
+    def test_combo_negative_spread_mark_holds(self):
+        """A bogus inverted spread mark would falsely fire the SHORT 50%-PT
+        target — must HOLD instead."""
+        short, long = _future_combo_syms()
+        result = self._run(
+            self._positions(short, long, short_mark=0.10, long_mark=0.30),
+            self._enrichment(short, long))
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "HOLD"
+        assert dec["reason"] == "combo_mark_invalid"
+
+    def test_combo_leg_qty_mismatch_holds_and_alerts(self):
+        short, long = _future_combo_syms()
+        captured: list[dict] = []
+        result = self._run(
+            self._positions(short, long, short_qty=2, long_qty=1),
+            self._enrichment(short, long), capture=captured)
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "HOLD"
+        assert dec["reason"] == "combo_leg_qty_mismatch"
+        events = [e for e in captured
+                  if e.get("event_type") == "combo_leg_qty_mismatch"]
+        assert len(events) == 1 and events[0]["severity"] == 2
+
+    def test_combo_orphan_long_leg_alerts(self):
+        short, long = _future_combo_syms()
+        captured: list[dict] = []
+        result = self._run(
+            self._positions(short, long, include_long=False),
+            self._enrichment(short, long), capture=captured)
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "HOLD"
+        assert dec["reason"] == "combo_long_leg_missing"
+        events = [e for e in captured
+                  if e.get("event_type") == "combo_long_leg_orphaned"]
+        assert len(events) == 1 and events[0]["severity"] == 2
+
+    def _downsize_plan(self, net_credit=1.2):
+        from trading_agent.llm.schemas import (
+            RegimeRulesConfig,
+            combo_exit_plan,
+        )
+        plan = combo_exit_plan(net_credit, 5.0)
+        plan = plan.model_copy(update={"regime_rules": RegimeRulesConfig(
+            downsize_50_on_labels=["VOLATILE_TRANSITION"])})
+        return plan.model_dump()
+
+    def test_combo_downsize_qty1_skips_and_stamps_label(self):
+        short, long = _future_combo_syms()
+        result = self._run(
+            self._positions(short, long, short_qty=1),
+            self._enrichment(short, long, contracts=1.0,
+                             plan=self._downsize_plan()),
+            regime_label="VOLATILE_TRANSITION")
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "HOLD"
+        assert "combo_trim_skipped_whole_unit" in dec["reason"]
+        assert dec["combo"] is True
+        assert dec["stamp_regime_label"] == "VOLATILE_TRANSITION"
+
+    def test_combo_downsize_qty2_trims_one_unit(self):
+        short, long = _future_combo_syms()
+        result = self._run(
+            self._positions(short, long, short_qty=2),
+            self._enrichment(short, long, plan=self._downsize_plan()),
+            regime_label="VOLATILE_TRANSITION")
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "EXIT_REGIME_DOWNSIZE"
+        assert dec["combo"] is True
+        assert dec["close_units"] == 1
+
+    def test_combo_downsize_qty3_trims_floor_one_not_round_two(self):
+        """floor(3 × 0.5) = 1, NOT round(1.5) = 2 — whole units only."""
+        short, long = _future_combo_syms()
+        result = self._run(
+            self._positions(short, long, short_qty=3),
+            self._enrichment(short, long, contracts=3.0,
+                             plan=self._downsize_plan()),
+            regime_label="VOLATILE_TRANSITION")
+        dec = result["journal"]["exit_decisions"][0]
+        assert dec["action"] == "EXIT_REGIME_DOWNSIZE"
+        assert dec["close_units"] == 1
+
+    def test_merge_combo_positions_identity_when_no_combos(self):
+        """No-behavior-change lock: single-leg position lists pass through
+        the merge untouched (same object, no forced decisions)."""
+        from trading_agent.graph.nodes.intraday_nodes import (
+            _merge_combo_positions,
+        )
+        positions = [
+            {"symbol": "US.AAPL", "asset_type": "STK", "qty": 10,
+             "mark": 200.0},
+            {"symbol": "US.NVDA260817C220000", "asset_type": "OPT",
+             "qty": 1, "mark": 12.0},
+        ]
+        merged, holds = _merge_combo_positions(
+            positions, run_id="r", trigger="t")
+        assert merged is positions
+        assert holds == []
+
+    def test_enrichment_noncombo_combo_key_none_rest_identical(self):
+        """get_open_journal_trades' new combo select maps to combo=None on
+        non-combo rows; every other enrichment key is unchanged."""
+        from trading_agent.graph.nodes.intraday_nodes import (
+            _load_journal_enrichment_by_symbol,
+        )
+        row = {
+            "trade_id": 7, "symbol": "US.AAPL", "thesis_id": 3,
+            "stop": 1.0, "target": 6.0, "exit_plan": None,
+            "mfe_so_far": None, "opened_at": None, "scale_rungs_taken": 0,
+            "regime_downsized_at_label": None, "thesis_status": "open",
+            "direction": "LONG", "thesis_text": "t", "invalidation": "i",
+            "combo": None,
+        }
+        with patch("trading_agent.store.postgres.get_open_journal_trades",
+                   return_value=[row]):
+            out = _load_journal_enrichment_by_symbol()
+        e = out["US.AAPL"]
+        assert e["combo"] is None
+        assert e["trade_id"] == 7 and e["stop"] == 1.0 and e["target"] == 6.0
+
+
+class TestRouteExitOrHoldCombo:
+    """Combo decisions route through the atomic two-leg close tool — never
+    the single-leg placement path."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_broker(self):
+        with patch("trading_agent.mcp_servers.moomoo.server.get_orders",
+                   return_value={"rows": []}), \
+             patch("trading_agent.exits.fill_confirm."
+                   "pending_close_trade_ids_sqlite", return_value=set()), \
+             patch("trading_agent.exits.fill_confirm."
+                   "pending_close_trade_ids_pg", return_value=set()):
+            yield
+
+    def _synthetic_pos(self, short, long, qty=2, net_credit=1.2):
+        return {
+            "symbol": short, "asset_type": "OPT", "qty": qty,
+            "entry_price": net_credit, "mark": 0.55,
+            "combo": _combo_meta_for(short, long, net_credit=net_credit,
+                                     contracts=float(qty)),
+            "combo_legs": {
+                "short": {"bid": 0.60, "ask": 0.65, "mark": 0.62},
+                "long": {"bid": 0.20, "ask": 0.24, "mark": 0.22},
+            },
+        }
+
+    def _state(self, short, long, dec_overrides=None, qty=2):
+        dec = {
+            "symbol": short, "action": "EXIT_TARGET",
+            "exit_qty_factor": 1.0, "reason": "50pct PT",
+            "regime_label": "RANGE_LOW_VOL", "combo": True,
+            "close_units": qty,
+        }
+        dec.update(dec_overrides or {})
+        return _base_state(
+            trigger="intraday_monitor",
+            journal={"exit_decisions": [dec]},
+            positions=[self._synthetic_pos(short, long, qty=qty)],
+        )
+
+    def _mock_pg_cursor(self):
+        cur = MagicMock()
+        cur.__enter__ = lambda s: cur
+        cur.__exit__ = MagicMock(return_value=False)
+        cur.fetchall.return_value = []
+        cur.execute = MagicMock()
+        return cur
+
+    def test_combo_exit_places_two_leg_close_short_first(self):
+        short, long = _future_combo_syms()
+        state = self._state(short, long)
+        close_resp = {"combo_close": True, "close_rows": [],
+                      "short_close_order_id": "B1",
+                      "long_close_order_id": "S1"}
+        with _patch_all_emits():
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": short, "trade_id": 15,
+                                      "thesis_id": 4}]), \
+                 patch("trading_agent.mcp_servers.moomoo.server."
+                       "close_paper_option_combo",
+                       return_value=close_resp) as mock_close, \
+                 patch("trading_agent.mcp_servers.moomoo.server."
+                       "place_paper_option_order") as mock_single, \
+                 patch("trading_agent.exits.fill_confirm.write_pending_close",
+                       return_value=True) as mock_pending, \
+                 patch("trading_agent.notify.send"):
+                from trading_agent.graph.nodes.intraday_nodes import (
+                    route_exit_or_hold,
+                )
+                route_exit_or_hold(state)
+        mock_close.assert_called_once()
+        kw = mock_close.call_args[1]
+        assert kw["short_leg_symbol"] == short
+        assert kw["long_leg_symbol"] == long
+        assert kw["contracts"] == 2
+        assert kw["trade_id"] == 15
+        mock_single.assert_not_called()  # NEVER the single-leg path
+        mock_pending.assert_called_once()
+        tid, pstate = mock_pending.call_args[0]
+        assert tid == 15
+        assert pstate["combo"] is True
+        assert pstate["settle_mode"] == "full"
+        legs = {x["leg"]: x for x in pstate["legs"]}
+        assert legs["short_close"]["order_id"] == "B1"
+        assert legs["long_close"]["order_id"] == "S1"
+
+    def test_combo_uses_per_leg_marketable_limits(self):
+        short, long = _future_combo_syms()
+        state = self._state(short, long)
+        close_resp = {"combo_close": True, "short_close_order_id": "B1",
+                      "long_close_order_id": "S1"}
+        with _patch_all_emits():
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": short, "trade_id": 15,
+                                      "thesis_id": 4}]), \
+                 patch("trading_agent.mcp_servers.moomoo.server."
+                       "close_paper_option_combo",
+                       return_value=close_resp) as mock_close, \
+                 patch("trading_agent.exits.fill_confirm.write_pending_close",
+                       return_value=True), \
+                 patch("trading_agent.notify.send"):
+                from trading_agent.graph.nodes.intraday_nodes import (
+                    route_exit_or_hold,
+                )
+                route_exit_or_hold(state)
+        kw = mock_close.call_args[1]
+        # BUY-to-close short crosses the ASK: 0.65 × 1.02 = 0.66
+        assert kw["short_price"] == pytest.approx(0.66)
+        # SELL-to-close long crosses the BID: 0.20 × 0.98 = 0.20
+        assert kw["long_price"] == pytest.approx(0.20)
+
+    def test_combo_trim_writes_trim_pending_and_stamps(self):
+        short, long = _future_combo_syms()
+        state = self._state(short, long, dec_overrides={
+            "action": "EXIT_REGIME_DOWNSIZE", "exit_qty_factor": 0.5,
+            "close_units": 1, "regime_label": "VOLATILE_TRANSITION",
+        })
+        close_resp = {"combo_close": True, "short_close_order_id": "B1",
+                      "long_close_order_id": "S1"}
+        pg_cursor = self._mock_pg_cursor()
+        with _patch_all_emits():
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": short, "trade_id": 15,
+                                      "thesis_id": 4}]), \
+                 patch("trading_agent.store.postgres.cursor",
+                       return_value=pg_cursor), \
+                 patch("trading_agent.mcp_servers.moomoo.server."
+                       "close_paper_option_combo",
+                       return_value=close_resp) as mock_close, \
+                 patch("trading_agent.exits.fill_confirm.write_pending_close",
+                       return_value=True) as mock_pending, \
+                 patch("trading_agent.notify.send"):
+                from trading_agent.graph.nodes.intraday_nodes import (
+                    route_exit_or_hold,
+                )
+                route_exit_or_hold(state)
+        assert mock_close.call_args[1]["contracts"] == 1
+        _tid, pstate = mock_pending.call_args[0]
+        assert pstate["settle_mode"] == "trim"
+        stamps = [c for c in pg_cursor.execute.call_args_list
+                  if c.args and "regime_downsized_at_label" in c.args[0]]
+        assert len(stamps) == 1
+        assert stamps[0].args[1] == ("VOLATILE_TRANSITION", 15)
+
+    def test_combo_defers_on_live_close_order_either_leg(self):
+        short, long = _future_combo_syms()
+        state = self._state(short, long)
+        live_orders = {"rows": [{
+            "order_id": "OLD-1", "code": short, "trd_side": "BUY",
+            "order_status": "SUBMITTED", "qty": 2,
+        }]}
+        captured: list[dict] = []
+        with patch("trading_agent.graph.nodes.intraday_nodes.emit",
+                   side_effect=lambda **kw: captured.append(kw)):
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": short, "trade_id": 15,
+                                      "thesis_id": 4}]), \
+                 patch("trading_agent.mcp_servers.moomoo.server.get_orders",
+                       return_value=live_orders), \
+                 patch("trading_agent.exits.fill_confirm."
+                       "pending_close_trade_ids_pg", return_value=set()), \
+                 patch("trading_agent.mcp_servers.moomoo.server."
+                       "close_paper_option_combo") as mock_close, \
+                 patch("trading_agent.notify.send"):
+                from trading_agent.graph.nodes.intraday_nodes import (
+                    route_exit_or_hold,
+                )
+                route_exit_or_hold(state)
+        mock_close.assert_not_called()
+        orphan = [e for e in captured
+                  if e.get("event_type") == "combo_close_possible_orphan"]
+        assert len(orphan) == 1 and orphan[0]["severity"] == 1
+
+    def test_combo_pending_write_failure_never_single_leg_closes(self):
+        """Pending write fails → sev-2 alert, journal row stays OPEN. The
+        single-leg cost-honest fallback close must NEVER fire for a combo."""
+        short, long = _future_combo_syms()
+        state = self._state(short, long)
+        close_resp = {"combo_close": True, "short_close_order_id": "B1",
+                      "long_close_order_id": "S1"}
+        pg_cursor = self._mock_pg_cursor()
+        captured: list[dict] = []
+        with patch("trading_agent.graph.nodes.intraday_nodes.emit",
+                   side_effect=lambda **kw: captured.append(kw)):
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": short, "trade_id": 15,
+                                      "thesis_id": 4}]), \
+                 patch("trading_agent.store.postgres.cursor",
+                       return_value=pg_cursor), \
+                 patch("trading_agent.mcp_servers.moomoo.server."
+                       "close_paper_option_combo", return_value=close_resp), \
+                 patch("trading_agent.exits.fill_confirm.write_pending_close",
+                       return_value=False), \
+                 patch("trading_agent.notify.send"):
+                from trading_agent.graph.nodes.intraday_nodes import (
+                    route_exit_or_hold,
+                )
+                route_exit_or_hold(state)
+        failed = [e for e in captured
+                  if e.get("event_type") == "combo_pending_write_failed"]
+        assert len(failed) == 1 and failed[0]["severity"] == 2
+        # NO journal close of any kind
+        closes = [c for c in pg_cursor.execute.call_args_list
+                  if c.args and "SET exit_price" in c.args[0]]
+        assert closes == []
+
+    def test_combo_stamp_only_skip_stamps_without_order(self):
+        """qty==1 downsize skip: HOLD decision with stamp_regime_label →
+        regime_downsized_at_label stamped, no order of any kind."""
+        short, long = _future_combo_syms()
+        state = self._state(short, long, qty=1, dec_overrides={
+            "action": "HOLD", "exit_qty_factor": 0.0,
+            "reason": "combo_trim_skipped_whole_unit: ...",
+            "stamp_regime_label": "VOLATILE_TRANSITION",
+            "close_units": None,
+        })
+        pg_cursor = self._mock_pg_cursor()
+        captured: list[dict] = []
+        with patch("trading_agent.graph.nodes.intraday_nodes.emit",
+                   side_effect=lambda **kw: captured.append(kw)):
+            with patch("trading_agent.store.postgres.get_open_journal_trades",
+                       return_value=[{"symbol": short, "trade_id": 15,
+                                      "thesis_id": 4}]), \
+                 patch("trading_agent.store.postgres.cursor",
+                       return_value=pg_cursor), \
+                 patch("trading_agent.mcp_servers.moomoo.server."
+                       "close_paper_option_combo") as mock_close, \
+                 patch("trading_agent.mcp_servers.moomoo.server."
+                       "place_paper_option_order") as mock_single, \
+                 patch("trading_agent.notify.send"):
+                from trading_agent.graph.nodes.intraday_nodes import (
+                    route_exit_or_hold,
+                )
+                route_exit_or_hold(state)
+        mock_close.assert_not_called()
+        mock_single.assert_not_called()
+        stamps = [c for c in pg_cursor.execute.call_args_list
+                  if c.args and "regime_downsized_at_label" in c.args[0]]
+        assert len(stamps) == 1
+        assert stamps[0].args[1] == ("VOLATILE_TRANSITION", 15)
+        skipped = [e for e in captured
+                   if e.get("event_type") == "combo_trim_skipped_single_unit"]
+        assert len(skipped) == 1 and skipped[0]["severity"] == 1
+
+    def test_build_pending_state_shape_unchanged(self):
+        """Shape lock: the single-leg pending state's key set is what it was
+        before combos landed, plus expected_qty_before_close (the vanished-
+        order branch's qty-aware reconciliation anchor — None when the
+        caller doesn't record it, which preserves legacy behavior)."""
+        from trading_agent.exits.fill_confirm import build_pending_state
+        state = build_pending_state(
+            order_id="EX-1", symbol="US.AAPL260626C325000",
+            action="EXIT_STOP", reason="stop", qty=2, side="SELL",
+            asset_type="OPT", requested_exit_price=15.5, quoted_bid=15.6,
+            quoted_ask=16.4, thesis_id=None, source="postgres",
+        )
+        assert set(state) == {
+            "order_id", "symbol", "action", "reason", "qty", "dealt_legs",
+            "side", "asset_type", "requested_exit_price", "quoted_bid",
+            "quoted_ask", "thesis_id", "source", "placed_at", "attempts",
+            "missing_ticks", "exhausted_alerted", "blocked_alerted",
+            "expected_qty_before_close",
+        }
+        assert state["expected_qty_before_close"] is None  # legacy default
+        assert "combo" not in state
+
+
+class TestSyncFillStatusCombo:
+    """Combo entry-price sync — the single-order path must never clobber a
+    combo row's net credit with ONE leg's dealt price (C5)."""
+
+    SHORT, LONG = "US.SPY261016P00100000", "US.SPY261016P00095000"
+
+    def _combo_payload(self):
+        return {"combo": True, "short_leg": self.SHORT, "long_leg": self.LONG,
+                "net_credit": 1.2, "width": 5.0, "max_loss": 760.0,
+                "contracts": 2.0, "broker_order_ids": ["L1", "S1"]}
+
+    def _pg(self, open_rows):
+        cur = MagicMock()
+        cur.__enter__ = lambda s: cur
+        cur.__exit__ = MagicMock(return_value=False)
+        cur.fetchall.return_value = open_rows
+        cur.execute = MagicMock()
+        return cur
+
+    def _run(self, order_rows, capture=None, combo_payload=...):
+        if combo_payload is ...:
+            combo_payload = self._combo_payload()
+        # broker_order_id column carries the LONG leg's id (long placed first)
+        pg = self._pg([(15, self.SHORT, "L1", 1.2, combo_payload)])
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            if capture is not None:
+                stack.enter_context(patch(
+                    "trading_agent.graph.nodes.intraday_nodes.emit",
+                    side_effect=lambda **kw: capture.append(kw)))
+            else:
+                stack.enter_context(_patch_all_emits())
+            stack.enter_context(patch(
+                "trading_agent.store.postgres.cursor", return_value=pg))
+            stack.enter_context(patch(
+                "trading_agent.graph.nodes.intraday_nodes."
+                "_alerted_today", return_value=False))
+            stack.enter_context(patch(
+                "trading_agent.mcp_servers.moomoo.server.get_orders",
+                return_value={"rows": order_rows}))
+            stack.enter_context(patch(
+                "trading_agent.exits.fill_confirm.finalize_pending_exits",
+                return_value={}))
+            from trading_agent.graph.nodes.intraday_nodes import (
+                sync_fill_status,
+            )
+            sync_fill_status(_base_state(trigger="intraday_monitor"))
+        return pg
+
+    def test_sync_fill_status_combo_skips_single_leg_entry_overwrite(self):
+        """Long leg FILLED, short leg still working: the legacy single-order
+        sync (keyed on broker_order_id = the LONG leg) would overwrite
+        entry_price=1.2 with the long leg's 0.85 dealt — must NOT happen."""
+        pg = self._run([
+            {"order_id": "L1", "code": self.LONG,
+             "order_status": "FILLED_ALL", "dealt_qty": 2,
+             "dealt_avg_price": 0.85},
+            {"order_id": "S1", "code": self.SHORT,
+             "order_status": "SUBMITTED"},
+        ])
+        updates = [c.args[0] for c in pg.execute.call_args_list
+                   if c.args and "UPDATE journal_trades" in c.args[0]]
+        assert updates == [], f"combo row must not sync one-legged: {updates}"
+
+    def test_sync_combo_both_legs_filled_sets_actual_net_credit(self):
+        pg = self._run([
+            {"order_id": "L1", "code": self.LONG,
+             "order_status": "FILLED_ALL", "dealt_qty": 2,
+             "dealt_avg_price": 0.85},
+            {"order_id": "S1", "code": self.SHORT,
+             "order_status": "FILLED_ALL", "dealt_qty": 2,
+             "dealt_avg_price": 2.05},
+        ])
+        updates = [c for c in pg.execute.call_args_list
+                   if c.args and "UPDATE journal_trades" in c.args[0]]
+        assert len(updates) == 1
+        # actual net credit = 2.05 − 0.85 = 1.20
+        assert updates[0].args[1][0] == pytest.approx(1.20)
+
+    def test_sync_combo_unparseable_payload_skips_single_order_branch(self):
+        """Combo payload PRESENT but unparseable → fail closed: the single-
+        order branch (keyed on broker_order_id = the LONG leg's id) must NOT
+        clobber entry_price (the net credit) with one leg's dealt price."""
+        captured: list[dict] = []
+        pg = self._run(
+            [{"order_id": "L1", "code": self.LONG,
+              "order_status": "FILLED_ALL", "dealt_qty": 2,
+              "dealt_avg_price": 0.85}],
+            capture=captured,
+            combo_payload={"combo": True},  # legs/net_credit stripped
+        )
+        updates = [c.args[0] for c in pg.execute.call_args_list
+                   if c.args and "UPDATE journal_trades" in c.args[0]]
+        assert updates == [], (
+            f"degraded combo row must not sync single-order: {updates}")
+        events = [e for e in captured
+                  if e.get("event_type") == "combo_payload_unparseable"]
+        assert len(events) == 1 and events[0]["severity"] == 2
+
+    def test_sync_combo_mixed_legs_alerts_not_unfilled(self):
+        captured: list[dict] = []
+        pg = self._run([
+            {"order_id": "L1", "code": self.LONG,
+             "order_status": "CANCELLED_ALL"},
+            {"order_id": "S1", "code": self.SHORT,
+             "order_status": "FILLED_ALL", "dealt_qty": 2,
+             "dealt_avg_price": 2.05},
+        ], capture=captured)
+        updates = [c.args[0] for c in pg.execute.call_args_list
+                   if c.args and "UPDATE journal_trades" in c.args[0]]
+        assert updates == []  # touch nothing
+        events = [e for e in captured
+                  if e.get("event_type") == "combo_entry_leg_mismatch"]
+        assert len(events) == 1 and events[0]["severity"] == 2
