@@ -1,17 +1,24 @@
 [Unit]
-Description=trading-agent scan @ 12:30 (premarket digest) + 13:35 UTC (open, executes)
+Description=trading-agent scan @ 08:30 ET (premarket digest) + 10:15/13:30 ET (RTH, executes)
 Requires=trading-agent-brain@premarket_scan.service
 
 [Timer]
-# Two fires per weekday, both run the premarket_scan graph:
-#   12:30 UTC — pre-open. Ranks + sends the digest, but the dispatch
-#               regular-hours gate skips trading (digest-only awareness).
-#   13:35 UTC — 5 min after the 13:30 open. Ranks on LIVE regular-hours
-#               quotes and DISPATCHES candidate_entry → trades execute
-#               against real prices (not the pre-market spike). 6/2 SNOW
-#               incident fix.
-OnCalendar=Mon..Fri *-*-* 12:30:00 UTC
-OnCalendar=Mon..Fri *-*-* 13:35:00 UTC
+# Three fires per weekday, all running the premarket_scan graph. Times are
+# pinned to America/New_York (systemd calendar-timezone support, present on
+# the EC2 host's systemd 249) so DST changes never move the scans relative
+# to the 09:30 ET open — the old fixed-UTC 12:30/13:35 entries drifted an
+# hour every DST switch:
+#   08:30 ET — pre-open. Ranks + sends the digest; the in-code
+#              regular-hours gate (is_us_market_open) skips dispatch.
+#   10:15 ET — first executing scan. Ranks on LIVE regular-hours quotes,
+#              past the opening rotation, and dispatches candidate_entry.
+#   13:30 ET — second executing scan: midday setups the 10:15 scan was
+#              too early for. On half-days the market has already closed
+#              by 13:30, so the same in-code gate degrades this fire to
+#              digest-only — routing is by market state, not wall-clock.
+OnCalendar=Mon..Fri *-*-* 08:30:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 10:15:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 13:30:00 America/New_York
 Persistent=true
 Unit=trading-agent-brain@premarket_scan.service
 

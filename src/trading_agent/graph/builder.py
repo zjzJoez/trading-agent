@@ -217,6 +217,7 @@ def build_healthcheck_graph():
     g.add_node("disk_health", H.disk_health)
     g.add_node("failed_units_check", H.failed_units_check)
     g.add_node("trade_engine_silence_check", H.trade_engine_silence_check)
+    g.add_node("scan_dispatch_liveness", H.scan_dispatch_liveness)
     g.add_node("ntfy_health", H.ntfy_health)
 
     g.add_edge(START, "opend_health")
@@ -224,7 +225,8 @@ def build_healthcheck_graph():
     g.add_edge("postgres_health", "disk_health")
     g.add_edge("disk_health", "failed_units_check")
     g.add_edge("failed_units_check", "trade_engine_silence_check")
-    g.add_edge("trade_engine_silence_check", "ntfy_health")
+    g.add_edge("trade_engine_silence_check", "scan_dispatch_liveness")
+    g.add_edge("scan_dispatch_liveness", "ntfy_health")
     g.add_edge("ntfy_health", END)
 
     return g.compile(checkpointer=get_saver())

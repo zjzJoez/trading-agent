@@ -3,9 +3,10 @@ Description=trading-agent — daily watchlist refresh @ 12:00 UTC weekdays
 Requires=trading-agent-watchlist-refresh.service
 
 [Timer]
-# Run 30 minutes before premarket scan (which fires 12:30 UTC).
+# Run before the premarket digest scan (08:30 America/New_York).
 # yfinance day_gainers/losers data is available from ~04:00 ET; 12:00 UTC
-# (08:00 ET) is well after that so the movers list is fresh.
+# (07:00-08:00 ET depending on DST) is well after that so the movers list
+# is fresh, and always ahead of the 08:30 ET digest.
 OnCalendar=Mon..Fri *-*-* 12:00:00 UTC
 Persistent=true
 Unit=trading-agent-watchlist-refresh.service

@@ -13,9 +13,14 @@ Coverage:
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# A Saturday — market closed, so scout-prompt rvol uses the prior-day
+# (f=1.0) semantics regardless of when the test suite happens to run.
+_MARKET_CLOSED_NOW = datetime(2026, 7, 18, 15, 0, tzinfo=timezone.utc)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1293,7 +1298,8 @@ class TestScoutPromptDeBias:
             "PLTR": {"last": 160.0, "change_pct": 0.0, "volume": 1.2e8, "avg_volume_3m": 4e7, "hot_today": True},
             "NVDA": {"last": 224.0, "change_pct": 0.0, "volume": 2.1e8, "avg_volume_3m": 2.0e8},
         }
-        prompt = _build_scout_prompt(watchlist, market_data, {"label": "RANGE_LOW_VOL"})
+        prompt = _build_scout_prompt(watchlist, market_data, {"label": "RANGE_LOW_VOL"},
+                                     now_utc=_MARKET_CLOSED_NOW)
         assert "HOT TODAY" in prompt
         # PLTR (hot) should appear in the HOT TODAY block, before "rest of watchlist"
         hot_idx = prompt.index("HOT TODAY")
@@ -1309,7 +1315,8 @@ class TestScoutPromptDeBias:
             "PLTR": {"last": 160.0, "change_pct": 0.0, "volume": 1.2e8, "avg_volume_3m": 4e7, "hot_today": True},
             "NVDA": {"last": 224.0, "change_pct": 0.0, "volume": 2.1e8, "avg_volume_3m": 2.0e8},
         }
-        prompt = _build_scout_prompt(["PLTR", "NVDA"], market_data, {"label": "RANGE_LOW_VOL"})
+        prompt = _build_scout_prompt(["PLTR", "NVDA"], market_data, {"label": "RANGE_LOW_VOL"},
+                                     now_utc=_MARKET_CLOSED_NOW)
         assert "rvol=3.0x" in prompt  # PLTR genuinely hot
         assert "rvol=1.0x" in prompt or "rvol=1.1x" in prompt  # NVDA normal
         # The prompt must explicitly warn against ranking by absolute volume
@@ -1326,7 +1333,8 @@ class TestScoutPromptDeBias:
             "AAPL": {"last": 200.0, "change_pct": 0.0, "volume": 5e7,
                      "avg_volume_3m": 5e7, "momentum_50d": -0.03},
         }
-        prompt = _build_scout_prompt(["ARM", "AAPL"], market_data, {"label": "RANGE_LOW_VOL"})
+        prompt = _build_scout_prompt(["ARM", "AAPL"], market_data, {"label": "RANGE_LOW_VOL"},
+                                     now_utc=_MARKET_CLOSED_NOW)
         assert "mom50d=+32%" in prompt   # ARM trending up
         assert "mom50d=-3%" in prompt    # AAPL flat/down
         assert "narrative" in prompt.lower()
@@ -1334,7 +1342,8 @@ class TestScoutPromptDeBias:
     def test_no_hot_today_still_builds(self):
         from trading_agent.graph.nodes.premarket_nodes import _build_scout_prompt
         market_data = {"AAPL": {"last": 200.0, "change_pct": 0.0, "volume": 5e7}}
-        prompt = _build_scout_prompt(["AAPL"], market_data, {"label": "RANGE_LOW_VOL"})
+        prompt = _build_scout_prompt(["AAPL"], market_data, {"label": "RANGE_LOW_VOL"},
+                                     now_utc=_MARKET_CLOSED_NOW)
         # No hot names → no hot SECTION header (the "HOT TODAY —" data block).
         # The phrase still appears in RANKING GUIDANCE, so check the header form.
         assert "HOT TODAY — your watchlist names" not in prompt
@@ -1416,6 +1425,10 @@ class TestNtfyScanDigest:
                 ))
                 self._stack.enter_context(patch(
                     "trading_agent.graph.nodes.premarket_nodes._in_dispatch_cooldown",
+                    return_value=None,
+                ))
+                self._stack.enter_context(patch(
+                    "trading_agent.graph.nodes.premarket_nodes._in_decline_cooldown",
                     return_value=None,
                 ))
                 # 0 open positions → full R2 dispatch budget available
