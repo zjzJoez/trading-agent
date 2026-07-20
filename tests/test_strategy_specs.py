@@ -18,6 +18,7 @@ from trading_agent.strategy_specs import (
     round_trip_friction_r,
     spec_band_violations,
     spec_for_label,
+    spec_trading_block,
 )
 
 # ---------------------------------------------------------------------------
@@ -25,19 +26,36 @@ from trading_agent.strategy_specs import (
 # ---------------------------------------------------------------------------
 
 
-def test_registry_has_exactly_the_two_declared_specs():
-    assert set(REGISTRY) == {"convexity_long_premium", "credit_put_spread_30_45"}
-    assert REGISTRY["convexity_long_premium"].status == "active"
+def test_registry_has_exactly_the_three_declared_specs():
+    assert set(REGISTRY) == {
+        "convexity_long_premium",
+        "credit_put_spread_30_45",
+        "credit_vertical_index_30_45",
+    }
+    # Interim convexity retirement (operator-approved 2026-07-20,
+    # docs/REVIVAL_PLAN_2026-07-20.md sleeve 3): shadow-only, zero capital.
+    assert REGISTRY["convexity_long_premium"].status == "shadow_only"
+    assert not REGISTRY["convexity_long_premium"].is_tradeable
     # area A: unblocked once the atomic multi-leg combo path (place_paper_option_
     # combo + R5e) landed; defined-risk verticals are now tradeable.
     assert REGISTRY["credit_put_spread_30_45"].status == "active"
+    assert REGISTRY["credit_put_spread_30_45"].is_tradeable
+    # Sleeve 1 (M1-1): declared but blocked until every M1-0 prereq is green.
+    assert REGISTRY["credit_vertical_index_30_45"].status == "pending_prereqs"
+    assert not REGISTRY["credit_vertical_index_30_45"].is_tradeable
 
 
 def test_every_spec_breakeven_net_above_gross():
     """Friction only ever raises the bar — a spec whose net breakeven is not
-    strictly above its gross breakeven means the cost model was bypassed."""
+    strictly above its gross breakeven means the cost model was bypassed.
+    credit_vertical_index_30_45 deliberately has NO profile yet — its
+    expectancy must come from the M1-0.4 managed-payoff replay, not from
+    the expiry-binary formula the plan rejected."""
     for spec in REGISTRY.values():
         p = spec.expectancy_profile
+        if spec.name == "credit_vertical_index_30_45":
+            assert p is None
+            continue
         assert p is not None, spec.name
         assert p.breakeven_wr_net > p.breakeven_wr_gross, spec.name
 
@@ -46,8 +64,34 @@ def test_every_spec_declares_falsification_and_eval_n():
     for spec in REGISTRY.values():
         assert spec.falsification, spec.name
         assert spec.min_trades_for_eval >= 20, spec.name
-        lo, hi = spec.expectancy_profile.expected_wr_range
-        assert 0.0 < lo < hi < 1.0, spec.name
+        if spec.expectancy_profile is not None:
+            lo, hi = spec.expectancy_profile.expected_wr_range
+            assert 0.0 < lo < hi < 1.0, spec.name
+
+
+def test_credit_vertical_falsification_quotes_three_tier_contract():
+    """The M1-3 revised contract must be in the spec text, with every number
+    marked placeholder pending the M1-0.4 replay."""
+    f = REGISTRY["credit_vertical_index_30_45"].falsification
+    assert "n=30" in f and "n=60" in f
+    assert "LB95(mean R) < -0.10R" in f
+    assert "block-bootstrap" in f
+    assert "97.5%" in f
+    assert "PLACEHOLDER" in f
+
+
+def test_credit_vertical_m1_1_gates():
+    g = REGISTRY["credit_vertical_index_30_45"].entry_gates
+    assert g["underlying_whitelist"] == ("SPY", "QQQ")
+    assert g["dte_range"] == (30, 45)
+    assert g["abs_delta_range"] == (0.20, 0.35)
+    assert g["min_credit_frac_of_width"] == 0.25
+    assert g["max_spread_pct_mid"] == 0.05
+    assert g["news_veto_required"] is True
+    # The plan deletes min_risk_reward as redundant with the credit gate.
+    assert "min_risk_reward" not in g
+    assert REGISTRY["credit_vertical_index_30_45"].allowed_regimes == (
+        "BULL_TREND", "RANGE_LOW_VOL")
 
 
 def test_convexity_min_rr_is_respecced_above_global():
@@ -136,6 +180,44 @@ def test_exact_spec_name_resolves_directly():
 ])
 def test_unknown_labels_are_legacy(label):
     assert spec_for_label(label) is None
+
+
+@pytest.mark.parametrize("label", [
+    "credit_vertical_index_30_45",
+    "credit_vertical_spy_put",
+    "Credit_Vertical_QQQ",
+])
+def test_credit_vertical_labels_map_to_index_spec(label):
+    spec = spec_for_label(label)
+    assert spec is not None and spec.name == "credit_vertical_index_30_45"
+
+
+# ---------------------------------------------------------------------------
+# Status enforcement — spec_trading_block
+# ---------------------------------------------------------------------------
+
+
+def test_trading_block_on_shadow_only_convexity_labels():
+    block = spec_trading_block("directional_long_call")
+    assert block is not None
+    assert block["spec"] == "convexity_long_premium"
+    assert block["status"] == "shadow_only"
+    assert "shadow book" in block["message"]
+
+
+def test_trading_block_on_pending_prereqs_vertical_labels():
+    block = spec_trading_block("credit_vertical_spy_put")
+    assert block is not None
+    assert block["spec"] == "credit_vertical_index_30_45"
+    assert block["status"] == "pending_prereqs"
+
+
+def test_no_trading_block_for_active_or_unmapped_labels():
+    # Active spec — tradeable.
+    assert spec_trading_block("credit_put_spread_30_45") is None
+    # Unmapped/legacy labels are governed by R5/R7, not spec status.
+    assert spec_trading_block("mean_reversion_pairs") is None
+    assert spec_trading_block(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +368,136 @@ def test_r7_spec_floor_never_relaxes_below_global():
     vs = [v for v in check(_ctx(), t) if v.rule == R7]
     assert len(vs) == 1 and vs[0].severity == "block"
     assert "global floor" in vs[0].message
+
+
+# ---------------------------------------------------------------------------
+# Spec status gate in sizing — opens refused, closes exempt
+# ---------------------------------------------------------------------------
+
+from trading_agent.sizing import R_SPEC_STATUS  # noqa: E402
+
+
+def _opt_trade(label: str | None, intent: str = "open",
+               side: str = "BUY") -> ProposedTrade:
+    """In-band long-premium option shape (dte 30, |delta| 0.45)."""
+    return ProposedTrade(
+        ticker="AAPL", asset_type="OPT", side=side,  # type: ignore[arg-type]
+        qty=1, entry_price=1.0, stop=0.5, target=3.0,
+        strategy_label=label, delta=0.45, dte=30,
+        intent=intent,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize("label", [
+    "directional_long_call", "pullback_reversal", "earnings_iv_drop",
+    "convexity_long_premium",
+])
+def test_spec_status_blocks_convexity_opens(label):
+    """Interim retirement (2026-07-20): no NEW real long-premium fills —
+    whichever path built the order, the guard-of-record refuses it."""
+    vs = [v for v in check(_ctx(), _opt_trade(label)) if v.rule == R_SPEC_STATUS]
+    assert len(vs) == 1 and vs[0].severity == "block"
+    assert "shadow_only" in vs[0].message
+
+
+@pytest.mark.parametrize("label", [
+    "directional_long_call", "credit_vertical_spy_put",
+    "mean_reversion_pairs",  # unmapped — the structure fallback must not
+    None,                    # gate closes either (exit engine passes no label)
+])
+def test_spec_status_never_blocks_closes(label):
+    """Retirement must never strand an open position: SELL-to-close of a
+    legacy convexity position (or any non-active/unmapped/absent label)
+    stays allowed."""
+    vs = check(_ctx(), _opt_trade(label, intent="close", side="SELL"))
+    assert not any(v.rule == R_SPEC_STATUS for v in vs)
+    assert not any(v.severity == "block" for v in vs)
+
+
+@pytest.mark.parametrize("label", [
+    "mean_reversion_pairs", "momentum_long_call", "swing_call",
+    "momentum-continuation-ITM-call",  # the 2026-07-08 CRNX label
+    None,                              # bare tool call with no label at all
+])
+def test_spec_status_blocks_unmapped_opt_opens(label):
+    """Fail closed on the STRUCTURE, not the label: single-leg SELL-to-open
+    is hard-blocked, so an unmapped-label (or label-less) single-leg OPT
+    open is exactly the retired long-premium structure — a free-text label
+    the prefix table doesn't know must not bypass the retirement."""
+    vs = [v for v in check(_ctx(), _opt_trade(label)) if v.rule == R_SPEC_STATUS]
+    assert len(vs) == 1 and vs[0].severity == "block"
+    assert "unmapped" in vs[0].message
+    assert "shadow_only" in vs[0].message
+
+
+def test_spec_status_allows_unmapped_stock_opens():
+    """The structure fallback is OPT-only: unmapped-label STOCK opens stay
+    governed by the global R1-R8 gates, not by any spec status."""
+    assert not any(
+        v.rule == R_SPEC_STATUS
+        for v in check(_ctx(), _trade("mean_reversion_pairs")))
+
+
+def test_single_leg_open_cannot_borrow_a_vertical_spec_label():
+    """A SINGLE-LEG option open labeled as an active vertical spec is a
+    structure mismatch, not an authorization: relabeling a long single-leg
+    as a credit spec would reopen exactly the structure convexity's
+    retirement closed (and the retry loop makes label-shopping a live
+    path). Verticals open via place_paper_option_combo only."""
+    for label in ("credit_put_spread_30_45", "credit_vertical_index_30_45"):
+        vs = [v for v in check(_ctx(), _opt_trade(label))
+              if v.rule == R_SPEC_STATUS]
+        assert vs, f"{label} single-leg open must be blocked"
+        assert "structure" in vs[0].message
+
+
+def test_spec_status_allows_active_single_leg_mapped_opens():
+    """A label mapping to an ACTIVE spec passes the status gate when the
+    spec's structure actually IS single-leg (band / R5 / R7 gates still
+    apply downstream). No such spec exists while convexity is retired, so
+    pin the contract with a temporary registry entry."""
+    from trading_agent import strategy_specs as ss
+    active_single = dataclasses.replace(
+        ss.REGISTRY["convexity_long_premium"], status="active")
+    with patch.object(ss, "spec_for_label", return_value=active_single):
+        assert not any(
+            v.rule == R_SPEC_STATUS
+            for v in check(_ctx(), _opt_trade("directional_long_call")))
+
+
+def test_spec_status_registry_failure_degrades_open():
+    """Same degradation contract as R7: a registry bug must not crash the
+    pretool hook / moomoo guard — the R5/R7 gates still apply."""
+    with patch("trading_agent.strategy_specs.spec_for_label",
+               side_effect=RuntimeError("registry exploded")):
+        vs = check(_ctx(), _opt_trade("directional_long_call"))
+    assert not any(v.rule == R_SPEC_STATUS for v in vs)
+
+
+def test_spec_status_blocks_pending_prereqs_combo():
+    """A credit_vertical_* labeled combo passes the R5e structural proof but
+    must die on spec status until M1-0 is green; the area-A
+    credit_put_spread label stays unaffected."""
+    from trading_agent.sizing import ComboLeg, ProposedCombo, check_combo
+    legs = (
+        ComboLeg(option_symbol="US.SPY260918P00600000", side="SELL",
+                 contracts=1, price=1.80, right="P", strike=600.0,
+                 dte=38, delta=-0.25),
+        ComboLeg(option_symbol="US.SPY260918P00595000", side="BUY",
+                 contracts=1, price=1.10, right="P", strike=595.0,
+                 dte=38, delta=-0.18),
+    )
+    blocked = check_combo(
+        _ctx(), ProposedCombo(ticker="SPY", legs=legs,
+                              strategy_label="credit_vertical_spy_put"))
+    hits = [v for v in blocked if v.rule == R_SPEC_STATUS]
+    assert len(hits) == 1 and hits[0].severity == "block"
+    assert "pending_prereqs" in hits[0].message
+
+    allowed = check_combo(
+        _ctx(), ProposedCombo(ticker="SPY", legs=legs,
+                              strategy_label="credit_put_spread_30_45"))
+    assert not any(v.rule == R_SPEC_STATUS for v in allowed)
 
 
 # ---------------------------------------------------------------------------

@@ -175,6 +175,13 @@ def test_liquid_option_open_places(stub_ctx, monkeypatch):
             "bid_price": 1.00, "ask_price": 1.02, "option_open_interest": 1200,
         },
     )
+    # Since the 2026-07-20 convexity retirement, EVERY single-leg OPT open
+    # is refused by the R_spec_status structure gate (mapped, unmapped or
+    # absent label). This test is about the R5d liquid-quote pass-through,
+    # so switch the status gate off — see test_order_guard.spec_gate_off.
+    monkeypatch.setattr(
+        "trading_agent.strategy_specs.spec_trading_block",
+        lambda *a, **k: None)
     resp = server.place_paper_option_order(
         option_symbol=_MRVL_OPT, side="BUY",
         contracts=1, price=1.02, thesis_id=1, delta=0.40,
@@ -182,6 +189,32 @@ def test_liquid_option_open_places(stub_ctx, monkeypatch):
     assert "order_blocked" not in resp
     assert len(stub_ctx.place_order_calls) == 1
     assert stub_ctx.place_order_calls[0]["code"] == _MRVL_OPT
+
+
+def test_unmapped_label_single_leg_open_refused_before_broker(stub_ctx, monkeypatch):
+    """Choke-point pin for the retirement bypass: a BUY-to-open single-leg
+    option under an off-prefix free-text label (the trader-synthesizer has
+    invented these in production — 2026-07-08 CRNX) must be refused INSIDE
+    the moomoo order tool, before any broker call."""
+    from trading_agent import order_guard as og
+    from trading_agent.mcp_servers.moomoo import server
+
+    _insert_thesis("MRVL")
+    monkeypatch.setattr(
+        og, "fetch_option_quote",
+        lambda code, timeout_s=5.0: {
+            "bid_price": 1.00, "ask_price": 1.02, "option_open_interest": 1200,
+        },
+    )
+    resp = server.place_paper_option_order(
+        option_symbol=_MRVL_OPT, side="BUY",
+        contracts=1, price=1.02, thesis_id=1, delta=0.40,
+        strategy_label="momentum_long_call",
+    )
+    assert resp["order_blocked"] is True
+    assert "rows" not in resp
+    assert stub_ctx.place_order_calls == []
+    assert "R_spec_status_not_tradeable" in {v["rule"] for v in resp["violations"]}
 
 
 def test_equity_lookup_failure_fails_closed(guard_db, monkeypatch):

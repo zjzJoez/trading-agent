@@ -133,9 +133,11 @@ def frozen_today(monkeypatch):
     return TODAY
 
 
-def _wire(monkeypatch, market, watchlist=None, journal_rows=None):
+def _wire(monkeypatch, market, watchlist=None, journal_rows=None,
+          shadow=None):
     monkeypatch.setattr(m, "_market_fns", lambda: market)
     monkeypatch.setattr(m, "_watchlist_underlyings", lambda: watchlist or [])
+    monkeypatch.setattr(m, "_shadow_underlyings", lambda: shadow or [])
     monkeypatch.setattr("trading_agent.store.postgres.get_open_journal_trades",
                         lambda: journal_rows)
 
@@ -244,6 +246,7 @@ def test_expiry_dte_filter_and_cap(frozen_today):
 
 def test_underlying_set_unions_watchlist_and_open_journal(monkeypatch):
     monkeypatch.setattr(m, "_watchlist_underlyings", lambda: ["SPY", "AAPL"])
+    monkeypatch.setattr(m, "_shadow_underlyings", lambda: [])
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades",
         lambda: [{"symbol": "US.QQQ260626C734000"}, {"symbol": "US.SPY"}],
@@ -251,10 +254,31 @@ def test_underlying_set_unions_watchlist_and_open_journal(monkeypatch):
     assert m.build_underlying_set() == ["AAPL", "QQQ", "SPY"]
 
 
+def test_underlying_set_includes_todays_shadow_book(monkeypatch):
+    """A SHADOW_ONLY proposal's underlying can be in neither the watchlist
+    nor the open-trade set (nothing was opened) — counterfactual replay
+    still needs its chain priced tonight."""
+    monkeypatch.setattr(m, "_watchlist_underlyings", lambda: ["SPY"])
+    monkeypatch.setattr(m, "_shadow_underlyings", lambda: ["CRNX"])
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.get_open_journal_trades", lambda: [])
+    assert m.build_underlying_set() == ["CRNX", "SPY"]
+
+
+def test_shadow_underlyings_store_failure_is_empty(monkeypatch):
+    """Best-effort: an unreachable shadow_proposals store loses one day of
+    shadow coverage, it must not kill the cache run."""
+    def _boom():
+        raise ConnectionError("no postgres on this box")
+    monkeypatch.setattr("trading_agent.store.postgres.cursor", _boom)
+    assert m._shadow_underlyings() == []
+
+
 def test_underlying_set_journal_unreadable_falls_back_to_watchlist(monkeypatch):
     """None from the store = PG unreachable; the cache run must still cover
     the watchlist instead of dying."""
     monkeypatch.setattr(m, "_watchlist_underlyings", lambda: ["SPY"])
+    monkeypatch.setattr(m, "_shadow_underlyings", lambda: [])
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades", lambda: None)
     assert m.build_underlying_set() == ["SPY"]
@@ -264,6 +288,7 @@ def test_underlyings_override_skips_sourcing(monkeypatch):
     def _boom(*a):
         raise AssertionError("must not source watchlist/journal when overridden")
     monkeypatch.setattr(m, "_watchlist_underlyings", _boom)
+    monkeypatch.setattr(m, "_shadow_underlyings", _boom)
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades", _boom)
     assert m.build_underlying_set("qqq, aapl") == ["AAPL", "QQQ"]

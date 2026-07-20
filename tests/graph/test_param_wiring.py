@@ -68,9 +68,16 @@ def _param_consumed_calls(mock_emit) -> list[dict]:
 
 
 def _run_sizing(state):
+    # spec_trading_block is patched off: since the 2026-07-20 convexity
+    # retirement EVERY single-leg OPT open is R_spec_status-refused (the
+    # structure fallback covers _opt_proposal's unmapped fixture label
+    # too). These tests exercise the resolver soft-cap machinery UNDER the
+    # status gate, which must keep working for a revived spec.
     with patch("trading_agent.graph.nodes.trade_nodes.emit",
                return_value=1) as mock_emit, \
          patch("trading_agent.learning.soak.tiny_paper_qty_cap",
+               return_value=None), \
+         patch("trading_agent.strategy_specs.spec_trading_block",
                return_value=None), \
          patch("trading_agent.sectors.known_count", return_value=10), \
          patch("trading_agent.sectors.lookup", return_value="Technology"):

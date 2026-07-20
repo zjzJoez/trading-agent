@@ -292,11 +292,31 @@ def has_fresh_open_thesis(ticker: str) -> tuple[bool, int | None]:
     return False, None
 
 
-def has_existing_open_for(broker_symbol: str) -> bool:
-    """True iff a journal (SQLite OR Postgres) has an OPEN trade for the
-    given broker symbol. Used to compute ``intent`` on the ProposedTrade:
-    SELL of an option we don't already hold = opening a SHORT; SELL of
-    one we do hold = closing the LONG.
+#: Sentinel returned by ``open_position_side_for`` when a journal row is
+#: known/presumed to exist but its side could not be read (store errors,
+#: NULL side column). Callers must fail CONSERVATIVELY on it: a SELL keeps
+#: today's close classification (R5b/R5c must not fire on a real close),
+#: while a BUY classifies as OPEN so every opening gate still applies.
+SIDE_UNKNOWN = "UNKNOWN"
+
+
+def open_position_side_for(broker_symbol: str) -> str | None:
+    """Side of the journal's OPEN trade for ``broker_symbol``, or None.
+
+    Returns:
+      'BUY'        — an open LONG position exists (we hold it)
+      'SELL'       — an open SHORT position exists (e.g. the short leg of a
+                     defined-risk combo, journaled side=SELL)
+      SIDE_UNKNOWN — a row exists (or the stores are unreachable and we
+                     cannot prove one doesn't) but the side is unknown
+      None         — definitively no open position in either journal
+
+    Used to compute ``intent`` on the ProposedTrade. Side-awareness matters
+    for BUY orders: BUY against an existing SHORT is a buy-back (close),
+    but BUY against an existing LONG is an ADD-ON that increases exposure
+    and must run every opening gate (status gate, thesis freshness, R5d,
+    sizing). Pre-fix, ANY existing row classified a BUY as 'close' — the
+    one remaining single-leg bypass of the convexity retirement.
 
     BOTH stores must be consulted: interactive /enter fills land in the
     SQLite journal, but autonomous-graph entries are journaled ONLY in
@@ -306,7 +326,7 @@ def has_existing_open_for(broker_symbol: str) -> bool:
     the guard would have prevented the system from exiting its own trades.
     """
     if not broker_symbol:
-        return False
+        return None
     sqlite_says_no = False
     try:
         with connection() as conn:
@@ -314,13 +334,14 @@ def has_existing_open_for(broker_symbol: str) -> bool:
             # row is the OPERATOR's real holding — the paper account holds
             # nothing, so a SELL against it is an opening short, not a close.
             row = conn.execute(
-                "SELECT 1 FROM trades WHERE symbol = ? AND outcome = 'OPEN' "
+                "SELECT side FROM trades WHERE symbol = ? AND outcome = 'OPEN' "
                 "AND COALESCE(provenance, 'agent') IN ('agent', 'virtual') "
                 "LIMIT 1",
                 (broker_symbol,),
             ).fetchone()
             if row is not None:
-                return True
+                side = row["side"]
+                return str(side).strip().upper() if side else SIDE_UNKNOWN
             sqlite_says_no = True
     except Exception:
         pass  # SQLite unknown — fall through to Postgres, then fail open
@@ -328,18 +349,21 @@ def has_existing_open_for(broker_symbol: str) -> bool:
         from trading_agent.store.postgres import cursor
         with cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM journal_trades "
+                "SELECT side FROM journal_trades "
                 "WHERE symbol = %s AND outcome = 'OPEN' LIMIT 1",
                 (broker_symbol,),
             )
-            if cur.fetchone() is not None:
-                return True
+            row = cur.fetchone()
+            if row is not None:
+                side = row.get("side") if isinstance(row, dict) else row[0]
+                return str(side).strip().upper() if side else SIDE_UNKNOWN
     except Exception:
         # Postgres unreachable is NORMAL on the Phase-1 Mac (no PG server).
         # If SQLite answered definitively "no open trade", trust it and
-        # classify as opening — returning True here would mark every SELL
-        # as a close and silently disable the SELL-to-open block in exactly
-        # the environment the operator trades interactively.
+        # classify as opening — treating unknown as an existing position
+        # would mark every SELL as a close and silently disable the
+        # SELL-to-open block in exactly the environment the operator
+        # trades interactively.
         pass
     # Combo long wings: a vertical is journaled as ONE row keyed by the SHORT
     # leg's symbol, so a direct-symbol lookup can never see the protective
@@ -353,11 +377,22 @@ def has_existing_open_for(broker_symbol: str) -> bool:
     except Exception:
         pass
     if sqlite_says_no:
-        return False
-    # SQLite errored and Postgres found nothing / errored: fail open to
-    # close (more conservative — SHORT-specific R5b/R5c won't fire
-    # spuriously on a real close).
-    return True
+        return None
+    # SQLite errored and Postgres found nothing / errored: a position may
+    # exist but we cannot see it — SIDE_UNKNOWN. For SELL that fails open
+    # to close (more conservative — SHORT-specific R5b/R5c won't fire
+    # spuriously on a real close); for BUY it fails CLOSED to open (all
+    # opening gates apply).
+    return SIDE_UNKNOWN
+
+
+def has_existing_open_for(broker_symbol: str) -> bool:
+    """True iff a journal (SQLite OR Postgres) has an OPEN trade for the
+    given broker symbol — or the stores are unreachable and we cannot prove
+    one doesn't (fail open to 'close' for SELL classification). Thin
+    wrapper over ``open_position_side_for``; see it for the dual-store
+    rationale."""
+    return open_position_side_for(broker_symbol) is not None
 
 
 # ---- R5d option liquidity ----
@@ -660,12 +695,24 @@ def build_proposed(
         delta = params.get("delta")
         contracts = float(params.get("contracts", 0))
         price = float(params.get("price", 0))
-        # Intent: SELL is OPEN (new short) iff no existing OPEN position
-        # has matching option_symbol; otherwise it's CLOSE of a long.
-        # BUY is OPEN (new long) iff no existing position; otherwise it's
-        # CLOSE of a short (buying back).
-        opens_for_symbol = has_existing_open_for(opt_sym)
-        intent = "close" if opens_for_symbol else "open"
+        # Intent is SIDE-AWARE (the pre-fix "any existing row → close"
+        # classified BUY-to-ADD to a held long as a close, skipping every
+        # opening gate — the last single-leg bypass of the convexity
+        # retirement):
+        #   SELL — CLOSE iff ANY open row exists (selling a held long, or
+        #          SIDE_UNKNOWN failing open so a real close is never
+        #          hard-blocked as SELL-to-open); otherwise OPEN (new
+        #          short → R_short_option_open_blocked).
+        #   BUY  — CLOSE only when the existing open row is a SHORT
+        #          (side=SELL buy-back, e.g. a combo's short leg). BUY
+        #          against an existing LONG (or SIDE_UNKNOWN, or no row)
+        #          is an OPEN: an add-on increases exposure and must run
+        #          the status gate, thesis freshness, R5d and sizing.
+        existing_side = open_position_side_for(opt_sym)
+        if side == "SELL":
+            intent = "close" if existing_side is not None else "open"
+        else:
+            intent = "close" if existing_side == "SELL" else "open"
         stop = params.get("stop")  # callers MAY pass stop; R5c needs it
         target = params.get("target")  # CSP / strategy code may pass it
         return ProposedTrade(
