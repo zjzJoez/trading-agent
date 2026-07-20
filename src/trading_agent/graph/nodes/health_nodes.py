@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import time
 
-from trading_agent.events import SEV_ERROR, SEV_INFO, emit
+from trading_agent.events import SEV_CRITICAL, SEV_ERROR, SEV_INFO, emit
 from trading_agent.graph.state import TradingGraphState
 
 log = logging.getLogger(__name__)
@@ -405,6 +405,143 @@ TRADE_ENGINE_SILENCE_ALERT_DAYS = 4
 # Cooldown so we don't ntfy every hour for the same persistent silence.
 SILENCE_ALERT_COOLDOWN_HOURS = 12
 
+# --- Deadman escalation (revival plan Week 1 Step 7) -----------------------
+# The 6/20→7/8 incident: OAuth expiry silently killed every EC2 LLM call;
+# this node emitted trade_engine_silence_detected 471 times and nothing
+# escalated beyond the ordinary cooldown alert. Escalation ladder, measured
+# in MARKET-OPEN hours of silence (market_calendar.market_hours_between —
+# overnight/weekend/holiday time contributes nothing, so a quiet weekend
+# can never trip a rung on its own):
+#   > 24 market-hours → priority-5 ops push, at most one per 6h (de-bounced
+#     via the deadman_silence_push event in agent_events)
+#   > 48 market-hours → AUTO-HALT new opens by creating the SAME
+#     data/halt.flag the /halt endpoint writes. Positions are NEVER
+#     auto-closed. Un-halt is manual only (POST /resume).
+DEADMAN_PUSH_MARKET_HOURS = 24.0
+DEADMAN_HALT_MARKET_HOURS = 48.0
+DEADMAN_PUSH_COOLDOWN_HOURS = 6
+
+
+def _was_deadman_push_recent() -> bool:
+    """True iff a deadman_silence_push landed within the de-bounce window.
+
+    Best-effort like _was_silence_alerted_recently: any DB error → False,
+    i.e. push anyway — a priority-5 deadman alarm fails loud, not silent.
+    """
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM agent_events
+                WHERE event_type = 'deadman_silence_push'
+                  AND ts > NOW() - (%s::text || ' hours')::interval
+                LIMIT 1
+                """,
+                (str(DEADMAN_PUSH_COOLDOWN_HOURS),),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        log.warning("[silence_check] deadman de-bounce query failed: %s", e)
+        return False
+
+
+def _deadman_escalation(run_id: str, trigger: str, last_dispatch_ts) -> None:
+    """Escalation ladder on top of the basic 4-day silence alert.
+
+    ``silence`` = market-open hours since the last candidate_entry dispatch.
+
+    > DEADMAN_PUSH_MARKET_HOURS: priority-5 ops push, de-bounced to one per
+      DEADMAN_PUSH_COOLDOWN_HOURS via the deadman_silence_push event. Keeps
+      re-firing every window until dispatches resume or an operator steps
+      in — an unacknowledged dead engine must stay loud.
+
+    > DEADMAN_HALT_MARKET_HOURS: create the SAME halt flag the /halt
+      endpoint writes (trading_agent.halt_endpoint.HALT_FLAG) so every
+      existing halt consumer — the premarket dispatch gate above all —
+      refuses NEW opens through the one established channel. Open positions
+      are NEVER auto-closed; exits and the monitor keep running. UN-HALT IS
+      MANUAL ONLY: POST /resume on the halt endpoint (or remove
+      data/halt.flag by hand). This node never deletes the flag, even after
+      dispatches resume — the operator must look at what died first.
+
+    An empty dispatch history (fresh deploy) skips escalation: there is no
+    heartbeat to measure from, and auto-halting a brand-new deployment
+    fails in the wrong direction.
+    """
+    if last_dispatch_ts is None:
+        return
+    from datetime import datetime, timezone
+
+    from trading_agent.market_calendar import market_hours_between
+
+    ts = last_dispatch_ts
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    silent_hours = market_hours_between(ts, datetime.now(timezone.utc))
+    if silent_hours <= DEADMAN_PUSH_MARKET_HOURS:
+        return
+
+    # ---- 48h rung: auto-halt new opens (once — an existing flag means
+    # we, or the operator, already halted; never spam repeat halts) ----
+    if silent_hours > DEADMAN_HALT_MARKET_HOURS:
+        from trading_agent import halt_endpoint
+        flag = halt_endpoint.HALT_FLAG
+        if not flag.exists():
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.touch()
+            emit(
+                run_id=run_id, trigger=trigger,
+                agent="trade_engine_silence_check",
+                event_type="deadman_auto_halt",
+                severity=SEV_CRITICAL,
+                payload={"silent_hours": round(silent_hours, 1)},
+            )
+            _alert_ops(
+                title=(f"DEADMAN AUTO-HALT — engine silent "
+                       f"{silent_hours:.0f} market-hours"),
+                body=(
+                    f"No candidate_entry dispatch for {silent_hours:.1f} "
+                    f"market-open hours (> {DEADMAN_HALT_MARKET_HOURS:.0f}h "
+                    f"rung). data/halt.flag created — NEW opens are blocked "
+                    f"through the standard halt channel.\n\n"
+                    f"Open positions were NOT touched; exits + monitor "
+                    f"continue.\n\n"
+                    f"Un-halt is MANUAL: fix the engine, then POST /resume."
+                ),
+            )
+
+    # ---- 24h rung: loud push, de-bounced to one per window ----
+    if _was_deadman_push_recent():
+        log.info("[silence_check] deadman push in de-bounce window")
+        return
+    emit(
+        run_id=run_id, trigger=trigger, agent="trade_engine_silence_check",
+        event_type="deadman_silence_push",
+        severity=SEV_ERROR,
+        payload={
+            "silent_hours": round(silent_hours, 1),
+            "push_threshold_hours": DEADMAN_PUSH_MARKET_HOURS,
+            "halt_threshold_hours": DEADMAN_HALT_MARKET_HOURS,
+            "cooldown_hours": DEADMAN_PUSH_COOLDOWN_HOURS,
+        },
+    )
+    _alert_ops(
+        title=(f"DEADMAN — trade engine silent "
+               f"{silent_hours:.0f} market-hours"),
+        body=(
+            f"No candidate_entry dispatch for {silent_hours:.1f} market-open "
+            f"hours (> {DEADMAN_PUSH_MARKET_HOURS:.0f}h rung; auto-halt at "
+            f"{DEADMAN_HALT_MARKET_HOURS:.0f}h).\n\n"
+            f"Check LLM channel liveness first (the 6/20 OAuth expiry "
+            f"presented exactly like this):\n"
+            f"  claude -p 'ping' on the box\n"
+            f"  journalctl -u trading-agent-brain | tail\n\n"
+            f"Next deadman push suppressed for "
+            f"{DEADMAN_PUSH_COOLDOWN_HOURS}h."
+        ),
+    )
+
 
 def _was_silence_alerted_recently() -> bool:
     """True iff we've already alerted on trade_engine_silence in cooldown."""
@@ -436,6 +573,13 @@ def trade_engine_silence_check(state: TradingGraphState) -> dict:
     Looks at agent_events for the most recent `candidate_entry_dispatched`
     event. If older than TRADE_ENGINE_SILENCE_ALERT_DAYS, emits sev=2
     + ntfy (rate-limited to one alert per SILENCE_ALERT_COOLDOWN_HOURS).
+
+    On top of that sits the deadman escalation (_deadman_escalation),
+    measured in MARKET-OPEN hours of silence: > 24h → priority-5 push
+    (de-bounced to one per 6h); > 48h → AUTO-HALT of new opens via the
+    same data/halt.flag the /halt endpoint writes. Open positions are
+    never auto-closed. Un-halt is MANUAL only — POST /resume on the halt
+    endpoint (existing semantics); nothing here ever removes the flag.
     """
     run_id = state["run_id"]
     trigger = state["trigger"]
@@ -459,12 +603,23 @@ def trade_engine_silence_check(state: TradingGraphState) -> dict:
         return {}
 
     if row is None:
+        last_ts = None
         days_ago = None
         last_ts_str = "never"
     else:
         last_ts, days_ago = row
         last_ts_str = last_ts.isoformat() if last_ts else "unknown"
         days_ago = float(days_ago) if days_ago is not None else None
+
+    # Deadman escalation runs BEFORE the wall-clock early-return below:
+    # its rungs are market-hours based (24 market-hours ≈ 3.7 trading
+    # days) and can trip while wall-clock days_ago is still under the
+    # 4-day alert threshold. Best-effort — escalation failure must not
+    # take down the rest of healthcheck.
+    try:
+        _deadman_escalation(run_id, trigger, last_ts)
+    except Exception as e:
+        log.warning("[silence_check] deadman escalation failed: %s", e)
 
     is_silent = days_ago is None or days_ago > TRADE_ENGINE_SILENCE_ALERT_DAYS
     if not is_silent:

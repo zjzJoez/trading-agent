@@ -561,7 +561,8 @@ def _run_order_guard(
         "warns": list(decision.warns),
         "thesis_id": decision.thesis_id,
         "hint": "Order refused by the server-side risk gate (thesis freshness "
-                "+ R1-R7 + no SELL-to-open option legs + R5d option liquidity). "
+                "+ R1-R7 + no SELL-to-open option legs + R5d option liquidity "
+                "+ R8 daily loss breaker). "
                 "Fix the violation and retry; see data/trader.db "
                 "hook_audit_log for the full record.",
     }

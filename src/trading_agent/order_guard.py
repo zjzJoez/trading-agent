@@ -33,6 +33,13 @@ Also owned here:
     an exit (the d089349 failure mode); a wide spread on the way out is a
     cost the journal measures, not a reason to hold.
 
+  - R8 DAILY -2R CIRCUIT BREAKER: once today's realized losing trades sum
+    to −2R (R = sizing.MAX_SINGLE_RISK_PCT × live equity, the same R1 risk
+    unit), NEW opening orders are refused for the rest of the trading day.
+    Closes are always exempt. Both journals are consulted (SQLite trades +
+    Postgres journal_trades — disjoint populations); one store down → warn
+    and use the other, both down → block opens (fail-closed on blindness).
+
   - AUDIT: every evaluation writes a row to the ``hook_audit_log`` table in
     trader.db (and a JSONL line in data/hook_audit.log). The nightly
     ``jobs/reconcile_order_guard.py`` joins opening fills against these rows
@@ -59,6 +66,7 @@ from typing import Literal
 from trading_agent.config import CONFIG, ensure_dirs
 from trading_agent.db import connection
 from trading_agent.sizing import (
+    MAX_SINGLE_RISK_PCT,
     R5E,
     ComboLeg,
     OpenPosition,
@@ -91,6 +99,25 @@ LIQ_MIN_OPEN_INTEREST = 500        # contracts of OI required at the strike
 R5D = "R5d_illiquid"               # spread or OI failed the thresholds
 R5D_UNQUOTABLE = "R5d_unquotable"  # no usable live bid/ask → block (fail-closed)
 R5D_OI_UNKNOWN = "R5d_oi_unknown"  # snapshot omits OI → warn (spread is primary)
+
+# Rule R8 — daily -2R circuit breaker (revival plan Week 1 Step 7).
+# Deterministic and in the ORDER path so it binds every layer (hook, MCP
+# server, autonomous graph) even when the LLM channel is down or degraded —
+# the 6/20→7/8 OAuth incident proved graph-only guards can go silently
+# offline. R is the SAME per-trade risk unit the sizing layer budgets for
+# R1: sizing.MAX_SINGLE_RISK_PCT × live equity (no hardcoded dollar figure;
+# equity moves, so does the trip wire). Once TODAY's realized losing trades
+# sum to −2R or worse, NEW opening orders are refused for the rest of the
+# trading day. Closes are NEVER touched — reducing risk is always allowed.
+DAILY_LOSS_BREAKER_R_MULT = 2.0
+R8 = "R8_daily_loss_breaker"
+R8_STORE_BLIND = "R8_store_blind"        # BOTH journals unreachable → block opens
+R8_STORE_DEGRADED = "R8_store_degraded"  # one journal unreachable → warn, use other
+
+# Rows that are not the system's own live results must not trip (or pad) the
+# breaker: real_mirror = operator's real-account shadow rows, virtual_backfill
+# = reconstructed history, dry_run = rehearsals. agent + virtual count.
+_BREAKER_EXCLUDED_PROVENANCE = ("real_mirror", "virtual_backfill", "dry_run")
 
 AUDIT_PATH = CONFIG.data_dir / "hook_audit.log"
 SECTORS_CSV = CONFIG.data_dir / "sectors.csv"
@@ -456,6 +483,136 @@ def check_option_liquidity(option_code: str,
     return out
 
 
+# ---- R8 daily -2R circuit breaker ----
+
+def _sqlite_todays_losses(today_utc: str) -> float:
+    """Sum (≤ 0) of today's realized LOSING P&L in the SQLite journal.
+
+    Raises on any DB failure — the caller decides the fail direction.
+    Losses only, not net P&L: a green morning must not re-arm a red
+    afternoon (fail-closed beats fail-open on a live loop).
+    ``substr(closed_at, 1, 10)`` compares the UTC date prefix, which works
+    for both aware ('...T...+00:00') and naive ISO strings in that column.
+    """
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0.0) FROM trades "
+            "WHERE outcome != 'OPEN' AND pnl IS NOT NULL AND pnl < 0 "
+            "AND substr(closed_at, 1, 10) = ? "
+            "AND COALESCE(provenance, 'agent') NOT IN (?, ?, ?)",
+            (today_utc, *_BREAKER_EXCLUDED_PROVENANCE),
+        ).fetchone()
+    return float(row[0] or 0.0)
+
+
+def _pg_todays_losses() -> float:
+    """Sum (≤ 0) of today's (UTC) realized LOSING P&L in journal_trades.
+
+    Raises when Postgres is unreachable — caller decides the fail
+    direction. journal_trades has no pnl column, so dollars are derived
+    the same way learning/outcome.py does: (exit − entry) × qty × contract
+    multiplier, sign flipped for SELL-side entries. Provenance lives in
+    broker_fill_json (persist_trade_event stamps 'agent'); the exclusion
+    matches the SQLite filter.
+
+    The two journals hold DISJOINT populations (see has_existing_open_for:
+    interactive /enter fills → SQLite only, autonomous-graph entries →
+    Postgres only), so summing both never double-counts a trade.
+    """
+    from trading_agent.store.postgres import cursor
+    with cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(pnl_usd), 0.0) FROM (
+                SELECT (exit_price - entry_price) * qty
+                       * (CASE WHEN asset_type = 'OPT' THEN 100 ELSE 1 END)
+                       * (CASE WHEN side = 'SELL' THEN -1 ELSE 1 END)
+                       AS pnl_usd
+                FROM journal_trades
+                WHERE outcome <> 'OPEN'
+                  AND exit_price IS NOT NULL
+                  AND (closed_at AT TIME ZONE 'UTC')::date
+                      = (NOW() AT TIME ZONE 'UTC')::date
+                  AND COALESCE(broker_fill_json->>'provenance', 'agent')
+                      NOT IN (%s, %s, %s)
+            ) x
+            WHERE pnl_usd < 0
+            """,
+            _BREAKER_EXCLUDED_PROVENANCE,
+        )
+        row = cur.fetchone()
+    return float(row[0] or 0.0)
+
+
+def check_daily_loss_breaker(equity: float, intent: str) -> list[SizingViolation]:
+    """Rule R8: block NEW opens once today's realized losses reach −2R.
+
+    Returns SizingViolation entries in the standard R1-R7 shape so callers
+    fold them into the blockers/warns flow and hook_audit_log.
+
+    Closes NEVER evaluate R8 — a breaker that traps exits is the d089349
+    failure mode all over again, and a dead DB must not brick a close.
+    Store-failure semantics for opens:
+      * one journal unreachable  → WARN + evaluate against the reachable
+        one (fail-closed to the store we can still see)
+      * BOTH journals unreachable → BLOCK (total blindness on today's
+        losses means we cannot prove the breaker hasn't tripped)
+    """
+    if intent != "open":
+        return []
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    losses = 0.0
+    reachable: list[str] = []
+    degraded: list[str] = []
+    try:
+        losses += _sqlite_todays_losses(today_utc)
+        reachable.append("sqlite")
+    except Exception:
+        degraded.append("sqlite")
+    try:
+        losses += _pg_todays_losses()
+        reachable.append("postgres")
+    except Exception:
+        # Postgres unreachable is NORMAL on the Phase-1 Mac (no PG server);
+        # the warn below still surfaces it in hook_audit_log.
+        degraded.append("postgres")
+
+    if not reachable:
+        return [SizingViolation(
+            R8_STORE_BLIND,
+            "both journals (SQLite trades + Postgres journal_trades) are "
+            "unreachable — today's realized losses are unknowable, so the "
+            "R8 daily-loss breaker cannot be proven un-tripped. Opening "
+            "order refused fail-closed; closes are exempt from R8.",
+            "block",
+        )]
+
+    out: list[SizingViolation] = []
+    if degraded:
+        out.append(SizingViolation(
+            R8_STORE_DEGRADED,
+            f"journal(s) unreachable for R8: {', '.join(degraded)}; daily "
+            f"loss evaluated against {', '.join(reachable)} only.",
+            "warn",
+        ))
+
+    # R = the R1 per-trade risk budget at CURRENT equity. equity <= 0 makes
+    # the trip wire meaningless (limit 0 would block every open on a flat
+    # day); R1/R5 sizing already refuses anything sane at zero equity.
+    limit = -DAILY_LOSS_BREAKER_R_MULT * MAX_SINGLE_RISK_PCT * equity
+    if limit < 0 and losses <= limit:
+        out.append(SizingViolation(
+            R8,
+            f"today's realized losses ${losses:,.2f} have reached the daily "
+            f"circuit breaker of -{DAILY_LOSS_BREAKER_R_MULT:g}R "
+            f"(${limit:,.2f}; R = {MAX_SINGLE_RISK_PCT:.1%} of equity "
+            f"${equity:,.2f}). No NEW positions for the rest of the trading "
+            f"day; closing/reducing existing positions stays allowed.",
+            "block",
+        ))
+    return out
+
+
 # ---- proposed-trade construction ----
 
 def build_proposed(
@@ -667,6 +824,9 @@ def evaluate_order(
                 quote = None  # belt-and-suspenders; fetch already swallows
         liq_vs = check_option_liquidity(symbol, quote)
 
+    # ---- R8 daily -2R circuit breaker (opens only; closes exempt) ----
+    breaker_vs = check_daily_loss_breaker(equity, proposed.intent)
+
     # ---- sizing (R1-R7) ----
     opens = load_open_positions(sector_map)
     ctx = SizingContext(
@@ -675,21 +835,25 @@ def evaluate_order(
         opens=tuple(opens),
         sector_lookup_available=bool(sector_map),
     )
-    vs = liq_vs + check(ctx, proposed)
+    vs = liq_vs + breaker_vs + check(ctx, proposed)
     bs = blockers(vs)
     warns = tuple(f"{v.rule}: {v.message}" for v in vs if v.severity == "warn")
 
     if bs:
-        # Distinct reason when ONLY liquidity blocked — hook_audit_log
-        # greps for it; mixed violations keep the generic sizing reason.
+        # Distinct reason when ONLY liquidity / only the breaker blocked —
+        # hook_audit_log greps for these; mixed violations keep the generic
+        # sizing reason.
         liq_rules = {R5D, R5D_UNQUOTABLE}
+        r8_rules = {R8, R8_STORE_BLIND}
+        if all(v.rule in liq_rules for v in bs):
+            reason = "option liquidity gate failed (R5d)"
+        elif all(v.rule in r8_rules for v in bs):
+            reason = "daily loss circuit breaker tripped (R8)"
+        else:
+            reason = "sizing rules violated"
         return GuardDecision(
             allowed=False,
-            reason=(
-                "option liquidity gate failed (R5d)"
-                if all(v.rule in liq_rules for v in bs)
-                else "sizing rules violated"
-            ),
+            reason=reason,
             symbol=symbol,
             ticker=proposed.ticker,
             intent=proposed.intent,
@@ -835,7 +999,9 @@ def evaluate_combo(
         equity=equity, cash=cash, opens=tuple(opens),
         sector_lookup_available=bool(sector_map),
     )
-    vs: list[SizingViolation] = list(check_combo(ctx, combo))
+    # A combo only ever OPENS, so the R8 daily -2R breaker always applies.
+    vs: list[SizingViolation] = list(check_daily_loss_breaker(equity, "open"))
+    vs += check_combo(ctx, combo)
 
     # R5d liquidity on BOTH legs (each must independently pass). A combo only
     # opens, so liquidity always applies; the protective long wing gets the
@@ -855,8 +1021,11 @@ def evaluate_combo(
 
     if bs:
         liq_rules = {R5D, R5D_UNQUOTABLE}
+        r8_rules = {R8, R8_STORE_BLIND}
         if all(v.rule in liq_rules for v in bs):
             reason = "option liquidity gate failed (R5d)"
+        elif all(v.rule in r8_rules for v in bs):
+            reason = "daily loss circuit breaker tripped (R8)"
         elif any(v.rule == R5E for v in bs):
             reason = "combo defined-risk gate failed (R5e)"
         else:
