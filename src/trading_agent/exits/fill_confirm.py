@@ -379,8 +379,11 @@ def _close_pg(trade_id: int, state: dict, dealt_price: float,
         if t_id is not None:
             with cursor() as cur:
                 cur.execute(
+                    # Include 'thesis_broken' so an EXIT_EVENT close confirmed
+                    # through this fill-confirm path still records the terminal
+                    # 'triggered' status (mirrors intraday_nodes route-side fix).
                     "UPDATE journal_theses SET status='triggered' "
-                    "WHERE id = %s AND status='open'",
+                    "WHERE id = %s AND status IN ('open','thesis_broken')",
                     (int(t_id),),
                 )
         return True, net

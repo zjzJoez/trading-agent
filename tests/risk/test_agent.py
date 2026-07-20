@@ -102,10 +102,16 @@ def test_crisis_regime_vetos_new_entry():
 
 def test_heat_breach_downsizes():
     """Existing portfolio with high heat triggers DOWNSIZE in BULL."""
-    # 10 long contracts at $4 entry → 10×4×100 = $4000 at risk on $50k equity = 8%
+    # $4000 at risk on $50k equity = 8% heat. Spread across 5 distinct expiries
+    # (1.6% each) so the now-active same-expiry cap (2%) does NOT fire — the
+    # HEAT cap stays the binding breach this test is about.
     # Use vega=0/delta=0 to isolate the heat breach (avoid greek-stress side breaches)
-    existing = _opt(qty=10, entry_price=4.0, delta=0.0, gamma=0.0, vega=0.0, theta=0.0)
-    snap = build_snapshot(equity=50_000, cash=50_000, open_positions=[existing])
+    existing = [
+        _opt(symbol=f"US.SPY2607{dd}C00500000", qty=5, entry_price=1.6,
+             delta=0.0, gamma=0.0, vega=0.0, theta=0.0)
+        for dd in ("10", "17", "24", "31", "08")
+    ]
+    snap = build_snapshot(equity=50_000, cash=50_000, open_positions=existing)
     out = decide(
         RiskInput(
             proposal=_proposal(qty=10, entry_price=0.01),  # tiny new proposal so it doesn't add heat

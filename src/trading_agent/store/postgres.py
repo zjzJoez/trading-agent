@@ -234,6 +234,7 @@ def get_open_journal_trades() -> list[dict] | None:
             t.qty, t.entry_price, t.stop, t.target,
             t.exit_plan, t.mfe_so_far,
             COALESCE(t.scale_rungs_taken, 0) AS scale_rungs_taken,
+            t.regime_downsized_at_label,
             t.opened_at, t.thesis_id,
             t.broker_fill_json->>'strategy_label' AS strategy_label,
             th.direction, th.thesis_text, th.invalidation,

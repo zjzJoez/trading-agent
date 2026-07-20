@@ -37,7 +37,6 @@ from trading_agent.risk.guardrails import check_guardrails
 from trading_agent.risk.llm import (
     real_council_review,
     should_invoke_council,
-    stub_council_review,
 )
 from trading_agent.risk.persist import insert_risk_decision, insert_risk_snapshot
 from trading_agent.risk.portfolio import OpenPosition, build_snapshot

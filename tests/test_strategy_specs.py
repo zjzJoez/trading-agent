@@ -27,8 +27,9 @@ from trading_agent.strategy_specs import (
 def test_registry_has_exactly_the_two_declared_specs():
     assert set(REGISTRY) == {"convexity_long_premium", "credit_put_spread_30_45"}
     assert REGISTRY["convexity_long_premium"].status == "active"
-    # blocked until SELL-to-open unblocks + multi-leg atomic sizing exists
-    assert REGISTRY["credit_put_spread_30_45"].status == "blocked"
+    # area A: unblocked once the atomic multi-leg combo path (place_paper_option_
+    # combo + R5e) landed; defined-risk verticals are now tradeable.
+    assert REGISTRY["credit_put_spread_30_45"].status == "active"
 
 
 def test_every_spec_breakeven_net_above_gross():

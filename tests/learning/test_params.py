@@ -104,9 +104,9 @@ def test_real_money_toggle_is_frozen():
 def test_audit_dict_round_trip():
     r = ParamResolver(
         version_id=7, status="CANARY", scope="global", scope_key=None,
-        values={"min_setup_quality": 0.7},
+        values={"r1_soft_cap_pct": 0.018},
     )
     d = r.to_audit_dict()
     assert d["version_id"] == 7
     assert d["status"] == "CANARY"
-    assert d["values"]["min_setup_quality"] == 0.7
+    assert d["values"]["r1_soft_cap_pct"] == 0.018

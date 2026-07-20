@@ -35,6 +35,10 @@ Sum of (option premium at risk + stock distance-to-stop × shares) divided by eq
 
 Pairwise Pearson on daily returns over the last 60 sessions. The `avg_pairwise_corr_max` is checked against the WORST off-diagonal correlation in the open-position set.
 
+## Same-expiry premium concentration
+
+`same_expiry_premium_max` is checked against the WORST per-expiry bucket: option positions are grouped by their OCC expiry (YYMMDD, **across underlyings** — event clustering), each bucket summing the same per-position at-risk used for heat (so short-leg assignment exposure counts, not just premium paid). The largest bucket / equity is compared to the cap; CRISIS cap 0% → any same-expiry option exposure VETOes. Breach severity follows the usual ≤1.5× DOWNSIZE / beyond VETO rule.
+
 ## Council interaction
 
 - LLM council runs when deterministic decision != APPROVE, OR regime ∈ {TRANSITION, BEAR, CRISIS}, OR is_earnings_play, OR canary_param_version.

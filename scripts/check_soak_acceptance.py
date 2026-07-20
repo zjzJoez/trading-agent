@@ -224,43 +224,116 @@ def check_exit_fills_confirmed(since) -> dict:
     )
 
 
-def check_paper_sharpe_vs_spy(since) -> dict:
-    """Compute paper-account daily-return Sharpe vs SPY over the window.
+def _annualized_sharpe(returns: list[float],
+                       periods_per_year: float = 252.0) -> float | None:
+    """Annualized Sharpe of a return series (0 risk-free). None if <2 points
+    or zero variance. Sample variance (n-1) so both series are consistent."""
+    import math
+    n = len(returns)
+    if n < 2:
+        return None
+    mean = sum(returns) / n
+    var = sum((r - mean) ** 2 for r in returns) / (n - 1)
+    sd = math.sqrt(var)
+    if sd <= 1e-12:
+        return None
+    return (mean / sd) * math.sqrt(periods_per_year)
 
-    Cheap implementation: trade-level R series → annualized Sharpe.  No
-    benchmark download yet — a Phase 2.8 v2 candidate. For now we report the
-    paper Sharpe and PASS if it's positive, leaving SPY comparison as a TODO.
-    """
+
+def fetch_spy_daily_returns(since) -> list[float]:
+    """SPY daily simple returns from `since` to today (yfinance, auto-adjusted).
+
+    Raises RuntimeError on an empty download so the gate FAILS rather than
+    silently passing a paper-only number."""
+    import yfinance as yf
+    start = since.date() if hasattr(since, "date") else since
+    df = yf.download("SPY", start=str(start), progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        raise RuntimeError("yfinance returned no SPY data for the window")
+    close = df["Close"]
+    if hasattr(close, "ndim") and close.ndim == 2:
+        close = close.iloc[:, 0]
+    rets = close.pct_change().dropna()
+    return [float(x) for x in rets.tolist()]
+
+
+def fetch_paper_daily_returns(since) -> tuple[list[float], str]:
+    """Paper return series over the window, with its source tag.
+
+    Preferred: portfolio_marks NAV (equity) → daily pct change, directly
+    comparable to SPY daily Sharpe. Falls back to the per-trade realized_r
+    series when <2 NAV marks exist (less comparable — reflected in the tag)."""
     try:
         with cursor() as cur:
             cur.execute(
                 """
-                SELECT tof.realized_r FROM trade_outcome_features tof
-                JOIN journal_trades jt ON jt.id = tof.trade_id
-                WHERE jt.closed_at >= %s AND tof.realized_r IS NOT NULL
-                ORDER BY jt.closed_at ASC
+                SELECT equity FROM portfolio_marks
+                WHERE as_of >= %s AND equity IS NOT NULL
+                ORDER BY as_of ASC
                 """,
                 (since,),
             )
-            rs = [float(r[0]) for r in cur.fetchall()]
+            navs = [float(r[0]) for r in cur.fetchall()]
     except Exception as e:
-        return _gate("paper_sharpe_positive", False, f"db read failed: {e}")
-    if not rs:
-        return _gate(
-            "paper_sharpe_positive",
-            False,
-            "no closed trades — soak window has no signal",
+        navs = []
+        log.warning("portfolio_marks read failed (%s); trying realized_r", e)
+    if len(navs) >= 2:
+        rets = [navs[i] / navs[i - 1] - 1.0
+                for i in range(1, len(navs)) if navs[i - 1] > 0]
+        if rets:
+            return rets, "portfolio_marks_nav"
+    with cursor() as cur:
+        cur.execute(
+            """
+            SELECT tof.realized_r FROM trade_outcome_features tof
+            JOIN journal_trades jt ON jt.id = tof.trade_id
+            WHERE jt.closed_at >= %s AND tof.realized_r IS NOT NULL
+            ORDER BY jt.closed_at ASC
+            """,
+            (since,),
         )
-    import math
-    mean = sum(rs) / len(rs)
-    var = sum((r - mean) ** 2 for r in rs) / len(rs) if len(rs) > 1 else 0
-    sd = math.sqrt(var)
-    sharpe_per_trade = (mean / sd) if sd > 1e-9 else 0.0
-    sharpe_annual = sharpe_per_trade * math.sqrt(252.0 / max(1, len(rs)))
+        rs = [float(r[0]) for r in cur.fetchall()]
+    return rs, "per_trade_realized_r"
+
+
+def check_paper_sharpe_vs_spy(since) -> dict:
+    """Gate 6: annualized paper Sharpe ≥ SPY Sharpe over the window.
+
+    Paper returns come from portfolio_marks NAV when available (daily, directly
+    comparable to SPY); otherwise a per-trade realized-R fallback. SPY daily
+    returns are downloaded via yfinance — a download failure FAILS the gate
+    (we will not pass on a paper-only number)."""
+    try:
+        paper_rets, source = fetch_paper_daily_returns(since)
+    except Exception as e:
+        return _gate("paper_sharpe_vs_spy", False, f"paper return read failed: {e}")
+    if not paper_rets:
+        return _gate("paper_sharpe_vs_spy", False,
+                     "no paper returns — soak window has no signal")
+    try:
+        spy_rets = fetch_spy_daily_returns(since)
+    except Exception as e:
+        return _gate("paper_sharpe_vs_spy", False, f"SPY benchmark fetch failed: {e}")
+
+    # NAV path is already daily → annualize with sqrt(252) like SPY. Per-trade
+    # fallback annualizes per-trade (sqrt(252/n)) — comparison is then only
+    # indicative (flagged via the source tag in the detail string).
+    if source == "per_trade_realized_r":
+        paper_sharpe = _annualized_sharpe(
+            paper_rets, periods_per_year=252.0 / max(1, len(paper_rets)))
+    else:
+        paper_sharpe = _annualized_sharpe(paper_rets)
+    spy_sharpe = _annualized_sharpe(spy_rets)
+
+    if spy_sharpe is None:
+        return _gate("paper_sharpe_vs_spy", False,
+                     f"SPY Sharpe undefined (n={len(spy_rets)})")
+    ps = paper_sharpe if paper_sharpe is not None else 0.0
     return _gate(
-        "paper_sharpe_positive",
-        sharpe_annual > 0,
-        f"sharpe_annual={sharpe_annual:.3f} (per-trade mean={mean:.3f}, sd={sd:.3f}, n={len(rs)})",
+        "paper_sharpe_vs_spy",
+        ps >= spy_sharpe,
+        f"paper_sharpe={ps:.3f} ({source}, n={len(paper_rets)}) vs "
+        f"spy_sharpe={spy_sharpe:.3f} (n={len(spy_rets)})",
     )
 
 

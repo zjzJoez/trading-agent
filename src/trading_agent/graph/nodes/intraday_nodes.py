@@ -382,6 +382,8 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
             "mfe_so_far": float(mfe_so_far) if mfe_so_far is not None else None,
             "opened_at": row.get("opened_at"),
             "scale_rungs_taken": int(row.get("scale_rungs_taken") or 0),
+            "regime_downsized_at_label": row.get("regime_downsized_at_label"),
+            "thesis_status": row.get("thesis_status"),
             "direction": row.get("direction"),
             "thesis_text": row.get("thesis_text"),
             "invalidation": row.get("invalidation"),
@@ -535,6 +537,8 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
             mfe_so_far=pos.get("mfe_so_far"),
             underlying_mark=underlying_marks.get(underlying),
             scale_rungs_taken=int(pos.get("scale_rungs_taken") or 0),
+            regime_downsized_at_label=pos.get("regime_downsized_at_label"),
+            thesis_status=pos.get("thesis_status"),
         )
 
         if decision is None:
@@ -569,6 +573,8 @@ def detect_exit_triggers(state: TradingGraphState) -> dict:
             "action": action,
             "exit_qty_factor": qty_factor,
             "reason": reason,
+            # carried so route_exit_or_hold can stamp the downsize guard column
+            "regime_label": regime_label,
         })
         if action == "HOLD":
             hold_count += 1
@@ -727,6 +733,7 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
         action = dec["action"]
         qty_factor = float(dec.get("exit_qty_factor") or 1.0)
         reason = dec.get("reason", "")
+        dec_regime_label = dec.get("regime_label")
 
         pos = positions_by_symbol.get(symbol)
         if not pos:
@@ -813,7 +820,10 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             base_px = float(quoted_ask) if quoted_ask else mark_px
             exit_price = round(base_px * BUY_CROSS_BUF, 2)
 
-        is_partial = (action == "EXIT_TARGET" and 0.0 < qty_factor < 1.0)
+        # Any sub-1.0 factor is a partial close — EXIT_TARGET scale-out rungs
+        # AND EXIT_REGIME_DOWNSIZE (0.5). Gating on EXIT_TARGET alone would
+        # mis-route a regime downsize as a FULL close (close_trade + close_thesis).
+        is_partial = (0.0 < qty_factor < 1.0)
 
         # Orphan adoption (full closes only): a live same-symbol same-side
         # order means a previous run placed this close and died before the
@@ -919,28 +929,58 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             try:
                 from trading_agent.store.postgres import cursor
                 with cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE journal_trades
-                        SET scale_rungs_taken = COALESCE(scale_rungs_taken, 0) + 1
-                        WHERE id = %s AND outcome = 'OPEN'
-                        """,
-                        (trade_id,),
-                    )
+                    if action == "EXIT_REGIME_DOWNSIZE":
+                        # Stamp the guard so the downsize won't re-fire every
+                        # tick while this degrade label persists. (We do NOT
+                        # bump scale_rungs_taken — this isn't a ladder rung.)
+                        cur.execute(
+                            """
+                            UPDATE journal_trades
+                            SET regime_downsized_at_label = %s
+                            WHERE id = %s AND outcome = 'OPEN'
+                            """,
+                            (dec_regime_label, trade_id),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE journal_trades
+                            SET scale_rungs_taken = COALESCE(scale_rungs_taken, 0) + 1
+                            WHERE id = %s AND outcome = 'OPEN'
+                            """,
+                            (trade_id,),
+                        )
                 closed_ok = True
                 log.info(
-                    "[route_exit_or_hold] %s partial close (factor=%.2f) — "
-                    "rung incremented; trade %s stays OPEN",
-                    symbol, qty_factor, trade_id,
+                    "[route_exit_or_hold] %s partial close (factor=%.2f, %s) — "
+                    "trade %s stays OPEN",
+                    symbol, qty_factor, action, trade_id,
                 )
             except Exception as e:
                 log.warning(
                     "[route_exit_or_hold] partial-close rung increment "
                     "%s failed: %s", symbol, e,
                 )
-                # Treat as best-effort — broker already trimmed the position.
-                # Don't fail the whole loop; the next tick re-evaluates.
-                closed_ok = True
+                if action == "EXIT_REGIME_DOWNSIZE":
+                    # The stamp IS the idempotency guard. The broker already
+                    # trimmed, but with regime_downsized_at_label unpersisted
+                    # the NEXT tick would trim ANOTHER 50%. Do NOT mark this a
+                    # clean success — surface a sev-1 alert so the operator
+                    # fixes the unpersisted guard before the position bleeds out.
+                    closed_ok = False
+                    emit(
+                        run_id=run_id, trigger=trigger, agent="route_exit_or_hold",
+                        event_type="downsize_guard_unpersisted", severity=1,
+                        payload={"symbol": symbol, "trade_id": trade_id,
+                                 "regime_label": dec_regime_label,
+                                 "error": repr(e),
+                                 "risk": "next tick may re-trim 50% — stamp "
+                                         "regime_downsized_at_label manually"},
+                    )
+                else:
+                    # Scale rung: best-effort — broker already trimmed and the
+                    # rung counter is advisory; next tick re-evaluates safely.
+                    closed_ok = True
         else:
             # Full close — the journal is NOT closed here anymore. The close
             # order just placed must be CONFIRMED at the broker's dealt price
@@ -1021,9 +1061,12 @@ def route_exit_or_hold(state: TradingGraphState) -> dict:
             try:
                 from trading_agent.store.postgres import cursor
                 with cursor() as cur:
+                    # Include 'thesis_broken' so an EXIT_EVENT full close still
+                    # records the terminal 'triggered' status (the trade
+                    # executed and resolved), not just plain 'open' theses.
                     cur.execute(
                         "UPDATE journal_theses SET status='triggered' "
-                        "WHERE id = %s AND status='open'",
+                        "WHERE id = %s AND status IN ('open','thesis_broken')",
                         (thesis_id,),
                     )
                 log.info(

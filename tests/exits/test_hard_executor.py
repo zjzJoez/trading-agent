@@ -204,6 +204,133 @@ class TestP0Regime:
 
 
 # ---------------------------------------------------------------------------
+# P0b — Regime partial downsize (downsize_50_on_labels)
+# ---------------------------------------------------------------------------
+
+
+class TestP0bRegimeDownsize:
+    def _downsize_plan(self):
+        return ExitPlan(
+            hard_stop=5.0, hard_target=15.0,
+            regime_rules=RegimeRulesConfig(
+                exit_on_labels=["CRISIS"],
+                downsize_50_on_labels=["VOLATILE_TRANSITION"],
+            ),
+        )
+
+    def test_downsize_label_trims_50pct(self):
+        pos = _option_pos(mark=10.0)  # not near stop/target
+        d = hard_exit_decision(
+            pos=pos, plan=self._downsize_plan(),
+            regime_label="VOLATILE_TRANSITION", now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is not None
+        assert d.action == "EXIT_REGIME_DOWNSIZE"
+        assert d.exit_qty_factor == 0.5
+
+    def test_does_not_refire_when_already_downsized_at_label(self):
+        """Idempotency: same label already stamped → no re-trim (HOLD)."""
+        pos = _option_pos(mark=10.0)
+        d = hard_exit_decision(
+            pos=pos, plan=self._downsize_plan(),
+            regime_label="VOLATILE_TRANSITION", now_utc=_NOW, mfe_so_far=None,
+            regime_downsized_at_label="VOLATILE_TRANSITION",
+        )
+        assert d is None
+
+    def test_refires_after_label_changed(self):
+        """Stamped at a DIFFERENT label → the new degrade label trims again."""
+        pos = _option_pos(mark=10.0)
+        d = hard_exit_decision(
+            pos=pos, plan=self._downsize_plan(),
+            regime_label="VOLATILE_TRANSITION", now_utc=_NOW, mfe_so_far=None,
+            regime_downsized_at_label="BEAR_TREND",
+        )
+        assert d is not None and d.action == "EXIT_REGIME_DOWNSIZE"
+
+    def test_full_flatten_label_beats_downsize(self):
+        """A label in BOTH lists: P0 full flatten (checked first) wins."""
+        plan = ExitPlan(
+            hard_stop=5.0, hard_target=15.0,
+            regime_rules=RegimeRulesConfig(
+                exit_on_labels=["CRISIS"],
+                downsize_50_on_labels=["CRISIS"],
+            ),
+        )
+        d = hard_exit_decision(
+            pos=_option_pos(mark=10.0), plan=plan,
+            regime_label="CRISIS", now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is not None and d.action == "EXIT_REGIME"  # full flatten
+        assert d.exit_qty_factor == 1.0
+
+    def test_no_downsize_labels_by_default(self):
+        """Default plan has an empty downsize list → never trims."""
+        d = hard_exit_decision(
+            pos=_option_pos(mark=10.0), plan=_plan(),
+            regime_label="VOLATILE_TRANSITION", now_utc=_NOW, mfe_so_far=None,
+        )
+        assert d is None
+
+
+# ---------------------------------------------------------------------------
+# P0c — Event rule: thesis broken
+# ---------------------------------------------------------------------------
+
+
+class TestP0cEventExit:
+    def test_thesis_broken_exits_full(self):
+        pos = _option_pos(mark=10.0)  # not near stop/target
+        d = hard_exit_decision(
+            pos=pos, plan=_plan(), regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None, thesis_status="thesis_broken",
+        )
+        assert d is not None
+        assert d.action == "EXIT_EVENT"
+        assert d.exit_qty_factor == 1.0
+
+    def test_open_thesis_does_not_trigger_event(self):
+        d = hard_exit_decision(
+            pos=_option_pos(mark=10.0), plan=_plan(), regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None, thesis_status="open",
+        )
+        assert d is None
+
+    def test_event_respects_custom_exit_factor(self):
+        from trading_agent.llm.schemas import EventRulesConfig
+        plan = ExitPlan(
+            hard_stop=5.0, hard_target=15.0,
+            event_rules=EventRulesConfig(exit_factor=0.5),
+        )
+        d = hard_exit_decision(
+            pos=_option_pos(mark=10.0), plan=plan, regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None, thesis_status="thesis_broken",
+        )
+        assert d is not None and d.action == "EXIT_EVENT"
+        assert d.exit_qty_factor == 0.5
+
+    def test_crisis_beats_thesis_broken(self):
+        """CRISIS full-flatten dominates a broken thesis."""
+        d = hard_exit_decision(
+            pos=_option_pos(mark=10.0), plan=_plan(), regime_label="CRISIS",
+            now_utc=_NOW, mfe_so_far=None, thesis_status="thesis_broken",
+        )
+        assert d is not None and d.action == "EXIT_REGIME"
+
+    def test_event_can_be_disabled(self):
+        from trading_agent.llm.schemas import EventRulesConfig
+        plan = ExitPlan(
+            hard_stop=5.0, hard_target=15.0,
+            event_rules=EventRulesConfig(exit_on_thesis_broken=False),
+        )
+        d = hard_exit_decision(
+            pos=_option_pos(mark=10.0), plan=plan, regime_label="RANGE_LOW_VOL",
+            now_utc=_NOW, mfe_so_far=None, thesis_status="thesis_broken",
+        )
+        assert d is None
+
+
+# ---------------------------------------------------------------------------
 # P1 — Hard stop
 # ---------------------------------------------------------------------------
 

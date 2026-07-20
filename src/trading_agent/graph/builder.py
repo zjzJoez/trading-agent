@@ -38,6 +38,9 @@ log = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 def build_premarket_scan_graph():
     g = StateGraph(TradingGraphState)
+    # load_active_params first so classify_regime sees the ACTIVE resolver
+    # (regime_thresholds family is consumed by the live classifier — area E).
+    g.add_node("load_active_params", L.load_active_params_node)
     g.add_node("collect_macro_market_data", R.collect_macro_market_data)
     g.add_node("compute_regime_features", R.compute_regime_features)
     g.add_node("classify_regime", R.classify_regime)
@@ -47,7 +50,8 @@ def build_premarket_scan_graph():
     g.add_node("rank_candidates", PM.rank_candidates)
     g.add_node("ntfy_scan_digest", PM.ntfy_scan_digest)
 
-    g.add_edge(START, "collect_macro_market_data")
+    g.add_edge(START, "load_active_params")
+    g.add_edge("load_active_params", "collect_macro_market_data")
     g.add_edge("collect_macro_market_data", "compute_regime_features")
     g.add_edge("compute_regime_features", "classify_regime")
     g.add_edge("classify_regime", "maybe_llm_regime_review")

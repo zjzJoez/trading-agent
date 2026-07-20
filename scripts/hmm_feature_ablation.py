@@ -54,7 +54,7 @@ import json
 import logging
 import math
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -62,15 +62,20 @@ import pandas as pd
 
 from trading_agent.regime.classifier import HMMModel, classify
 from trading_agent.regime.features import HMM_FEATURE_ORDER, FeatureSnapshot
-from trading_agent.regime.gates import SIZE_MULTIPLIERS, regime_size_multiplier
+from trading_agent.regime.gates import regime_size_multiplier
+from trading_agent.regime.holdout import HoldoutViolation, require_holdout_intact
 from trading_agent.store.postgres import cursor
 
 log = logging.getLogger(__name__)
 
 # Single seed for ablation speed — variance across seeds in v5 was ±0.029
 # Sharpe (5-seed), so a single-seed read is within that error band and 5×
-# cheaper. If the ablation surfaces a feature with |delta| > 0.05, re-run
-# with --seed-sweep to confirm with 5 seeds.
+# cheaper. If the ablation surfaces a feature with |delta| > 0.05, confirm it
+# with a 5-seed loop, e.g.:
+#   for s in 42 7 99 123 2026; do \
+#     python -m scripts.hmm_feature_ablation --only <feat> --seed $s \
+#       --out-dir reports/walkforward_v5_ablation_seed_$s; done
+# then compare the per-seed deltas by hand.
 DEFAULT_SEED = 42
 N_STATES = 4
 
@@ -92,13 +97,13 @@ def load_snapshots_range(start, end) -> list[tuple[datetime, FeatureSnapshot]]:
         rows = cur.fetchall()
     out = []
     for as_of, feats, freshness, dq in rows:
+        # `data_quality` is a jsonb dict (see FeatureSnapshot.to_db_payload);
+        # degradation_level is a derived property, NOT a constructor field.
         snap = FeatureSnapshot(
             as_of=as_of,
-            features=feats or {},
-            source_freshness=freshness or {},
-            data_quality_warnings=[],
-            degradation_level=int(dq or 0),
-            raw_klines={},
+            features=dict(feats or {}),
+            source_freshness=dict(freshness or {}),
+            data_quality=dict(dq or {}),
         )
         out.append((as_of, snap))
     return out
@@ -124,7 +129,7 @@ def feature_matrix(
             idx = HMM_FEATURE_ORDER.index(ablated_feature)
             Z[:, idx] = 0.0   # zero in standardized space = mean of original feature
         except ValueError:
-            raise SystemExit(f"unknown feature: {ablated_feature}")
+            raise SystemExit(f"unknown feature: {ablated_feature}") from None
     return Z, means, stds
 
 
@@ -258,19 +263,21 @@ def run_ablation_year(
                 as_of=snap.as_of,
                 features=patched,
                 source_freshness=snap.source_freshness,
-                data_quality_warnings=snap.data_quality_warnings,
-                degradation_level=snap.degradation_level,
+                data_quality=snap.data_quality,
                 raw_klines=snap.raw_klines,
             )
         else:
             patched_snap = snap
 
         prediction = classify(patched_snap, hmm)
+        # RegimePrediction has no `allow_new_entries`; entries are gated on the
+        # CRISIS label downstream (mirrors regime_nodes.py: allow_new_entries =
+        # label != "CRISIS"). compute_strategy_sharpe consumes this bool.
         rows.append({
             "as_of": as_of.date().isoformat(),
             "label": prediction.label,
             "confidence": prediction.confidence,
-            "allow_new_entries": prediction.allow_new_entries,
+            "allow_new_entries": prediction.label != "CRISIS",
             "size_multiplier": regime_size_multiplier(prediction.label),
         })
     return rows
@@ -383,7 +390,8 @@ def write_report(results: list[dict], out_dir: Path) -> None:
         "- Δ < 0: feature hurts (rare, but possible) — drop in v6.",
         "",
         "Single-seed runs have ±0.03 noise band. Re-run any candidate-drop "
-        "feature with `--seed-sweep` (5 seeds) to confirm before promoting v6.",
+        "feature across 5 seeds (loop `--seed` over 42 7 99 123 2026 with "
+        "distinct `--out-dir`s) to confirm before promoting v6.",
     ]
     (out_dir / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -398,7 +406,24 @@ def main():
     ap.add_argument("--last-year", type=int, default=2026)
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--out-dir", type=str, default=str(REPORT_DIR))
+    ap.add_argument("--break-glass", action="store_true",
+                    help="proceed even if --last-year reaches the frozen holdout "
+                         "(loud warning; only for a deliberate final v6 eval)")
     args = ap.parse_args()
+
+    # The last test year is last_year-1 (run_full_ablation iterates
+    # [first_year, last_year)), consuming snapshots through (last_year-1)-12-31.
+    # Guard on that boundary so a re-run after the holdout fills can't silently
+    # read frozen data.
+    try:
+        require_holdout_intact(
+            date(args.last_year - 1, 12, 31),
+            break_glass=args.break_glass,
+            context=f"hmm_feature_ablation --last-year {args.last_year}",
+        )
+    except HoldoutViolation as e:
+        log.error("%s", e)
+        sys.exit(5)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

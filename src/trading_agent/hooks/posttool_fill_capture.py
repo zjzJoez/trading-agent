@@ -34,7 +34,8 @@ from trading_agent.config import CONFIG, ensure_dirs
 from trading_agent.db import connection
 
 ORDER_TOOL_RE = re.compile(
-    r"^mcp__moomoo[_-]mcp__(place_paper_order|place_paper_option_order)$"
+    r"^mcp__moomoo[_-]mcp__(place_paper_order|place_paper_option_order"
+    r"|place_paper_option_combo)$"
 )
 OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{4,8})$")
 AUDIT_PATH = CONFIG.data_dir / "hook_audit.log"
@@ -185,6 +186,52 @@ def main() -> int:
         _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
                 "decision": "defer_virtual", "reason": resp.get("reason"),
                 "thesis_id": resp.get("thesis_id")})
+        return 0
+
+    # Combo (defined-risk vertical): journal the spread as ONE OPT position so
+    # R2 counts it once and the post-mortem scores it as a unit. entry_price is
+    # the net credit; both leg symbols + broker order ids + width/max_loss live
+    # in the snapshot. NOTE (area A limitation): at the broker-position level
+    # the short leg still reads as a naked short to portfolio heat — that
+    # over-counts (conservative; blocks more, never less). Netting vertical
+    # pairs in heat, and a first-class combo-CLOSE path, are flagged follow-ups.
+    if resp.get("combo"):
+        combo_rows = resp.get("combo_rows") or []
+        order_ids = [str(r.get("order_id") or "") for r in combo_rows]
+        short_sym = tool_input.get("short_leg_symbol", "")
+        long_sym = tool_input.get("long_leg_symbol", "")
+        net_credit = resp.get("net_credit")
+        width = resp.get("width")
+        max_loss = resp.get("max_loss")
+        combo_thesis = resp.get("thesis_id") or tool_input.get("thesis_id")
+        combo_label = (resp.get("strategy_label")
+                       or tool_input.get("strategy_label")
+                       or "credit_put_spread_30_45")
+        contracts = float(tool_input.get("contracts", 0) or 0)
+        reasoning = (f"combo defined-risk vertical: short={short_sym} "
+                     f"long={long_sym} net_credit={net_credit} width={width} "
+                     f"max_loss={max_loss}")
+        try:
+            trade_id = _insert_trade_row(
+                thesis_id=combo_thesis, symbol=short_sym, asset_type="OPT",
+                strategy_label=combo_label, side="SELL", qty=contracts,
+                entry_price=float(net_credit or 0), stop=None, target=None,
+                broker_order_id=order_ids[0] if order_ids else "",
+                reasoning=reasoning,
+            )
+            _insert_snapshot(trade_id, {
+                "combo": True, "short_leg": short_sym, "long_leg": long_sym,
+                "broker_order_ids": order_ids, "net_credit": net_credit,
+                "width": width, "max_loss": max_loss, "contracts": contracts,
+            })
+        except Exception as e:
+            _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
+                    "decision": "error", "reason": f"combo insert failed: {e!r}"})
+            return 0
+        _audit({"ts": _now(), "hook": "posttool_fill_capture", "tool": tool_name,
+                "decision": "combo_insert", "trade_id": trade_id,
+                "short_leg": short_sym, "long_leg": long_sym,
+                "broker_order_ids": order_ids})
         return 0
 
     is_option = tool_name.endswith("__place_paper_option_order")

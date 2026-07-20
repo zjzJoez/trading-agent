@@ -73,6 +73,19 @@ def _patch_quote(monkeypatch, row):
     monkeypatch.setattr(og, "fetch_option_quote", lambda code, timeout_s=5.0: row)
 
 
+def _future_opt(ticker: str = "MRVL", days: int = 30, right: str = "C",
+                strike: float = 290.0) -> str:
+    """Option symbol with a live ~`days`-DTE expiry so R5's [14,60] DTE band
+    keeps passing as real time advances. (Hardcoded 260702 symbols went stale
+    once their DTE fell below 14 — this keeps the fixtures evergreen.)"""
+    exp = (datetime.now(timezone.utc).date() + timedelta(days=days)).strftime("%y%m%d")
+    return f"US.{ticker}{exp}{right}{int(round(strike * 1000)):08d}"
+
+
+# Evergreen ~30-DTE option used across the buy/audit/R5d fixtures.
+_MRVL_OPT = _future_opt("MRVL", 30, "C", 290.0)
+
+
 # ---------------------------------------------------------------------------
 # SELL-to-open hard block (the AAPL 8x 300P leg)
 # ---------------------------------------------------------------------------
@@ -111,7 +124,7 @@ def test_sell_to_close_option_allowed_without_thesis(guard_db):
 
 def test_open_without_thesis_blocked(guard_db):
     d = _eval("option", {
-        "option_symbol": "US.MRVL260702C00290000", "side": "BUY",
+        "option_symbol": _MRVL_OPT, "side": "BUY",
         "contracts": 2, "price": 1.00,
     })
     assert not d.allowed
@@ -121,7 +134,7 @@ def test_open_without_thesis_blocked(guard_db):
 def test_stale_thesis_blocked(guard_db):
     _insert_thesis("MRVL", minutes_ago=11)
     d = _eval("option", {
-        "option_symbol": "US.MRVL260702C00290000", "side": "BUY",
+        "option_symbol": _MRVL_OPT, "side": "BUY",
         "contracts": 2, "price": 1.00,
     })
     assert not d.allowed
@@ -132,7 +145,7 @@ def test_fresh_thesis_buy_option_allowed(guard_db, monkeypatch):
     tid = _insert_thesis("MRVL")
     _patch_quote(monkeypatch, GOOD_QUOTE)
     d = _eval("option", {
-        "option_symbol": "US.MRVL260702C00290000", "side": "BUY",
+        "option_symbol": _MRVL_OPT, "side": "BUY",
         "contracts": 1, "price": 1.00, "delta": 0.40,
     })
     assert d.allowed, d.violations_json()
@@ -177,7 +190,7 @@ def test_audit_decision_writes_db_and_jsonl(guard_db, tmp_path, monkeypatch):
     _insert_thesis("MRVL")
     _patch_quote(monkeypatch, GOOD_QUOTE)
     d = _eval("option", {
-        "option_symbol": "US.MRVL260702C00290000", "side": "BUY",
+        "option_symbol": _MRVL_OPT, "side": "BUY",
         "contracts": 1, "price": 1.00,
     })
     og.audit_decision(d, guard_name="server_order_guard",
@@ -191,7 +204,7 @@ def test_audit_decision_writes_db_and_jsonl(guard_db, tmp_path, monkeypatch):
     assert rows[0]["hook_name"] == "server_order_guard"
     assert rows[0]["decision"] == "allow"
     payload = json.loads(rows[0]["payload"])
-    assert payload["symbol"] == "US.MRVL260702C00290000"
+    assert payload["symbol"] == _MRVL_OPT
 
     jsonl = (tmp_path / "hook_audit.log").read_text().strip().splitlines()
     assert len(jsonl) == 1
@@ -223,7 +236,7 @@ def test_audit_block_recorded(guard_db):
 
 def _buy_open_option(**over):
     params = {
-        "option_symbol": "US.MRVL260702C00290000", "side": "BUY",
+        "option_symbol": _MRVL_OPT, "side": "BUY",
         "contracts": 1, "price": 1.00, "delta": 0.40,
     }
     params.update(over)
@@ -397,20 +410,20 @@ def test_fetch_option_quote_swallows_server_errors(monkeypatch):
         raise RuntimeError("get_market_snapshot failed")
 
     _stub_server_module(monkeypatch, _boom)
-    assert fetch_option_quote("US.MRVL260702C00290000") is None
+    assert fetch_option_quote(_MRVL_OPT) is None
 
 
 def test_fetch_option_quote_empty_rows_is_none(monkeypatch):
     from trading_agent.order_guard import fetch_option_quote
     _stub_server_module(monkeypatch, lambda symbols: {"rows": []})
-    assert fetch_option_quote("US.MRVL260702C00290000") is None
+    assert fetch_option_quote(_MRVL_OPT) is None
 
 
 def test_fetch_option_quote_returns_first_row(monkeypatch):
     from trading_agent.order_guard import fetch_option_quote
     row = {"bid_price": 1.0, "ask_price": 1.02, "option_open_interest": 900}
     _stub_server_module(monkeypatch, lambda symbols: {"rows": [row]})
-    assert fetch_option_quote("US.MRVL260702C00290000") == row
+    assert fetch_option_quote(_MRVL_OPT) == row
 
 
 # ---- dual-store close-intent (post-merge regression: Postgres journal) ----
@@ -457,3 +470,136 @@ def test_sell_intent_open_when_sqlite_says_no_and_postgres_unreachable(guard_db,
         raise ConnectionError("no postgres on this box")
     monkeypatch.setattr("trading_agent.store.postgres.cursor", _boom)
     assert og.has_existing_open_for("US.QQQ260626C734000") is False
+
+
+# ---------------------------------------------------------------------------
+# Multi-leg defined-risk combos (evaluate_combo, area A)
+# ---------------------------------------------------------------------------
+
+
+def _eval_combo(params, equity=100_000.0, cash=100_000.0, **kw):
+    from trading_agent.order_guard import evaluate_combo
+    return evaluate_combo(params, equity=equity, cash=cash, **kw)
+
+
+def _combo_params(short_strike=100.0, long_strike=95.0, short_price=2.0,
+                  long_price=0.8, contracts=1, right="P", ticker="SPY"):
+    return {
+        "short_leg_symbol": _future_opt(ticker, 30, right, short_strike),
+        "long_leg_symbol": _future_opt(ticker, 30, right, long_strike),
+        "contracts": contracts, "short_price": short_price,
+        "long_price": long_price, "strategy_label": "credit_put_spread_30_45",
+    }
+
+
+def test_valid_credit_put_spread_combo_allowed(guard_db, monkeypatch):
+    """Fresh thesis + liquid legs + long caps short → the combo opens, even
+    though its short leg would be hard-blocked as a single-leg SELL-to-open."""
+    _insert_thesis("SPY")
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    d = _eval_combo(_combo_params())
+    assert d.allowed, d.violations_json()
+    assert d.legs is not None and len(d.legs) == 2
+    assert d.proposed["max_loss"] == (5.0 - 1.2) * 100.0  # 380
+
+
+def test_combo_requires_fresh_thesis(guard_db, monkeypatch):
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    d = _eval_combo(_combo_params())  # no thesis inserted
+    assert not d.allowed
+    assert "no open thesis" in d.reason
+
+
+def test_combo_not_defined_risk_blocked(guard_db, monkeypatch):
+    """Put spread where the long strike is ABOVE the short = not capped → R5e."""
+    from trading_agent.sizing import R5E
+    _insert_thesis("SPY")
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    d = _eval_combo(_combo_params(short_strike=95.0, long_strike=100.0))
+    assert not d.allowed
+    assert any(v.rule == R5E for v in d.violations)
+
+
+def test_combo_illiquid_leg_blocked(guard_db, monkeypatch):
+    """A wide-spread quote on the legs trips R5d (liquidity) → blocked."""
+    _insert_thesis("SPY")
+    # bid/ask 1.00/1.40 → ~33% spread, far over the 5% R5d cap
+    _patch_quote(monkeypatch, {"bid_price": 1.00, "ask_price": 1.40,
+                               "option_open_interest": 1200})
+    d = _eval_combo(_combo_params())
+    assert not d.allowed
+    assert "R5d" in d.reason
+
+
+def test_combo_unparseable_leg_symbol_blocked(guard_db, monkeypatch):
+    _insert_thesis("SPY")
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    params = _combo_params()
+    params["short_leg_symbol"] = "GARBAGE"
+    d = _eval_combo(params)
+    assert not d.allowed
+    assert "unparseable" in d.reason
+
+
+def test_combo_legs_must_share_underlying(guard_db, monkeypatch):
+    _insert_thesis("SPY")
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    params = _combo_params()
+    params["long_leg_symbol"] = _future_opt("QQQ", 30, "P", 95.0)  # different underlying
+    d = _eval_combo(params)
+    assert not d.allowed
+    assert "different underlying" in d.reason
+
+
+def test_single_leg_sell_to_open_still_blocked(guard_db):
+    """Regression guard: the combo path must NOT have loosened the single-leg
+    SELL-to-open hard block."""
+    from trading_agent.order_guard import R_NO_SHORT_OPEN
+    _insert_thesis("SPY")
+    d = _eval("option", {
+        "option_symbol": _future_opt("SPY", 30, "P", 100.0), "side": "SELL",
+        "contracts": 1, "price": 2.0, "strategy_label": "x",
+    })
+    assert not d.allowed
+    assert any(v.rule == R_NO_SHORT_OPEN for v in d.violations)
+
+
+def test_open_combo_counts_at_max_loss_for_r3(guard_db):
+    """An open combo journaled at net_credit (1.2) must register its true
+    max_loss (380) as existing exposure, not 1.2×100=120 — otherwise a
+    follow-on order under-counts R3 ticker concentration."""
+    import json as _json
+
+    from trading_agent.db import connection
+    from trading_agent.order_guard import load_open_positions, load_sector_map
+    with connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO trades (symbol, asset_type, side, qty, entry_price, "
+            "opened_at, outcome, is_paper) "
+            "VALUES (?, 'OPT', 'SELL', 1, 1.2, ?, 'OPEN', 1)",
+            ("US.SPY260717P00100000",
+             datetime.now(timezone.utc).isoformat()),
+        )
+        tid = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO market_snapshots (trade_id, taken_at, payload) "
+            "VALUES (?, ?, ?)",
+            (tid, datetime.now(timezone.utc).isoformat(),
+             _json.dumps({"combo": True, "max_loss": 380.0, "net_credit": 1.2})),
+        )
+        conn.commit()
+    opens = load_open_positions(load_sector_map())
+    spy = next(p for p in opens if p.ticker == "SPY")
+    assert spy.risk_notional == 380.0
+    assert spy.notional == 380.0  # NOT 120
+
+
+def test_combo_response_returns_guard_verified_thesis_id(guard_db, monkeypatch):
+    """evaluate_combo runs on the underlying's fresh thesis; the placement
+    summary must carry that guard-verified id so the journal FK never breaks
+    on a caller-supplied bad id."""
+    tid = _insert_thesis("SPY")
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    d = _eval_combo(_combo_params())
+    assert d.allowed
+    assert d.thesis_id == tid

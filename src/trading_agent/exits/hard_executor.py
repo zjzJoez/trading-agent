@@ -6,7 +6,10 @@ that was stored at entry time and returns either an ``ExitDecision`` or
 ``None`` (= HOLD). No LLM calls. No network. Pure function.
 
 Priority order (highest first):
-  0. Regime kill switch (CRISIS → exit)
+  0.  Regime kill switch (exit_on_labels, e.g. CRISIS → full exit)
+  0b. Regime partial downsize (regime_label in downsize_50_on_labels → trim 50%,
+      once per regime-label episode)
+  0c. Event rule (thesis flagged 'thesis_broken' out-of-band → exit)
   1. Hard stop (mark <= hard_stop)
   2. DTE rules (options only)
        - DTE <= force_exit_at_dte         → EXIT_DTE_HARD
@@ -39,6 +42,8 @@ class ExitDecision:
 
     action: Literal[
         "EXIT_REGIME",
+        "EXIT_REGIME_DOWNSIZE",
+        "EXIT_EVENT",
         "EXIT_STOP",
         "EXIT_TARGET",
         "EXIT_TRAIL",
@@ -171,6 +176,8 @@ def hard_exit_decision(
     mfe_so_far: float | None,
     underlying_mark: float | None = None,
     scale_rungs_taken: int = 0,
+    regime_downsized_at_label: str | None = None,
+    thesis_status: str | None = None,
 ) -> ExitDecision | None:
     """Return an exit decision for one position, or None to HOLD.
 
@@ -187,6 +194,13 @@ def hard_exit_decision(
              intrinsic floor at DTE <= 5).
         scale_rungs_taken: how many scale-out rungs have already fired
              on this trade (so we don't fire the same rung twice).
+        regime_downsized_at_label: the regime label this trade was last
+             partially downsized at (journal_trades.regime_downsized_at_label).
+             The P0b downsize fires only when it differs from regime_label, so
+             a sustained degrade regime trims 50% ONCE per label episode, not
+             every tick.
+        thesis_status: current journal_theses.status for this trade's thesis.
+             P0c exits when it is 'thesis_broken' (set out-of-band).
     """
     mark = float(pos.get("mark") or 0.0)
     entry = float(pos.get("entry_price") or 0.0)
@@ -194,12 +208,42 @@ def hard_exit_decision(
     symbol = pos.get("symbol") or ""
     is_short = plan.direction == "SHORT"
 
-    # ---- P0 — Regime kill switch ----
+    # ---- P0 — Regime kill switch (full flatten) ----
+    # exit_on_labels wins over downsize: a CRISIS full-flatten must beat a
+    # degrade-label trim when a label appears in both lists (checked first).
     if regime_label in plan.regime_rules.exit_on_labels:
         return ExitDecision(
             action="EXIT_REGIME",
             exit_qty_factor=1.0,
             reason=f"regime={regime_label}",
+        )
+
+    # ---- P0b — Regime partial downsize (trim 50%, once per label episode) ----
+    # Fires once per (trade, regime-label): the residual is only trimmed again
+    # if the label leaves and a different downsize label re-enters. Routed as a
+    # partial close that stamps regime_downsized_at_label so it won't re-fire.
+    if (
+        regime_label in plan.regime_rules.downsize_50_on_labels
+        and regime_downsized_at_label != regime_label
+    ):
+        return ExitDecision(
+            action="EXIT_REGIME_DOWNSIZE",
+            exit_qty_factor=0.5,
+            reason=f"regime={regime_label} in downsize_50_on_labels (trim 50%)",
+        )
+
+    # ---- P0c — Event rule: thesis broken (set out-of-band) ----
+    # A broken thesis should exit even before the price stop — that is the
+    # whole point of invalidation discipline. Below CRISIS (a market-wide
+    # event dominates) but above the price stop.
+    if (
+        plan.event_rules.exit_on_thesis_broken
+        and thesis_status == "thesis_broken"
+    ):
+        return ExitDecision(
+            action="EXIT_EVENT",
+            exit_qty_factor=float(plan.event_rules.exit_factor),
+            reason="thesis_broken flag set on journal_theses",
         )
 
     # ---- P1 — Hard stop ----

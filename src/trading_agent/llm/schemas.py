@@ -85,6 +85,16 @@ class RegimeRulesConfig(_Strict):
     downsize_50_on_labels: list[str] = Field(default_factory=list)
 
 
+class EventRulesConfig(_Strict):
+    """Event-driven exits. Fires when an out-of-band signal marks the thesis
+    broken (journal_theses.status == 'thesis_broken'), set by the operator via
+    journal-mcp ``mark_thesis_broken`` or a future premarket news node. The
+    intraday executor only READS the flag — no LLM/network on the hot path."""
+
+    exit_on_thesis_broken: bool = True
+    exit_factor: float = Field(gt=0.0, le=1.0, default=1.0)
+
+
 class ExitPlan(_Strict):
     """Full deterministic exit plan baked at entry time.
 
@@ -106,6 +116,7 @@ class ExitPlan(_Strict):
     trail_stop: TrailStopConfig | None = None
     dte_rules: DteRulesConfig = Field(default_factory=DteRulesConfig)
     regime_rules: RegimeRulesConfig = Field(default_factory=RegimeRulesConfig)
+    event_rules: EventRulesConfig = Field(default_factory=EventRulesConfig)
     time_in_trade_max_days: int = Field(ge=1, default=30)
 
 

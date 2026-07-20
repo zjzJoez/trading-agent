@@ -94,6 +94,28 @@ def test_heat_aggregates_per_underlying():
     assert math.isclose(snap.heat_metrics["max_per_underlying_pct"], 0.015)
 
 
+def test_heat_aggregates_per_expiry():
+    """Per-expiry bucket sums at-risk by parsed OCC expiry (YYMMDD)."""
+    p1 = _opt(symbol="US.SPY260710C00500000", underlying="US.SPY", entry_price=1.0, qty=5)
+    p2 = _opt(symbol="US.SPY260710C00510000", underlying="US.SPY", entry_price=2.0, qty=5)
+    p3 = _opt(symbol="US.QQQ260814C00400000", underlying="US.QQQ", entry_price=1.0, qty=5)
+    snap = build_snapshot(equity=100_000, cash=100_000, open_positions=[p1, p2, p3])
+    # 260710 = (1+2)×5×100 = 1500; 260814 = 500. max-per-expiry = 1500 → 1.5%.
+    assert math.isclose(snap.heat_metrics["per_expiry_usd"]["260710"], 1500.0)
+    assert math.isclose(snap.heat_metrics["per_expiry_usd"]["260814"], 500.0)
+    assert math.isclose(snap.heat_metrics["max_per_expiry_pct"], 0.015)
+
+
+def test_heat_per_expiry_clusters_across_underlyings():
+    """Event clustering: different underlyings sharing one expiry sum together."""
+    p1 = _opt(symbol="US.SPY260710C00500000", underlying="US.SPY", entry_price=1.0, qty=5)
+    p2 = _opt(symbol="US.QQQ260710C00400000", underlying="US.QQQ", entry_price=1.0, qty=5)
+    snap = build_snapshot(equity=100_000, cash=100_000, open_positions=[p1, p2])
+    # both expire 260710 → 500 + 500 = 1000 in that one bucket → 1.0%.
+    assert math.isclose(snap.heat_metrics["per_expiry_usd"]["260710"], 1000.0)
+    assert math.isclose(snap.heat_metrics["max_per_expiry_pct"], 0.01)
+
+
 def test_heat_short_put_uses_assignment_exposure():
     """Short put heat = strike × 100 × qty − premium collected (CSP assignment).
 

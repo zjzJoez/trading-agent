@@ -25,6 +25,7 @@ Design invariants:
 from __future__ import annotations
 
 import json
+import logging
 import struct
 import sys
 import threading
@@ -36,6 +37,8 @@ from mcp.server.fastmcp import FastMCP
 from trading_agent.config import CONFIG
 from trading_agent.db import connection
 from trading_agent.strategy_specs import spec_for_label
+
+log = logging.getLogger(__name__)
 
 # Lazy imports for heavyweight deps. SentenceTransformer load is ~500MB,
 # so we only import when the first embedding is needed.
@@ -142,6 +145,50 @@ def close_thesis(thesis_id: int, status: Literal["triggered", "void"], note: str
             )
         conn.commit()
     return {"thesis_id": thesis_id, "status": status}
+
+
+@mcp.tool()
+def mark_thesis_broken(thesis_id: int, reason: str = "") -> dict:
+    """Flag a thesis as broken so the deterministic intraday executor exits the
+    position on its next tick (P0c in exits.hard_executor).
+
+    Use this when the thesis is invalidated by news / a fundamental change but
+    the price stop hasn't been hit — invalidation discipline says exit anyway.
+    The executor reads journal_theses.status from POSTGRES, so this dual-writes:
+    SQLite (the journal source of truth, picked up by db_sync) AND a best-effort
+    direct Postgres update by id so the flag is visible within one tick rather
+    than waiting on the next sync (db_sync dedups theses on a key that includes
+    status, so a status change may not propagate as an in-place update).
+    """
+    with connection() as conn:
+        conn.execute(
+            "UPDATE theses SET status = 'thesis_broken' WHERE id = ?",
+            (thesis_id,),
+        )
+        if reason:
+            conn.execute(
+                "INSERT INTO notes (created_at, topic, text, tags, source) "
+                "VALUES (?, ?, ?, ?, 'manual')",
+                (_now(), f"thesis-{thesis_id}-broken", reason, "mark_thesis_broken"),
+            )
+        conn.commit()
+
+    pg_synced = False
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            # Only flag a still-live thesis; never resurrect a closed one.
+            cur.execute(
+                "UPDATE journal_theses SET status = 'thesis_broken' "
+                "WHERE id = %s AND status IN ('open', 'triggered')",
+                (thesis_id,),
+            )
+        pg_synced = True
+    except Exception as e:  # noqa: BLE001 — best-effort; db_sync is the backstop
+        log.warning("mark_thesis_broken: direct Postgres update failed (%s); "
+                    "relying on db_sync", e)
+
+    return {"thesis_id": thesis_id, "status": "thesis_broken", "pg_synced": pg_synced}
 
 
 # Valid trades.provenance values. Aggregates and retrieval treat them
@@ -440,8 +487,11 @@ def close_trade(
             ).fetchone()[0]
             if remaining_open == 0:
                 cur = conn.execute(
+                    # 'thesis_broken' included so a broken-thesis close still
+                    # records the terminal 'triggered' status (parity with the
+                    # Postgres fill-confirm path).
                     "UPDATE theses SET status = 'triggered' "
-                    "WHERE id = ? AND status = 'open'",
+                    "WHERE id = ? AND status IN ('open','thesis_broken')",
                     (thesis_id,),
                 )
                 thesis_closed = cur.rowcount > 0

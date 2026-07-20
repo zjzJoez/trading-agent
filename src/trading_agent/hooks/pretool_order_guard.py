@@ -47,12 +47,18 @@ import sys
 import traceback
 
 from trading_agent.config import CONFIG
-from trading_agent.order_guard import GuardDecision, audit_decision, evaluate_order
+from trading_agent.order_guard import (
+    GuardDecision,
+    audit_decision,
+    evaluate_combo,
+    evaluate_order,
+)
 
 GUARD_NAME = "pretool_order_guard"
 
 ORDER_TOOL_RE = re.compile(
-    r"^mcp__moomoo[_-]mcp__(place_paper_order|place_paper_option_order)$"
+    r"^mcp__moomoo[_-]mcp__(place_paper_order|place_paper_option_order"
+    r"|place_paper_option_combo)$"
 )
 
 
@@ -133,7 +139,9 @@ def main() -> int:
     if not m:
         # Not our business.
         return 0
-    kind = "option" if m.group(1) == "place_paper_option_order" else "stock"
+    tool = m.group(1)
+    is_combo = tool == "place_paper_option_combo"
+    kind = "option" if tool == "place_paper_option_order" else "stock"
 
     # Equity + cash from live SDK (paper account). Fail-closed on any SDK
     # issue. Cash is best-effort (None falls back to equity in R5b).
@@ -152,7 +160,11 @@ def main() -> int:
         return 2
 
     try:
-        decision = evaluate_order(kind, tool_input, equity=equity, cash=cash)
+        decision = (
+            evaluate_combo(tool_input, equity=equity, cash=cash)
+            if is_combo
+            else evaluate_order(kind, tool_input, equity=equity, cash=cash)
+        )
     finally:
         # R5d's quote fetch lazily imports the moomoo server and creates its
         # singleton OpenQuoteContext. That SDK context starts NON-DAEMON

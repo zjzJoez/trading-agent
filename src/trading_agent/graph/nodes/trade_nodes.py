@@ -1806,6 +1806,44 @@ def deterministic_sizing(state: TradingGraphState) -> dict:
         )
         return {"sizing": {"r1_r6_violations": [], "approved_qty": 0.0, "infeasible": True}}
 
+    # Entry filter (ITEM 11 live consumer for min_dte): reject new OPTION
+    # entries whose days-to-expiry is below the learner's min_dte. Runs after
+    # assign_canary so per-ticker attribution is valid. Stock proposals have no
+    # DTE → exempt. No resolver override → "min_dte" absent from values → no-op
+    # (byte-identical to the pre-learning path). The R5 hard DTE floor still
+    # applies downstream; this only TIGHTENS beyond it when min_dte > floor.
+    _entry_vals = _learning_param_values(state)
+    if proposal.get("asset_type") == "OPT" and "min_dte" in _entry_vals:
+        _opt_dte = proposal.get("option_dte")
+        _min_dte = int(_entry_vals["min_dte"])
+        if _opt_dte is not None and int(_opt_dte) < _min_dte:
+            _msg = f"option DTE {int(_opt_dte)} < min_dte {_min_dte} → entry filtered"
+            _emit_param_consumed(
+                state, agent="deterministic_sizing",
+                effects=[{"key": "min_dte", "effect": _msg}],
+            )
+            thesis_id = proposal.get("thesis_id")
+            if thesis_id:
+                _mark_thesis_rejected(int(thesis_id), reason="entry_filter: min_dte")
+            emit(
+                run_id=run_id, trigger=trigger, agent="deterministic_sizing",
+                event_type="infeasible", severity=1,
+                payload={
+                    "ticker": proposal.get("ticker", "?"), "thesis_id": thesis_id,
+                    "blockers": ["min_dte"],
+                    "violations": [{"rule": "entry_min_dte", "severity": "block",
+                                    "message": _msg}],
+                },
+            )
+            return {
+                "proposal": {**proposal, "qty": 0.0},
+                "sizing": {
+                    "r1_r6_violations": [{"rule": "entry_min_dte",
+                                          "severity": "block", "message": _msg}],
+                    "approved_qty": 0.0, "infeasible": True,
+                },
+            }
+
     # Soak TINY_PAPER cap: hard ceiling before R1-R6 candidates are tried
     try:
         from trading_agent.learning.soak import tiny_paper_qty_cap

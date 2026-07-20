@@ -294,6 +294,32 @@ def check_guardrails(
                 g.single_underlying_delta_dollar_max / max_per_und,
             )
 
+    # -------- Same-expiry premium-at-risk (event clustering) --------
+    # Caps the worst single-expiry bucket: too much premium concentrated in
+    # one expiry means one event (earnings/FOMC/OPEX) can wipe a big slice of
+    # the book at once. CRISIS cap is 0.0 → any same-expiry exposure VETOes
+    # (handled by _classify_breach's threshold<=0 branch).
+    max_expiry_prem = heat_metrics.get("max_per_expiry_pct", 0)
+    if max_expiry_prem > g.same_expiry_premium_max:
+        sev = _classify_breach(max_expiry_prem, g.same_expiry_premium_max)
+        violations.append(
+            GuardrailViolation(
+                rule="same_expiry_premium_max",
+                severity=sev,
+                detail=(
+                    f"max same-expiry premium {max_expiry_prem:.2%} > "
+                    f"cap {g.same_expiry_premium_max:.2%}"
+                ),
+                measured=max_expiry_prem,
+                threshold=g.same_expiry_premium_max,
+            )
+        )
+        if sev == "DOWNSIZE":
+            suggested_factor = min(
+                suggested_factor,
+                g.same_expiry_premium_max / max_expiry_prem,
+            )
+
     # -------- Factor exposure --------
     for factor, exposure in (portfolio_factor_exposures or {}).items():
         if abs(exposure) > g.factor_exposure_max:

@@ -34,19 +34,25 @@ Closing orders (selling a long, buying back a short — `intent="close"`) reduce
 - Lookup table: `data/sectors.csv` (~90 US large-caps + common ETFs).
 - If the proposed ticker isn't in the table, the hook emits `R4_sector_unknown` warn and does NOT block. Add missing tickers manually if you trade them often.
 
-### R5 — options policy
-- **Side** = BUY only to open, for now. SELL-to-open is hard-blocked at the order layer (`R_short_option_open_blocked`) — including the short leg of a would-be spread — until multi-leg combos get atomic sizing. SELL-to-close an existing long is exempt. When the block lifts, R5b/R5c below govern short legs (they already apply in hypothetical sizing and replay).
+### R5 — options policy (single-leg)
+- **Side** = BUY only to open via the single-leg tool. Single-leg SELL-to-open stays hard-blocked at the order layer (`R_short_option_open_blocked`) — a legged-in short evaluated alone is a naked short. SELL-to-close an existing long is exempt. To open a short leg, use a DEFINED-RISK vertical via the combo path (R5e below), never two single-leg orders.
 - **DTE** ∈ [14, 60]. Parsed from the OCC expiry in the option code; caller can also pass `dte` explicitly.
 - **|delta|** ∈ [0.25, 0.65] when `delta` is passed.
 - **Notional** ≤ 1.5% equity (= `contracts × 100 × entry` for the single trade).
-- Single-leg only. Do NOT leg into spreads with two orders — the SELL leg will be refused.
+- Single-leg only via `place_paper_option_order`. Do NOT leg into spreads with two single-leg orders — the SELL leg will be refused.
 
 ### R5b — cash-secured put collateral
 - An opening short put must be fully cash-collateralized: `cash ≥ strike × 100 × qty − premium collected`.
 - Missing/invalid strike → block (collateral can't be verified).
+- Applies to a standalone CSP (still blocked at the single-leg tool); a vertical's defined `max_loss` supersedes the CSP collateral requirement because the long leg caps assignment.
 
 ### R5c — naked short call requires an explicit stop
-- Opening a short call needs `stop > entry`, otherwise blocked outright — the stop (plus the 1.5× stress buffer in R1) is the only thing bounding the theoretically unbounded risk.
+- Opening a short call needs `stop > entry`, otherwise blocked outright — the stop (plus the 1.5× stress buffer in R1) is the only thing bounding the theoretically unbounded risk. Standalone naked calls stay blocked; only defined-risk verticals are unblocked (R5e).
+
+### R5e — multi-leg defined-risk vertical (combo path)
+- Open a credit vertical atomically via the `place_paper_option_combo` tool (`evaluate_combo` → `check_combo`). It PROVES the structure is defined-risk before sizing: exactly 2 legs, same underlying + expiry + right, equal contracts, **net credit > 0**, and the **long leg caps the short** (put spread: long strike below short; call spread: long strike above short).
+- Sized as ONE position off `max_loss = (width − net_credit) × 100 × contracts`: that max_loss flows through R1 (≤ 2.5% equity), the combo counts once for R2/R3/R4, R5 DTE band applies on the shared expiry, and R5d liquidity is checked on BOTH legs.
+- The server places the protective LONG leg first, then the SHORT leg; a short-leg rejection rolls back (closes) the long. The single-leg SELL-to-open block is untouched.
 
 ### R6 — earnings lock
 - Within 2 trading days of next earnings (`earnings_dte ∈ [0, 2]`), only strategy labels starting with `earnings_` are allowed.

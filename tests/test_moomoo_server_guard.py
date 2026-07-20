@@ -10,7 +10,7 @@ hook_audit_log.
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +40,7 @@ class _StubTradeCtx:
         self.equity = equity
         self.fail_accinfo = fail_accinfo
         self.place_order_calls: list[dict] = []
+        self.modify_order_calls: list[dict] = []
 
     def accinfo_query(self, **kwargs):
         if self.fail_accinfo:
@@ -54,6 +55,11 @@ class _StubTradeCtx:
             "price": kwargs["price"], "dealt_qty": 0, "dealt_avg_price": 0,
             "order_status": "SUBMITTING",
         }])
+
+    def modify_order(self, **kwargs):
+        self.modify_order_calls.append(kwargs)
+        return 0, pd.DataFrame([{"order_id": kwargs.get("order_id", ""),
+                                 "order_status": "CANCELLED_ALL"}])
 
 
 @pytest.fixture()
@@ -73,6 +79,17 @@ def _insert_thesis(ticker: str) -> int:
             (datetime.now(timezone.utc).isoformat(), ticker),
         )
         return int(cur.lastrowid)
+
+
+def _future_opt(ticker: str = "MRVL", days: int = 30, right: str = "C",
+                strike: float = 290.0) -> str:
+    """Evergreen ~`days`-DTE option symbol (keeps R5's [14,60] DTE band
+    satisfied as real time advances)."""
+    exp = (datetime.now(timezone.utc).date() + timedelta(days=days)).strftime("%y%m%d")
+    return f"US.{ticker}{exp}{right}{int(round(strike * 1000)):08d}"
+
+
+_MRVL_OPT = _future_opt("MRVL", 30, "C", 290.0)
 
 
 def test_sell_to_open_option_refused_before_broker(stub_ctx):
@@ -137,7 +154,7 @@ def test_illiquid_option_open_refused_before_broker(stub_ctx, monkeypatch):
         },
     )
     resp = server.place_paper_option_order(
-        option_symbol="US.MRVL260702C00290000", side="BUY",
+        option_symbol=_MRVL_OPT, side="BUY",
         contracts=1, price=1.40, thesis_id=1,
     )
     assert resp["order_blocked"] is True
@@ -159,12 +176,12 @@ def test_liquid_option_open_places(stub_ctx, monkeypatch):
         },
     )
     resp = server.place_paper_option_order(
-        option_symbol="US.MRVL260702C00290000", side="BUY",
+        option_symbol=_MRVL_OPT, side="BUY",
         contracts=1, price=1.02, thesis_id=1, delta=0.40,
     )
     assert "order_blocked" not in resp
     assert len(stub_ctx.place_order_calls) == 1
-    assert stub_ctx.place_order_calls[0]["code"] == "US.MRVL260702C00290000"
+    assert stub_ctx.place_order_calls[0]["code"] == _MRVL_OPT
 
 
 def test_equity_lookup_failure_fails_closed(guard_db, monkeypatch):
@@ -179,3 +196,142 @@ def test_equity_lookup_failure_fails_closed(guard_db, monkeypatch):
     assert resp["order_blocked"] is True
     assert "cannot verify sizing" in resp["reason"]
     assert ctx.place_order_calls == []
+
+
+# ---------------------------------------------------------------------------
+# place_paper_option_combo (defined-risk vertical, area A)
+# ---------------------------------------------------------------------------
+
+_GOOD_QUOTE = {"bid_price": 1.00, "ask_price": 1.02, "option_open_interest": 1200}
+_SHORT_PUT = _future_opt("SPY", 30, "P", 100.0)
+_LONG_PUT = _future_opt("SPY", 30, "P", 95.0)
+
+
+def _patch_combo_quote(monkeypatch, row=None):
+    from trading_agent import order_guard as og
+    monkeypatch.setattr(og, "fetch_option_quote",
+                        lambda code, timeout_s=5.0: dict(row or _GOOD_QUOTE))
+
+
+def test_valid_combo_places_both_legs_long_first(stub_ctx, monkeypatch):
+    from trading_agent.mcp_servers.moomoo import server
+    _insert_thesis("SPY")
+    _patch_combo_quote(monkeypatch)
+    resp = server.place_paper_option_combo(
+        short_leg_symbol=_SHORT_PUT, long_leg_symbol=_LONG_PUT,
+        contracts=1, short_price=2.0, long_price=0.8, thesis_id=1,
+        strategy_label="credit_put_spread_30_45",
+    )
+    assert "order_blocked" not in resp
+    assert resp["combo"] is True
+    assert resp["net_credit"] == 2.0 - 0.8
+    assert resp["max_loss"] == (5.0 - 1.2) * 100.0
+    assert "rows" not in resp and len(resp["combo_rows"]) == 2
+    # protective LONG leg placed FIRST, then the SHORT leg
+    assert len(stub_ctx.place_order_calls) == 2
+    assert stub_ctx.place_order_calls[0]["code"] == _LONG_PUT
+    assert str(stub_ctx.place_order_calls[0]["trd_side"]).endswith("BUY")
+    assert stub_ctx.place_order_calls[1]["code"] == _SHORT_PUT
+
+
+def test_combo_not_defined_risk_blocked_before_broker(stub_ctx, monkeypatch):
+    from trading_agent.mcp_servers.moomoo import server
+    _insert_thesis("SPY")
+    _patch_combo_quote(monkeypatch)
+    # long strike ABOVE short on a put spread → not capped → R5e block
+    resp = server.place_paper_option_combo(
+        short_leg_symbol=_future_opt("SPY", 30, "P", 95.0),
+        long_leg_symbol=_future_opt("SPY", 30, "P", 100.0),
+        contracts=1, short_price=2.0, long_price=0.8, thesis_id=1,
+    )
+    assert resp["order_blocked"] is True
+    assert "combo_rows" not in resp and "rows" not in resp
+    assert stub_ctx.place_order_calls == []
+    assert "R5e_combo_defined_risk" in {v["rule"] for v in resp["violations"]}
+
+
+def test_combo_short_rejection_cancels_working_long(guard_db, monkeypatch):
+    """Long leg is a LIMIT order still WORKING (dealt_qty=0) when the short is
+    rejected → roll back by CANCELLING it, NOT market-selling (a market sell
+    with no position would open a naked short of the long-leg option)."""
+    from trading_agent.mcp_servers.moomoo import server
+
+    class _FailShortLeg(_StubTradeCtx):
+        def place_order(self, **kwargs):
+            idx = len(self.place_order_calls)
+            self.place_order_calls.append(kwargs)
+            if idx == 1:  # the SHORT opening leg (2nd call) is rejected
+                return -1, "simulated short-leg rejection"
+            return 0, pd.DataFrame([{
+                "order_id": f"STUB-{idx}", "code": kwargs["code"],
+                "trd_side": str(kwargs["trd_side"]), "qty": kwargs["qty"],
+                "price": kwargs["price"], "dealt_qty": 0,  # WORKING, not filled
+                "order_status": "SUBMITTING",
+            }])
+
+    ctx = _FailShortLeg()
+    monkeypatch.setattr(server, "_trade", lambda: ctx)
+    _insert_thesis("SPY")
+    _patch_combo_quote(monkeypatch)
+    resp = server.place_paper_option_combo(
+        short_leg_symbol=_SHORT_PUT, long_leg_symbol=_LONG_PUT,
+        contracts=1, short_price=2.0, long_price=0.8, thesis_id=1,
+    )
+    assert resp.get("combo") is False
+    assert resp.get("combo_rollback") is True
+    assert resp.get("rolled_back_long") is True
+    assert resp.get("rollback_action") == "cancelled_working_long"
+    # 2 place_orders (long BUY, short SELL-fail); the working long is CANCELLED,
+    # not sold — exactly ONE modify_order(CANCEL) on the long's order id.
+    assert len(ctx.place_order_calls) == 2
+    assert len(ctx.modify_order_calls) == 1
+    assert ctx.modify_order_calls[0]["order_id"] == "STUB-0"
+
+
+def test_combo_short_rejection_market_sells_filled_long(guard_db, monkeypatch):
+    """Long leg actually FILLED (dealt_qty>0) when the short is rejected → roll
+    back by market-selling the dealt quantity to flatten the real position."""
+    from trading_agent.mcp_servers.moomoo import server
+
+    class _FilledLongFailShort(_StubTradeCtx):
+        def place_order(self, **kwargs):
+            idx = len(self.place_order_calls)
+            self.place_order_calls.append(kwargs)
+            if idx == 1:  # short opening leg rejected
+                return -1, "simulated short-leg rejection"
+            # long leg fills immediately
+            return 0, pd.DataFrame([{
+                "order_id": f"STUB-{idx}", "code": kwargs["code"],
+                "trd_side": str(kwargs["trd_side"]), "qty": kwargs["qty"],
+                "price": kwargs["price"], "dealt_qty": kwargs["qty"],
+                "dealt_avg_price": kwargs["price"], "order_status": "FILLED_ALL",
+            }])
+
+    ctx = _FilledLongFailShort()
+    monkeypatch.setattr(server, "_trade", lambda: ctx)
+    _insert_thesis("SPY")
+    _patch_combo_quote(monkeypatch)
+    resp = server.place_paper_option_combo(
+        short_leg_symbol=_SHORT_PUT, long_leg_symbol=_LONG_PUT,
+        contracts=1, short_price=2.0, long_price=0.8, thesis_id=1,
+    )
+    assert resp.get("combo_rollback") is True
+    assert resp.get("rolled_back_long") is True
+    assert resp.get("rollback_action") == "sold_filled_long"
+    # 3 place_orders: long BUY, short SELL-fail, long SELL-to-close (market)
+    assert len(ctx.place_order_calls) == 3
+    assert ctx.modify_order_calls == []
+    assert str(ctx.place_order_calls[2]["trd_side"]).endswith("SELL")
+    assert ctx.place_order_calls[2]["code"] == _LONG_PUT
+
+
+def test_combo_requires_fresh_thesis(stub_ctx, monkeypatch):
+    from trading_agent.mcp_servers.moomoo import server
+    _patch_combo_quote(monkeypatch)
+    resp = server.place_paper_option_combo(
+        short_leg_symbol=_SHORT_PUT, long_leg_symbol=_LONG_PUT,
+        contracts=1, short_price=2.0, long_price=0.8, thesis_id=1,
+    )
+    assert resp["order_blocked"] is True
+    assert "no open thesis" in resp["reason"]
+    assert stub_ctx.place_order_calls == []

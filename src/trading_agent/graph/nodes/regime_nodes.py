@@ -232,7 +232,31 @@ def classify_regime(state: dict) -> dict:
     prior_state = get_latest_regime_state()
     prior_label = prior_state["label"] if prior_state else None
 
-    pred = classify(snap, model=model, prior_label=prior_label)
+    # Online-learning regime_thresholds (area E): an ACTIVE param swap moves
+    # the LIVE classifier. Defaults preserve byte-identical behaviour when no
+    # override is present (crisis_overlay merges partial params over
+    # DEFAULT_CRISIS_PARAMS; classify defaults the confidence kwargs to its
+    # module constants). The literal key strings below are the ITEM 11
+    # consumer-grep anchor. These keys stay canary_eligible=False — global/
+    # premarket scope, no global-scope canary routing yet (see params.py).
+    _vals = ((state.get("learning") or {}).get("params") or {}).get("values") or {}
+    crisis_params: dict[str, float] = {}
+    if "crisis_vix_level" in _vals:
+        crisis_params["vix_abs_high"] = float(_vals["crisis_vix_level"])
+    if "crisis_vix_delta_5d" in _vals:
+        crisis_params["vix_5d_change_high"] = float(_vals["crisis_vix_delta_5d"])
+    if "crisis_spy_5d_drop_pct" in _vals:
+        crisis_params["spy_5d_drop"] = float(_vals["crisis_spy_5d_drop_pct"]) / 100.0
+    conf_kwargs: dict[str, float] = {}
+    if "regime_confidence_transition" in _vals:
+        conf_kwargs["confidence_transition"] = float(_vals["regime_confidence_transition"])
+    if "regime_confidence_llm_review" in _vals:
+        conf_kwargs["confidence_llm_review"] = float(_vals["regime_confidence_llm_review"])
+
+    pred = classify(
+        snap, model=model, prior_label=prior_label,
+        crisis_params=crisis_params or None, **conf_kwargs,
+    )
 
     emit(
         run_id=run_id,
