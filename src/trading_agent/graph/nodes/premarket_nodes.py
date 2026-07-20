@@ -183,16 +183,82 @@ def collect_watchlist_data(state: TradingGraphState) -> dict:
 # Node 2: rank_candidates
 # ---------------------------------------------------------------------------
 
+# Cumulative fraction of a full US session's volume typically traded by t
+# minutes after the open, anchored on the well-documented U-shaped intraday
+# volume profile (heavy first half hour, midday trough, heavy close).
+# CALIBRATION PLACEHOLDER: these are static market-level estimates, not
+# fitted values — the constant is named so the online-learning layer can own
+# (and eventually per-ticker-calibrate) the curve later.
+RVOL_INTRADAY_CUM_FRACTION_ANCHORS: tuple[tuple[float, float], ...] = (
+    (0.0, 0.00),
+    (30.0, 0.12),
+    (60.0, 0.20),
+    (120.0, 0.30),
+    (180.0, 0.38),
+    (240.0, 0.46),
+    (300.0, 0.55),
+    (360.0, 0.68),
+    (390.0, 1.00),
+)
+# Floor on the expected fraction so the first minutes after the open don't
+# divide today's tiny cumulative volume by ~0 and explode rvol.
+RVOL_INTRADAY_FRACTION_FLOOR = 0.06
+
+_FULL_SESSION_MINUTES = 390.0
+
+
+def intraday_volume_fraction(
+    minutes_since_open: float,
+    session_minutes: float = _FULL_SESSION_MINUTES,
+) -> float:
+    """Expected cumulative fraction of the day's volume traded by now.
+
+    Linear interpolation over RVOL_INTRADAY_CUM_FRACTION_ANCHORS, floored
+    at RVOL_INTRADAY_FRACTION_FLOOR. Half-days (session_minutes < 390) are
+    handled by rescaling elapsed minutes onto the full-day profile, so the
+    fraction still reaches 1.0 at the early close. Input is clamped to
+    [0, 390] after rescale — values outside the session never extrapolate.
+    """
+    if session_minutes and session_minutes > 0 and session_minutes != _FULL_SESSION_MINUTES:
+        minutes_since_open = minutes_since_open * (_FULL_SESSION_MINUTES / session_minutes)
+    t = min(max(minutes_since_open, 0.0), _FULL_SESSION_MINUTES)
+    anchors = RVOL_INTRADAY_CUM_FRACTION_ANCHORS
+    frac = anchors[-1][1]
+    for (t0, f0), (t1, f1) in zip(anchors, anchors[1:]):
+        if t <= t1:
+            frac = f0 + (f1 - f0) * ((t - t0) / (t1 - t0))
+            break
+    return max(frac, RVOL_INTRADAY_FRACTION_FLOOR)
+
+
 def _build_scout_prompt(
     watchlist: list[str],
     market_data: dict[str, Any],
     regime: dict[str, Any],
+    now_utc: datetime | None = None,
 ) -> str:
     regime_label = regime.get("label", "VOLATILE_TRANSITION")
     regime_conf = float(regime.get("confidence") or 0.0)
     gate = regime.get("gate") or {}
     allow_entries = gate.get("allow_new_entries", True)
     size_mult = float(gate.get("size_multiplier") or 1.0)
+
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    # Time-of-day context for rvol normalization. During the regular
+    # session the quote's `volume` field is TODAY'S CUMULATIVE volume, so
+    # it must be compared against the fraction of a day's volume that is
+    # normally done by now — not against a full day's average. Outside
+    # regular hours the feed still carries the PRIOR full day's volume,
+    # where the old full-day comparison is the correct semantics (f=1.0).
+    from trading_agent.market_calendar import is_us_market_open, minutes_since_open
+    rth_minutes: float | None = None
+    session_minutes = _FULL_SESSION_MINUTES
+    if is_us_market_open(now_utc):
+        mso = minutes_since_open(now_utc)
+        if mso is not None and mso[0] >= 0:
+            rth_minutes, session_minutes = mso
 
     def _fmt_quote(ticker: str) -> str:
         q = market_data.get(ticker) or {}
@@ -201,16 +267,27 @@ def _build_scout_prompt(
         last = q.get("last", 0)
         chg = q.get("change_pct", 0)
         vol = q.get("volume", 0)
-        # Relative volume = prior-day volume / 3-month average. This is the
-        # KEY de-bias signal: NVDA's 212M shares is ~1.0x its own norm
-        # (not special), while a small-cap doubling its volume is 2.0x
-        # (genuinely hot). Pre-open, change_pct is ~0 for everything, so
-        # WITHOUT rvol the scout falls back to absolute volume and always
-        # locks onto the highest-volume mega-cap (the 6/2 NVDA-bias audit).
+        # Relative volume — the KEY de-bias signal: NVDA at ~1.0x its own
+        # norm is not special, while a small-cap doubling its volume is
+        # 2.0x (genuinely hot). Without rvol the scout falls back to
+        # absolute volume and always locks onto the highest-volume
+        # mega-cap (the 6/2 NVDA-bias audit).
+        #
+        # During regular hours: rvol = today_cum_vol / (avg_3m * f(t)),
+        # where f(t) is the expected cumulative intraday volume fraction
+        # at t minutes since the open (U-shaped profile, see
+        # intraday_volume_fraction). Without f(t), a 10:15 ET scan reads
+        # every normal name at 0.1-0.4x and teaches the scout that
+        # nothing is active. Outside regular hours: vol is the prior
+        # day's total, so the plain full-day ratio applies (f=1.0).
         avg_vol = q.get("avg_volume_3m")
         rvol_str = ""
         if avg_vol and avg_vol > 0 and vol:
-            rvol_str = f" rvol={vol / avg_vol:.1f}x"
+            if rth_minutes is not None:
+                expected = avg_vol * intraday_volume_fraction(rth_minutes, session_minutes)
+            else:
+                expected = avg_vol
+            rvol_str = f" rvol={vol / expected:.1f}x"
         # Medium-term momentum (price vs 50-day MA) — the multi-day "trending
         # up on a narrative" signal, distinct from rvol (today's activity).
         mom = q.get("momentum_50d")
@@ -226,8 +303,19 @@ def _build_scout_prompt(
     hot = [t for t in watchlist if (market_data.get(t) or {}).get("hot_today")]
     rest = [t for t in watchlist if t not in set(hot)]
 
+    if rth_minutes is not None:
+        time_line = (
+            f"time: {now_utc.strftime('%H:%M')} UTC — regular session, "
+            f"{rth_minutes:.0f} min since the open"
+        )
+    else:
+        time_line = (
+            f"time: {now_utc.strftime('%H:%M')} UTC — outside regular hours "
+            f"(pre-open digest; rvol = prior-day volume vs its 3-month average)"
+        )
     lines = [
-        f"date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+        f"date: {now_utc.strftime('%Y-%m-%d')}",
+        time_line,
         f"regime: {regime_label} (confidence={regime_conf:.2f})",
         f"allow_new_entries: {allow_entries}",
         f"size_multiplier: {size_mult:.2f}",
@@ -257,6 +345,12 @@ def _build_scout_prompt(
         f"    rvol≈1.0x is trading NORMALLY — that is NOT a signal. Do not rank a ",
         f"    name highly just because its absolute volume is large; NVDA always ",
         f"    has huge absolute volume. rvol ≥ 1.5x is what flags genuine activity.",
+        f"  • rvol is TIME-NORMALIZED: during the regular session it compares ",
+        f"    today's cumulative volume against the fraction of a day's volume ",
+        f"    normally traded by this time. It centers on 1.0x and is directly ",
+        f"    comparable at ANY time of day — 9:35 and 15:30 alike. Do NOT ",
+        f"    discount rvol as 'too early to read' or hedge with pre-open-style ",
+        f"    caveats during regular hours; the number is already comparable.",
         f"  • mom50d = price vs 50-day average = the multi-day NARRATIVE trend. ",
         f"    The best setups combine BOTH: rvol ≥ 1.5x (active today) AND ",
         f"    mom50d strongly positive (riding a weeks-long uptrend). A name ",
@@ -522,6 +616,15 @@ DISPATCH_MIN_SCORE = 0.50
 # same underlying keeps rotating to the top of the watchlist.
 SAME_TICKER_COOLDOWN_DAYS = 7
 
+# After the trader-synthesizer DECLINED or the risk council VETOED a ticker,
+# don't re-dispatch the same name for this many TRADING days (market
+# calendar, not calendar days — a Friday decline blocks Mon/Tue/Wed, not
+# just the weekend). A decline/veto means the full pipeline already looked
+# at the setup and said no; re-running it the next morning burns the
+# research+council LLM spend on the same answer. Distinct from
+# SAME_TICKER_COOLDOWN_DAYS, which only locks after a FILLED entry.
+DECLINE_COOLDOWN_TRADING_DAYS = 3
+
 
 def _dispatch_candidate_entry_if_eligible(
     state: TradingGraphState,
@@ -531,6 +634,7 @@ def _dispatch_candidate_entry_if_eligible(
     """Spin off the candidate_entry subgraph for the highest-scoring candidate.
 
     Conditions for dispatch (all must hold):
+      * market in its regular cash session (checked FIRST — see below)
       * at least one candidate, top score ≥ DISPATCH_MIN_SCORE
       * halt flag absent
       * soak phase allows new entries
@@ -547,10 +651,42 @@ def _dispatch_candidate_entry_if_eligible(
     run_id = state["run_id"]
     trigger = state["trigger"]
 
-    if not candidates:
+    # ---- Global guards (checked ONCE for the whole scan) ----
+    # Regular-hours gate — FIRST, before every other guard. The 08:30 ET
+    # premarket scan runs an hour before the 09:30 ET open — dispatching/
+    # executing then buys pre-market spikes at unreliable quotes (6/2 SNOW:
+    # bought ~$273 pre-market, faded to $256 at open). When the market is
+    # closed the scan still ranks + sends its digest (awareness), but does
+    # NOT dispatch. The 10:15 and 13:30 ET scans run in regular hours and
+    # are the ones that actually trade. Routing is by MARKET STATE, not
+    # wall-clock: any scan that happens to run while the market is open
+    # will dispatch (holidays / half-days after the early close correctly
+    # degrade to digest-only).
+    #
+    # Ordering matters for scan_dispatch_liveness: it excludes ONLY
+    # skipped-with-reason=outside_regular_hours events, so every other skip
+    # reason must provably come from an in-session scan. Checking this gate
+    # first guarantees that — a halted/soaked/regime-blocked 08:30 digest
+    # emits outside_regular_hours (excluded), never a reason that would
+    # mask two dead executing scans.
+    from trading_agent.market_calendar import is_us_market_open
+    if not is_us_market_open():
+        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+             event_type="candidate_entry_skipped",
+             payload={"reason": "outside_regular_hours",
+                      "note": "digest-only; dispatch deferred to the open scan"})
         return
 
-    # ---- Global guards (checked ONCE for the whole scan) ----
+    # Empty in-session scan: emit (don't return silently) so a trading day
+    # whose two executing scans both completed with zero candidates still
+    # produces dispatch-decision events — otherwise scan_dispatch_liveness
+    # would false-alarm at 17:00 ET on a merely quiet day.
+    if not candidates:
+        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+             event_type="candidate_entry_skipped",
+             payload={"reason": "no_candidates"})
+        return
+
     # Halt flag
     from pathlib import Path
     halt_flag = Path.home() / "trading-agent" / "data" / "halt.flag"
@@ -578,20 +714,6 @@ def _dispatch_candidate_entry_if_eligible(
         emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
              event_type="candidate_entry_skipped",
              payload={"reason": "regime_blocks_new_entries", "regime_label": regime.get("label")})
-        return
-
-    # Regular-hours gate. The 12:30 UTC premarket scan runs an hour before
-    # the 13:30 open — dispatching/executing then buys pre-market spikes at
-    # unreliable quotes (6/2 SNOW: bought ~$273 pre-market, faded to $256 at
-    # open). When the market is closed the scan still ranks + sends its
-    # digest (awareness), but does NOT dispatch. The 13:35 UTC scan runs in
-    # regular hours and is the one that actually trades.
-    from trading_agent.market_calendar import is_us_market_open
-    if not is_us_market_open():
-        emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
-             event_type="candidate_entry_skipped",
-             payload={"reason": "outside_regular_hours",
-                      "note": "digest-only; dispatch deferred to the open scan"})
         return
 
     # ---- Remaining position budget (R2 cap) ----
@@ -641,6 +763,20 @@ def _dispatch_candidate_entry_if_eligible(
                  event_type="candidate_entry_skipped",
                  payload={"ticker": ticker, "reason": exposure["reason"],
                           "detail": exposure["detail"]})
+            continue
+
+        # Per-ticker guard: recent decline/veto — the pipeline already said
+        # no to this name. Skip and FALL THROUGH to the next-ranked eligible
+        # candidate (never dispatch nothing just because #1 is cooling down).
+        dc = _in_decline_cooldown(ticker)
+        if dc:
+            emit(run_id=run_id, trigger=trigger, agent="ntfy_scan_digest",
+                 event_type="candidate_skipped_cooldown",
+                 payload={"ticker": ticker,
+                          "declined_at": dc["declined_at"],
+                          "decline_event_type": dc["event_type"],
+                          "trading_days_ago": dc["trading_days_ago"],
+                          "cooldown_trading_days": DECLINE_COOLDOWN_TRADING_DAYS})
             continue
 
         # Per-ticker guard: cooldown on a recent FILLED entry
@@ -856,6 +992,67 @@ def _in_dispatch_cooldown(ticker: str, days: int = 7) -> dict | None:
     return None
 
 
+def _in_decline_cooldown(
+    ticker: str,
+    trading_days: int = DECLINE_COOLDOWN_TRADING_DAYS,
+    now_utc: datetime | None = None,
+) -> dict | None:
+    """Return decline info if `ticker` was DECLINED or VETOED within the last
+    `trading_days` US trading days, else None.
+
+    Events consulted (both carry payload->>'ticker'):
+      * ``declined``       — build_trade_proposal: trader-synthesizer said no
+      * ``veto_persisted`` — persist_veto: risk council / guardrails VETO
+
+    Excluded: ``declined`` events with reason='no_parsed_output'. Those are
+    LLM parse FAILURES (build_trade_proposal got no usable output), not the
+    pipeline looking at the setup and saying no — an infrastructure hiccup
+    must not lock a name out for 3 trading days.
+
+    Age is measured in TRADING days via market_calendar.trading_days_between
+    — a Friday decline is 1 trading day old on Monday, not 3. The 14-day
+    calendar bound on the query comfortably covers 3 trading days plus any
+    holiday cluster.
+
+    Returns None on any DB error — same best-effort posture as
+    ``_in_dispatch_cooldown``: the cooldown saves LLM spend, it is not a
+    safety guard (``_existing_exposure`` is the real defence).
+    """
+    try:
+        from trading_agent.store.postgres import cursor
+        norm = (ticker or "").strip().upper()
+        if not norm:
+            return None
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT ts, event_type FROM agent_events
+                WHERE event_type IN ('declined', 'veto_persisted')
+                  AND UPPER(payload->>'ticker') = %s
+                  AND COALESCE(payload->>'reason', '') <> 'no_parsed_output'
+                  AND ts > NOW() - interval '14 days'
+                ORDER BY ts DESC
+                LIMIT 1
+                """,
+                (norm,),
+            )
+            row = cur.fetchone()
+        if not row or not row[0]:
+            return None
+        declined_at, event_type = row
+        from trading_agent.market_calendar import trading_days_between
+        elapsed = trading_days_between(declined_at, now_utc)
+        if elapsed <= trading_days:
+            return {
+                "declined_at": declined_at.isoformat(),
+                "event_type": event_type,
+                "trading_days_ago": elapsed,
+            }
+    except Exception as e:
+        log.warning("[cooldown] decline-cooldown check failed: %s", e)
+    return None
+
+
 # A candidate_entry pipeline runs ~5-8 min. If the same ticker was dispatched
 # inside this window, its unit is still running (or just finished) — a second
 # dispatch's `systemctl start` would no-op and emit no run_start, which then
@@ -866,7 +1063,7 @@ _RECENT_DISPATCH_DEDUP_MIN = 20
 def _recently_dispatched(ticker: str, minutes: int = _RECENT_DISPATCH_DEDUP_MIN) -> bool:
     """True if `ticker` already has a candidate_entry_dispatched in the last
     `minutes`. Prevents double-dispatch when two scans (e.g. a manual run +
-    the scheduled 12:30 premarket) surface the same top pick within minutes.
+    a scheduled premarket fire) surface the same top pick within minutes.
 
     Best-effort: any DB error → False (don't block dispatch on a flaky read).
     """

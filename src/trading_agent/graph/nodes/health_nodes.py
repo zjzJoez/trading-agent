@@ -520,6 +520,139 @@ def trade_engine_silence_check(state: TradingGraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 2e: scan_dispatch_liveness
+# ---------------------------------------------------------------------------
+
+# Zero-eligible-scan tripwire. On a trading day the premarket timer fires
+# two EXECUTING scans (10:15 + 13:30 ET); each must end its dispatch phase
+# with either candidate_entry_dispatched or a candidate_entry_skipped /
+# candidate_skipped_cooldown decision. If a trading day reaches late
+# afternoon with ZERO such events, the executing scans never ran (timer
+# broken, unit crash before dispatch, deploy gone bad) — that's the exact
+# "system silently offline" failure the 5/22→6/1 incident hid for 11 days,
+# but caught the SAME day instead of after TRADE_ENGINE_SILENCE_ALERT_DAYS.
+SCAN_LIVENESS_CUTOFF_HOUR_ET = 17
+# The hourly healthcheck keeps ticking after 17:00 ET; alert once, not
+# every hour until midnight.
+SCAN_LIVENESS_ALERT_COOLDOWN_HOURS = 12
+
+
+def _was_scan_silence_alerted_recently() -> bool:
+    """True iff a scan_dispatch_silent alert fired within cooldown."""
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM agent_events
+                WHERE event_type = 'scan_dispatch_silent'
+                  AND ts > NOW() - (%s::text || ' hours')::interval
+                LIMIT 1
+                """,
+                (str(SCAN_LIVENESS_ALERT_COOLDOWN_HOURS),),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        log.warning("[scan_liveness] cooldown query failed: %s", e)
+        return False
+
+
+def scan_dispatch_liveness(state: TradingGraphState, now_utc=None) -> dict:
+    """Alert if a trading day produced NO executing-scan dispatch decisions.
+
+    Evaluates only after SCAN_LIVENESS_CUTOFF_HOUR_ET on US trading days —
+    i.e. once the day SHOULD have had both executing scans (10:15 + 13:30
+    ET). Counts today's (ET calendar day) candidate_entry_dispatched,
+    candidate_skipped_cooldown, and candidate_entry_skipped events,
+    EXCLUDING skipped-with-reason=outside_regular_hours: the 08:30 ET
+    digest scan always emits that one, so counting it would mask dead
+    executing scans — the exact blindness this tripwire exists to remove.
+    """
+    run_id = state["run_id"]
+    trigger = state["trigger"]
+    log.info("[health/scan_dispatch_liveness] run_id=%s", run_id)
+
+    from datetime import datetime, timezone
+
+    from trading_agent.market_calendar import ET, is_us_trading_day
+
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    now_et = now_utc.astimezone(ET)
+
+    if not is_us_trading_day(now_et.date()):
+        return {}  # weekend / holiday — no executing scan expected
+    if now_et.hour < SCAN_LIVENESS_CUTOFF_HOUR_ET:
+        return {}  # too early to judge; the 13:30 ET scan may still be due
+
+    day_start_utc = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    try:
+        from trading_agent.store.postgres import cursor
+        with cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM agent_events
+                WHERE ts >= %s
+                  AND (event_type IN ('candidate_entry_dispatched',
+                                      'candidate_skipped_cooldown')
+                       OR (event_type = 'candidate_entry_skipped'
+                           AND COALESCE(payload->>'reason', '')
+                               <> 'outside_regular_hours'))
+                """,
+                (day_start_utc,),
+            )
+            row = cur.fetchone()
+            n_decisions = int(row[0] or 0) if row else 0
+    except Exception as e:
+        log.warning("[scan_liveness] query failed: %s", e)
+        return {}
+
+    if n_decisions > 0:
+        emit(
+            run_id=run_id, trigger=trigger, agent="scan_dispatch_liveness",
+            event_type="scan_dispatch_alive",
+            payload={"n_decisions_today": n_decisions},
+        )
+        return {}
+
+    suppressed = _was_scan_silence_alerted_recently()
+    emit(
+        run_id=run_id, trigger=trigger, agent="scan_dispatch_liveness",
+        event_type="scan_dispatch_silent",
+        severity=SEV_ERROR,
+        payload={
+            "et_date": now_et.date().isoformat(),
+            "cutoff_hour_et": SCAN_LIVENESS_CUTOFF_HOUR_ET,
+            "ntfy_suppressed": suppressed,
+        },
+    )
+    if suppressed:
+        log.info("[scan_liveness] silence persists but ntfy in cooldown")
+        return {}
+
+    _alert_ops(
+        title="NO executing scan today — trade engine offline?",
+        body=(
+            f"Trading day {now_et.date().isoformat()} reached "
+            f"{SCAN_LIVENESS_CUTOFF_HOUR_ET}:00 ET with ZERO "
+            f"candidate_entry dispatch decisions.\n\n"
+            f"The 10:15 / 13:30 ET executing scans either never fired or "
+            f"died before the dispatch phase.\n\n"
+            f"Investigate:\n"
+            f"  systemctl list-timers trading-agent-premarket.timer\n"
+            f"  journalctl -u trading-agent-brain@premarket_scan.service "
+            f"--since today\n\n"
+            f"Next alert suppressed for "
+            f"{SCAN_LIVENESS_ALERT_COOLDOWN_HOURS}h."
+        ),
+    )
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Node 3: ntfy_health
 # ---------------------------------------------------------------------------
 
@@ -758,4 +891,12 @@ def _check_llm_schema_violations(run_id: str, trigger: str) -> None:
     )
 
 
-__all__ = ["opend_health", "postgres_health", "ntfy_health"]
+__all__ = [
+    "opend_health",
+    "postgres_health",
+    "disk_health",
+    "failed_units_check",
+    "trade_engine_silence_check",
+    "scan_dispatch_liveness",
+    "ntfy_health",
+]
