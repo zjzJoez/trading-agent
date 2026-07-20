@@ -2146,8 +2146,10 @@ class TestSpecBandBackstop:
         assert payload["violations"][0]["spec"] == "convexity_long_premium"
 
     def test_compliant_proposal_passes_through(self):
+        # Unmapped legacy label inside the global R5 band: no spec, no
+        # status gate — flows through to sizing as before.
         result, mock_emit, mock_insert, mock_fin = self._run_node(_synth_output(
-            strategy_label="directional_long_call", option_dte=30,
+            strategy_label="mean_reversion_pairs", option_dte=30,
             option_delta=0.45,
         ))
         assert result["proposal"]["ticker"] == "CRNX"
@@ -2155,3 +2157,96 @@ class TestSpecBandBackstop:
         events = [c.kwargs["event_type"] for c in mock_emit.call_args_list]
         assert events == ["proposal_built"]
         mock_fin.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# build_trade_proposal — spec status gate (interim convexity retirement,
+# operator-approved 2026-07-20, docs/REVIVAL_PLAN_2026-07-20.md)
+# ---------------------------------------------------------------------------
+
+class TestSpecStatusShadowOnly:
+    _run_node = TestSpecBandBackstop._run_node
+
+    def test_convexity_label_goes_shadow_only_not_to_order_path(self):
+        """In-band long-premium proposal: NOT sized into an order; recorded
+        to the shadow book (SHADOW_ONLY) + full-payload agent event for
+        option-level counterfactual replay."""
+        result, mock_emit, mock_insert, mock_fin = self._run_node(_synth_output(
+            strategy_label="directional_long_call", option_dte=30,
+            option_delta=0.45,
+        ))
+        assert "proposal" not in result           # no order path
+        assert "shadow_proposal_id" not in result  # downstream nodes see nothing
+        assert result["research"]["trader_decline"] is True
+        mock_insert.assert_called_once()
+        mock_fin.assert_called_once_with(77, final_action="SHADOW_ONLY")
+        events = [c.kwargs["event_type"] for c in mock_emit.call_args_list]
+        assert events == ["shadow_proposal_recorded"]
+        payload = mock_emit.call_args_list[0].kwargs["payload"]
+        assert payload["spec"] == "convexity_long_premium"
+        assert payload["spec_status"] == "shadow_only"
+        assert payload["final_action"] == "SHADOW_ONLY"
+        assert payload["shadow_proposal_id"] == 77
+        # Full proposal payload — enough for counterfactual replay against
+        # option_chain_snapshots even if the shadow insert had failed.
+        p = payload["proposal"]
+        assert p["ticker"] == "CRNX"
+        assert p["symbol"] == "US.CRNX260821C00040000"
+        assert p["strategy_label"] == "directional_long_call"
+        assert p["option_dte"] == 30 and p["option_delta"] == 0.45
+        assert p["entry_price"] == 2.0 and p["stop"] == 1.0 and p["target"] == 5.0
+
+    def test_band_check_still_runs_before_status_gate(self):
+        """A band-violating convexity shape is REJECTED_SPEC_BAND, not
+        SHADOW_ONLY — the shadow book only accumulates proposals that would
+        have been executable but for the retirement."""
+        result, mock_emit, mock_insert, mock_fin = self._run_node(_synth_output(
+            strategy_label="directional_long_call", option_dte=50,
+            option_delta=0.45,
+        ))
+        assert "proposal" not in result
+        mock_fin.assert_called_once_with(77, final_action="REJECTED_SPEC_BAND")
+        events = [c.kwargs["event_type"] for c in mock_emit.call_args_list]
+        assert events == ["proposal_rejected_spec_band"]
+
+    def test_pending_prereqs_label_is_blocked_not_shadowed(self):
+        """credit_vertical_* (pending_prereqs) never went live — finalized
+        BLOCKED_SPEC_STATUS, not part of the counterfactual book."""
+        result, mock_emit, mock_insert, mock_fin = self._run_node(_synth_output(
+            strategy_label="credit_vertical_spy_put", option_dte=35,
+            option_delta=0.30,
+        ))
+        assert "proposal" not in result
+        mock_fin.assert_called_once_with(77, final_action="BLOCKED_SPEC_STATUS")
+        payload = mock_emit.call_args_list[0].kwargs["payload"]
+        assert payload["spec_status"] == "pending_prereqs"
+
+    def test_shadow_insert_failure_still_emits_full_payload_event(self):
+        """Best-effort DB down: the agent_event alone must carry enough to
+        replay the proposal later."""
+        from trading_agent.llm.schemas import TraderSynthesizerOutput  # noqa: F401
+        synth = _synth_output(
+            strategy_label="directional_long_call", option_dte=30,
+            option_delta=0.45,
+        )
+        state = _base_state(
+            trigger="candidate_entry",
+            research={"target_ticker": "CRNX"},
+            regime={"label": "BULL_TREND", "confidence": 0.8, "gate": {}},
+            account={"equity": 100_000.0},
+            positions=[],
+        )
+        router = MagicMock()
+        router.call.return_value = MagicMock(parsed=synth)
+        with patch("trading_agent.graph.nodes.trade_nodes.emit") as mock_emit:
+            with patch("trading_agent.llm.get_router", return_value=router):
+                with patch("trading_agent.shadow.persist.insert_shadow_proposal",
+                           return_value=None):
+                    with patch("trading_agent.shadow.persist.finalize_shadow_proposal") as mock_fin:
+                        from trading_agent.graph.nodes.trade_nodes import build_trade_proposal
+                        result = build_trade_proposal(state)
+        assert "proposal" not in result
+        mock_fin.assert_not_called()  # no row to finalize
+        payload = mock_emit.call_args_list[0].kwargs["payload"]
+        assert payload["shadow_proposal_id"] is None
+        assert payload["proposal"]["symbol"] == "US.CRNX260821C00040000"

@@ -23,6 +23,10 @@ Rules (from plan, canonical form):
                                 Strategy specs may TIGHTEN the floor per label
                                 (strategy_specs.spec_for_label); the global 1.3
                                 stays the absolute minimum for unmapped labels.
+  R_spec_status                — a strategy_label mapping to a NON-ACTIVE
+                                StrategySpec (shadow_only / pending_prereqs /
+                                blocked) cannot OPEN; closes are exempt so a
+                                retired strategy can always be unwound.
 
 Risk calc for R1:
   stock trade: risk = |entry - stop| * qty                      (if stop supplied)
@@ -50,6 +54,10 @@ R7 = "R7_risk_reward"
 R5B = "R5b_csp_collateral"
 R5C = "R5c_naked_call_no_stop"
 R5E = "R5e_combo_defined_risk"               # multi-leg vertical defined-risk gate
+R_SPEC_STATUS = "R_spec_status_not_tradeable"  # label maps to a non-active
+                                               # StrategySpec (shadow_only /
+                                               # pending_prereqs / blocked);
+                                               # OPENS refused, closes exempt
 R_STOP_MISSING = "R1_stop_missing"          # warn-only signal when stop absent
 R_SECTOR_UNKNOWN = "R4_sector_unknown"      # warn-only signal when sector lookup empty
 R_TARGET_MISSING = "R7_target_missing"      # warn-only signal when target absent
@@ -236,6 +244,27 @@ def check(ctx: SizingContext, proposed: ProposedTrade) -> list[SizingViolation]:
     # (selling a long, buying back a short) and must skip the opening-only
     # rules below (R1, R2, R3, R5 notional caps).
     is_opening = proposed.intent == "open"
+
+    # ---- Spec status gate (OPENS only) ----
+    # convexity_long_premium retired to shadow_only 2026-07-20
+    # (docs/REVIVAL_PLAN_2026-07-20.md): a label mapping to a non-active
+    # spec must never open a real position, whichever path built the order
+    # (graph pipeline, /enter skill, or a bare tool call) — this runs inside
+    # both the pretool hook and the moomoo MCP server guard. Closes are
+    # DELIBERATELY exempt: retirement must never strand an open position.
+    # Lazy + guarded import mirrors the R7 spec-floor lookup below: a
+    # registry bug degrades to no status gate rather than crashing the
+    # guard (the R5/R7 gates still apply).
+    if is_opening:
+        try:
+            from trading_agent.strategy_specs import spec_trading_block
+            block = spec_trading_block(proposed.strategy_label)
+        except Exception:
+            block = None  # registry unavailable — other gates still apply
+        if block is not None:
+            violations.append(SizingViolation(
+                R_SPEC_STATUS, str(block["message"]), "block",
+            ))
 
     # ---- R1 single-trade risk ----
     if proposed.asset_type == "STK" and proposed.stop is None:
@@ -586,6 +615,22 @@ def check_combo(ctx: SizingContext, combo: ProposedCombo) -> list[SizingViolatio
     v: list[SizingViolation] = []
     max_loss = combo.max_loss
     is_opening = combo.intent == "open"
+
+    # ---- Spec status gate (combos are always opens) ----
+    # credit_vertical_index_30_45 is registered pending_prereqs until every
+    # M1-0 blocking prerequisite is green (docs/REVIVAL_PLAN_2026-07-20.md)
+    # — a combo labeled into it must be refused here even though the R5e
+    # structural proof above passed. credit_put_spread_30_45 (area A)
+    # remains active and is unaffected.
+    if is_opening:
+        try:
+            from trading_agent.strategy_specs import spec_trading_block
+            block = spec_trading_block(combo.strategy_label)
+        except Exception:
+            block = None
+        if block is not None:
+            v.append(SizingViolation(
+                R_SPEC_STATUS, str(block["message"]), "block"))
 
     r1_budget = MAX_SINGLE_RISK_PCT * ctx.equity
     if is_opening and max_loss > r1_budget + EPS:

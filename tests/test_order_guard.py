@@ -162,6 +162,40 @@ def test_stock_sell_of_held_position_is_close(guard_db):
 
 
 # ---------------------------------------------------------------------------
+# Spec status gate (interim convexity retirement, 2026-07-20)
+# ---------------------------------------------------------------------------
+
+
+def test_convexity_open_blocked_at_order_tools_even_with_fresh_thesis(guard_db, monkeypatch):
+    """Retirement enforcement of record: a BUY-to-open long premium order
+    labeled into the shadow_only convexity spec is refused by the moomoo
+    guard even when thesis freshness / bands / sizing would all pass."""
+    from trading_agent.sizing import R_SPEC_STATUS
+    _insert_thesis("MRVL")
+    _patch_quote(monkeypatch, GOOD_QUOTE)
+    d = _eval("option", {
+        "option_symbol": _MRVL_OPT, "side": "BUY",
+        "contracts": 1, "price": 1.00, "delta": 0.40,
+        "strategy_label": "directional_long_call",
+    })
+    assert not d.allowed
+    assert any(v.rule == R_SPEC_STATUS for v in d.violations)
+
+
+def test_convexity_close_still_allowed_after_retirement(guard_db):
+    """Retirement must never strand a position: SELL-to-close of an existing
+    legacy convexity position passes the full guard, no thesis needed."""
+    sym = "US.AAPL260720C00200000"
+    _insert_open_trade(sym, qty=2, entry_price=2.0)
+    d = _eval("option", {
+        "option_symbol": sym, "side": "SELL", "contracts": 2, "price": 2.50,
+        "strategy_label": "directional_long_call",
+    })
+    assert d.allowed, d.violations_json()
+    assert d.intent == "close"
+
+
+# ---------------------------------------------------------------------------
 # Sizing pass-through (R1)
 # ---------------------------------------------------------------------------
 

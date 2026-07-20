@@ -1722,6 +1722,55 @@ def build_trade_proposal(state: TradingGraphState) -> dict:
             finalize_shadow_proposal(sid, final_action="REJECTED_SPEC_BAND")
         return {"research": {**research, "trader_decline": True}}
 
+    # Spec status gate (interim convexity retirement, operator-approved
+    # 2026-07-20 — docs/REVIVAL_PLAN_2026-07-20.md). Runs AFTER the band
+    # check on purpose: the shadow book must only accumulate proposals that
+    # would have been executable but for the retirement — a band-violating
+    # shape is not a valid counterfactual of the strategy. A label mapping
+    # to a shadow_only spec is recorded to shadow_proposals (SHADOW_ONLY)
+    # plus a structured agent_event carrying the FULL proposal payload, so
+    # option-level counterfactual replay against option_chain_snapshots
+    # stays possible even if the best-effort shadow insert failed. Other
+    # non-active statuses (pending_prereqs/blocked) are finalized
+    # BLOCKED_SPEC_STATUS — there is no counterfactual book for a strategy
+    # that never went live. Sizing re-enforces this at order time
+    # (R_spec_status_not_tradeable); closes are exempt there.
+    from trading_agent.strategy_specs import spec_for_label
+    _spec = spec_for_label(proposal_dict.get("strategy_label"))
+    if _spec is not None and not _spec.is_tradeable:
+        from trading_agent.shadow.persist import (
+            finalize_shadow_proposal,
+            insert_shadow_proposal,
+        )
+        sid = insert_shadow_proposal(
+            run_id=run_id, trigger=trigger,
+            proposal=proposal_dict, regime=regime,
+        )
+        final_action = (
+            "SHADOW_ONLY" if _spec.status == "shadow_only"
+            else "BLOCKED_SPEC_STATUS"
+        )
+        if sid is not None:
+            finalize_shadow_proposal(sid, final_action=final_action)
+        emit(
+            run_id=run_id, trigger=trigger, agent="build_trade_proposal",
+            event_type="shadow_proposal_recorded", severity=1,
+            payload={
+                "spec": _spec.name,
+                "spec_status": _spec.status,
+                "final_action": final_action,
+                "shadow_proposal_id": sid,
+                "regime": {
+                    "label": (regime or {}).get("label"),
+                    "confidence": (regime or {}).get("confidence"),
+                },
+                # Full proposal payload — enough for later counterfactual
+                # replay against option_chain_snapshots without the DB row.
+                "proposal": proposal_dict,
+            },
+        )
+        return {"research": {**research, "trader_decline": True}}
+
     emit(
         run_id=run_id, trigger=trigger, agent="build_trade_proposal",
         event_type="proposal_built",

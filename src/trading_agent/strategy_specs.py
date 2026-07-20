@@ -110,10 +110,34 @@ class StrategySpec:
     ``falsification`` is the contract: the observable result that kills
     the strategy. If a spec can't state one, it isn't a strategy — it's
     a vibe.
+
+    Status semantics (enforced — see ``spec_trading_block`` below):
+      * ``active``          — tradeable; sizing/guards apply normally.
+      * ``shadow_only``     — RETIRED from real fills. Proposals mapped to
+        this spec are never sized into an order; build_trade_proposal
+        records them to the shadow book (shadow_proposals, final_action
+        SHADOW_ONLY) for option-level counterfactual replay against
+        option_chain_snapshots. CLOSES of existing positions are exempt
+        (sizing gates the check on intent=='open') — retirement must
+        never strand an open position.
+      * ``pending_prereqs`` — declared but its blocking prerequisites are
+        not yet green; NOT tradeable through any consumer. Unlike
+        shadow_only there is no counterfactual book to feed yet, so a
+        proposal reaching build_trade_proposal is finalized
+        BLOCKED_SPEC_STATUS rather than SHADOW_ONLY.
+      * ``blocked``         — legacy name, kept for compatibility; same
+        non-tradeable enforcement as pending_prereqs. Historical note:
+        before area A, ``blocked`` carried NO enforcement anywhere in the
+        proposal→order path (its only consumer was the journal
+        post-mortem's spec_status display) — the actual block was
+        order_guard's single-leg SELL-to-open hard block. The statuses
+        above exist precisely because 'blocked' the *name* promised an
+        enforcement that never existed; new code should prefer the two
+        explicit statuses.
     """
 
     name: str
-    status: Literal["active", "blocked"]
+    status: Literal["active", "shadow_only", "pending_prereqs", "blocked"]
     structure: str
     entry_gates: Mapping[str, Any] = field(default_factory=dict)
     allowed_regimes: tuple[str, ...] = ()
@@ -125,6 +149,11 @@ class StrategySpec:
     def min_risk_reward(self) -> float | None:
         v = self.entry_gates.get("min_risk_reward")
         return float(v) if v is not None else None
+
+    @property
+    def is_tradeable(self) -> bool:
+        """Only ``active`` specs may open real (paper) positions."""
+        return self.status == "active"
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +178,17 @@ def _convexity_spec() -> StrategySpec:
     )
     return StrategySpec(
         name="convexity_long_premium",
-        status="active",
+        # RETIRED to shadow-only (sleeve 3, zero capital): operator-approved
+        # 2026-07-20 — docs/REVIVAL_PLAN_2026-07-20.md ("Sleeve 3:
+        # convexity_long_premium → shadow-only"). NO NEW real long-premium
+        # fills; every in-band proposal is still recorded to the shadow
+        # book so revival can be judged on option-level counterfactual P&L
+        # (shadow proposals replayed against option_chain_snapshots +
+        # execution_costs.py, promote-grade 97.5% gate, per the plan) —
+        # never on the 20d underlying-direction proxy. Closing existing
+        # long-premium positions remains allowed (intent=='close' is
+        # exempt from the status gate).
+        status="shadow_only",
         structure=(
             "Single-leg long premium (calls or puts), debit-defined risk. "
             "The edge lives in the tail of the winners, not the hit rate — "
@@ -235,8 +274,83 @@ def _credit_put_spread_spec() -> StrategySpec:
     )
 
 
+def _credit_vertical_index_spec() -> StrategySpec:
+    """Sleeve 1 — index credit verticals (docs/REVIVAL_PLAN_2026-07-20.md,
+    M1-1 revised). Registered ``pending_prereqs``: it turns active ONLY when
+    every M1-0 blocking prerequisite is green (combo-aware exit path with
+    net-of-both-legs marking + atomic two-leg close, combo cost-honest paper
+    fills, per-underlying spread calibration, and the M1-0.4 gate-feasibility
+    snapshot replay). Until then no consumer may size or place it.
+
+    EVERY number below is a PLACEHOLDER pending the M1-0.4 replay against
+    option_chain_snapshots — the plan explicitly forbids shipping a second
+    better-documented zero-order funnel: the replay must show qualifying
+    verticals exist on >=60% of snapshot days in the allowed regimes, or the
+    gates get retuned and the breakevens recomputed before activation.
+    """
+    return StrategySpec(
+        name="credit_vertical_index_30_45",
+        status="pending_prereqs",   # M1-0 all green → active (operator flip)
+        structure=(
+            "Short put vertical (BULL/RANGE); short call vertical (BEAR, on "
+            "regime confirmation). 30-45 DTE, short leg |delta| 0.20-0.35, "
+            "width $5-10, opened atomically via place_paper_option_combo "
+            "(R5e defined-risk proof), managed deterministically by the "
+            "hard executor: 50% profit-take or 21-DTE force-close, no "
+            "mid-trade stop."
+        ),
+        entry_gates={
+            # M1-1 revised gates — ALL PLACEHOLDERS pending M1-0.4 replay.
+            "underlying_whitelist": ("SPY", "QQQ"),  # IWM pending M1-0.3
+                                                     # measured combo friction
+                                                     # (> 0.06R ⇒ stays out)
+            "dte_range": (30, 45),
+            "abs_delta_range": (0.20, 0.35),   # short leg; 0.30→0.35 per plan
+            # credit >= width/4 (draft's width/3 was unsatisfiable in the
+            # allowed low-IV regimes — structural zero-order funnel; final
+            # value set by the M1-0.4 replay).
+            "min_credit_frac_of_width": 0.25,
+            "max_spread_pct_mid": 0.05,
+            "news_veto_required": True,        # single LLM call pre-entry
+            # NOTE: deliberately NO min_risk_reward — the plan deletes it as
+            # mathematically redundant with (and contradictory to) the
+            # credit gate; R7 exempts short-premium structures anyway.
+        },
+        allowed_regimes=("BULL_TREND", "RANGE_LOW_VOL"),
+        # No ExpectancyProfile yet — the plan REJECTS the expiry-binary
+        # breakeven formula for a 50%-PT / 21-DTE managed book (it is wrong
+        # in both directions); the declared profile must come from the
+        # M1-0.4 managed-payoff snapshot replay. Post-mortem spec_comparison
+        # skips None profiles, so nothing grades against fake numbers.
+        expectancy_profile=None,
+        min_trades_for_eval=30,
+        falsification=(
+            "Three-tier contract (docs/REVIVAL_PLAN_2026-07-20.md M1-3; "
+            "all thresholds PLACEHOLDER pending M1-0.4 replay): "
+            "(1) n=30 mechanical health check — realized costs within 1.5x "
+            "the M1-0.3 MEASURED calibration, no single loss > 1.05x the "
+            "defined max_loss, observed WR vs the management-aware baseline "
+            "P(50%-PT before 21-DTE | short delta) from snapshot replay "
+            "(not hold-to-expiry 1-delta); the cost and max-loss checks are "
+            "the real teeth at n=30 (binomial power ~37% at true WR 65%). "
+            "(2) n=60 kill-gate — moratorium iff LB95(mean R) < -0.10R "
+            "('proven harmful', not 'unproven'), CI via entry-week "
+            "block-bootstrap (same-week SPY/QQQ verticals correlate >0.9). "
+            "(3) promotion/scale-up is a SEPARATE gate — LB95(mean R) > 0 "
+            "at 97.5% one-sided or replication across two non-overlapping "
+            "windows; at the declared economics that needs n~150-400, so "
+            "the account-level daily benchmark window vs 60/40 is the "
+            "primary confirm/deny statistic."
+        ),
+    )
+
+
 REGISTRY: dict[str, StrategySpec] = {
-    s.name: s for s in (_convexity_spec(), _credit_put_spread_spec())
+    s.name: s for s in (
+        _convexity_spec(),
+        _credit_put_spread_spec(),
+        _credit_vertical_index_spec(),
+    )
 }
 
 
@@ -252,6 +366,8 @@ _LABEL_PREFIX_TO_SPEC: tuple[tuple[str, str], ...] = (
     ("breakout_", "convexity_long_premium"),
     # Defined-risk credit verticals (area A) — placed via the combo path.
     ("credit_put_spread", "credit_put_spread_30_45"),
+    # Sleeve 1 index verticals (M1-1) — pending_prereqs until M1-0 is green.
+    ("credit_vertical", "credit_vertical_index_30_45"),
 )
 
 
@@ -270,6 +386,45 @@ def spec_for_label(label: str | None) -> StrategySpec | None:
         if lbl.startswith(prefix):
             return REGISTRY[name]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Status enforcement — is this label allowed to OPEN a real position?
+# ---------------------------------------------------------------------------
+
+
+def spec_trading_block(strategy_label: str | None) -> dict[str, Any] | None:
+    """Return a structured block descriptor when ``strategy_label`` maps to a
+    non-tradeable spec, else None.
+
+    This is the single source of truth consulted by every opening path:
+    sizing.check (single-leg, via the pretool hook AND the moomoo MCP
+    guard), sizing.check_combo (verticals), and build_trade_proposal (which
+    additionally records shadow_only proposals to the shadow book instead
+    of silently dropping them).
+
+    ONLY opening paths may call this — closes (intent=='close') must never
+    be status-gated: retiring a strategy while stranding its open positions
+    is strictly worse than either state. Unmapped/legacy labels return None
+    (they are governed by the global R5/R7 gates, not by a spec status).
+    """
+    spec = spec_for_label(strategy_label)
+    if spec is None or spec.is_tradeable:
+        return None
+    return {
+        "spec": spec.name,
+        "status": spec.status,
+        "strategy_label": strategy_label,
+        "message": (
+            f"strategy_label {strategy_label!r} maps to spec "
+            f"'{spec.name}' with status='{spec.status}' — not tradeable; "
+            f"opening orders are refused"
+            + (
+                " (proposal recorded to the shadow book for counterfactual"
+                " replay)" if spec.status == "shadow_only" else ""
+            )
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -365,4 +520,5 @@ __all__ = [
     "round_trip_friction_r",
     "spec_band_violations",
     "spec_for_label",
+    "spec_trading_block",
 ]

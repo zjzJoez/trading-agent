@@ -215,7 +215,15 @@ def finalize_shadow_proposal(
 ) -> None:
     """Mark the final outcome. `final_action` should be one of:
     EXECUTED | VETOED_BY_GATE | VETOED_BY_RISK | VETOED_BY_COUNCIL |
-    DEFERRED | DECLINED_BY_TRADER | REJECTED_SPEC_BAND.
+    DEFERRED | DECLINED_BY_TRADER | REJECTED_SPEC_BAND | SHADOW_ONLY |
+    BLOCKED_SPEC_STATUS.
+
+    SHADOW_ONLY rows are the retired-strategy counterfactual book (spec
+    status shadow_only — e.g. convexity_long_premium per
+    docs/REVIVAL_PLAN_2026-07-20.md): in-band proposals that would have
+    been executable but for the retirement. BLOCKED_SPEC_STATUS covers
+    labels whose spec is pending_prereqs/blocked (never went live — not a
+    valid counterfactual population).
     """
     if shadow_id is None:
         return
