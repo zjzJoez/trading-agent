@@ -56,7 +56,8 @@ def _insert_guard_row(symbol: str, hours_ago: float = 1.0, decision: str = "allo
 
 def _run(argv=None):
     from trading_agent.jobs import reconcile_order_guard as job
-    return job.main(argv or ["--no-notify"])
+    # --skip-positions keeps the guard-audit unit tests hermetic (no OpenD).
+    return job.main(argv or ["--no-notify", "--skip-positions"])
 
 
 def test_guarded_fill_is_clean(recon_db, capsys):
@@ -113,8 +114,123 @@ def test_notify_fires_on_findings(recon_db):
     _insert_fill("US.AAPL260720P00300000", hours_ago=2.0)
     with patch("trading_agent.notify.send") as sent:
         from trading_agent.jobs import reconcile_order_guard as job
-        assert job.main([]) == 1
+        assert job.main(["--skip-positions"]) == 1
     assert sent.call_count == 1
     args, kwargs = sent.call_args
     assert args[0] == "risk"
     assert kwargs["priority"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Position reconciliation — broker positions vs journal OPEN rows
+# ---------------------------------------------------------------------------
+
+def _compare(broker, rows):
+    from trading_agent.jobs.reconcile_order_guard import compare_positions
+    return compare_positions(broker, rows)
+
+
+def _row(symbol, side="BUY", qty=1.0, trade_id=1, store="sqlite"):
+    return {"store": store, "trade_id": trade_id, "symbol": symbol,
+            "side": side, "qty": qty}
+
+
+def test_position_without_journal_row():
+    """The 6/2 NVDA phantom exit: broker holds it, journal thinks it's flat."""
+    findings = _compare({"US.NVDA": 112.0}, [])
+    assert len(findings) == 1
+    assert findings[0]["status"] == "position_without_journal_row"
+    assert findings[0]["symbol"] == "US.NVDA"
+    assert findings[0]["broker_qty"] == 112.0
+
+
+def test_journal_row_without_position():
+    """The ids 9-12 shape: journal OPEN rows for a vanished broker position."""
+    findings = _compare({}, [
+        _row("US.MRVL260702C290000", "BUY", 2.0, trade_id=9),
+        _row("US.MRVL260702C300000", "SELL", 2.0, trade_id=10),
+    ])
+    statuses = {f["symbol"]: f["status"] for f in findings}
+    assert statuses == {
+        "US.MRVL260702C290000": "journal_row_without_position",
+        "US.MRVL260702C300000": "journal_row_without_position",
+    }
+    by_symbol = {f["symbol"]: f for f in findings}
+    assert by_symbol["US.MRVL260702C290000"]["journal_qty"] == 2.0
+    assert by_symbol["US.MRVL260702C300000"]["journal_qty"] == -2.0
+    assert by_symbol["US.MRVL260702C290000"]["trade_ids"] == [9]
+
+
+def test_position_qty_mismatch():
+    findings = _compare({"US.NVDA": 112.0}, [_row("US.NVDA", "BUY", 50.0)])
+    assert len(findings) == 1
+    assert findings[0]["status"] == "position_qty_mismatch"
+    assert findings[0]["journal_qty"] == 50.0
+
+
+def test_matched_positions_clean():
+    findings = _compare(
+        {"US.NVDA": 112.0, "US.AAPL260710P300000": -8.0},
+        [_row("US.NVDA", "BUY", 112.0, trade_id=1),
+         _row("US.AAPL260710P300000", "SELL", 8.0, trade_id=2, store="postgres")],
+    )
+    assert findings == []
+
+
+def test_partial_stores_suppress_broker_side_findings():
+    """Mac shape: Postgres unreachable → a broker position absent from the
+    visible journals must NOT alert (it may be journaled in the brain's
+    store), but a visible OPEN row with no broker position still must."""
+    from trading_agent.jobs.reconcile_order_guard import compare_positions
+    findings = compare_positions(
+        {"US.NVDA": 112.0},
+        [_row("US.MRVL260702C290000", "BUY", 2.0, trade_id=9)],
+        all_stores_visible=False,
+    )
+    assert [f["status"] for f in findings] == ["journal_row_without_position"]
+    assert findings[0]["symbol"] == "US.MRVL260702C290000"
+
+
+def test_positions_check_end_to_end(recon_db, capsys):
+    """Full main() run with patched broker/pg loaders: the NVDA case."""
+    from trading_agent.jobs import reconcile_order_guard as job
+    with patch.object(job, "_load_broker_positions", return_value={"US.NVDA": 112.0}), \
+         patch.object(job, "_load_open_rows_pg", return_value=[]):
+        assert job.main(["--no-notify"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["positions_checked"] is True
+    assert out["position_stores"] == ["sqlite", "postgres"]
+    assert len(out["position_findings"]) == 1
+    assert out["position_findings"][0]["status"] == "position_without_journal_row"
+
+
+def test_positions_check_skipped_when_broker_offline(recon_db, capsys):
+    """OpenD offline → check skipped with a flag, no alert, exit 0."""
+    from trading_agent.jobs import reconcile_order_guard as job
+    with patch.object(job, "_load_broker_positions", return_value=None):
+        assert job.main(["--no-notify"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["positions_checked"] is False
+    assert out["position_findings"] == []
+
+
+def test_open_mirror_rows_excluded_from_positions(recon_db, capsys):
+    """real_mirror OPEN rows are journal-only by design — never a mismatch."""
+    _insert_fill("US.NVDA", hours_ago=2.0, broker_order_id="REALMIRROR-9",
+                 strategy_label="shadow_real_account")
+    from trading_agent.jobs import reconcile_order_guard as job
+    with patch.object(job, "_load_broker_positions", return_value={}), \
+         patch.object(job, "_load_open_rows_pg", return_value=[]):
+        assert job.main(["--no-notify"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["position_findings"] == []
+
+
+def test_missing_audit_table_is_a_finding(recon_db, capsys):
+    """Schema never migrated (the Mac 2026-07-08 state) must alert, not crash."""
+    from trading_agent.db import connection
+    with connection() as conn:
+        conn.execute("DROP TABLE hook_audit_log")
+    assert _run() == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["findings"][0]["status"] == "audit_log_unreadable"

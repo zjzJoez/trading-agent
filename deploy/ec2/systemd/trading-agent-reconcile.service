@@ -1,0 +1,28 @@
+[Unit]
+Description=trading-agent — nightly guard + broker-vs-journal reconciliation
+Documentation=https://github.com/joezz/trading-agent
+After=network-online.target postgresql.service trading-agent-opend.service
+Wants=network-online.target
+PartOf=trading-agent.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/trading-agent
+
+EnvironmentFile=/home/ubuntu/trading-agent/.env
+EnvironmentFile=/home/ubuntu/.env.postgres
+
+# Exit 1 (findings) must still be visible in logs but not flap the unit
+# into "failed" restarts — oneshot with no Restart does exactly that.
+ExecStart=/home/ubuntu/trading-agent/.venv/bin/python -m trading_agent.jobs.reconcile_order_guard
+
+# Broker + Postgres round-trips; cap generously.
+TimeoutStartSec=300
+
+StandardOutput=append:/var/log/trading-agent-reconcile.log
+StandardError=append:/var/log/trading-agent-reconcile.err
+
+NoNewPrivileges=true
+PrivateTmp=true

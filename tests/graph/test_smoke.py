@@ -40,7 +40,9 @@ def test_graph_builder_registry_has_all_triggers():
 
 def test_builder_no_longer_imports_stubs():
     """builder.py must not import the stubs module (all nodes are real)."""
-    import importlib, ast, pathlib
+    import ast
+    import importlib
+    import pathlib
     src = pathlib.Path("src/trading_agent/graph/builder.py").read_text()
     tree = ast.parse(src)
     for node in ast.walk(tree):
@@ -49,6 +51,38 @@ def test_builder_no_longer_imports_stubs():
             module = getattr(node, "module", "") or ""
             assert "stubs" not in module and all("stubs" not in n for n in names), \
                 f"builder.py still imports stubs: {ast.dump(node)}"
+
+
+def test_run_once_records_nodes_visited(monkeypatch):
+    """run_once must report the nodes that actually executed.
+
+    Regression: the summary derived nodes_visited from state["notifications"],
+    which only stub nodes ever appended to — so production runs always
+    printed "nodes_visited": [] even though nodes ran.
+    """
+    from langgraph.graph import END, START, StateGraph
+
+    import trading_agent.orchestrator as orch
+    from trading_agent.graph.state import TradingGraphState
+
+    g = StateGraph(TradingGraphState)
+    g.add_node("node_a", lambda state: {})
+    g.add_node("node_b", lambda state: {})
+    g.add_edge(START, "node_a")
+    g.add_edge("node_a", "node_b")
+    g.add_edge("node_b", END)
+    compiled = g.compile(checkpointer=_memory_saver())
+
+    events = []
+    monkeypatch.setattr(orch, "GRAPH_BUILDERS", {"healthcheck": lambda: compiled})
+    monkeypatch.setattr(orch, "build", lambda trigger: compiled)
+    monkeypatch.setattr(orch, "emit", lambda **kw: events.append(kw))
+
+    final = orch.run_once("healthcheck")
+    assert final["nodes_visited"] == ["node_a", "node_b"]
+    finished = [e for e in events if e["event_type"] == "run_finished"]
+    assert len(finished) == 1
+    assert finished[0]["payload"]["nodes_visited"] == ["node_a", "node_b"]
 
 
 # ---------------------------------------------------------------------------

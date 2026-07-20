@@ -27,6 +27,11 @@
     <dict>
         <key>DB_PATH</key>
         <string>__PROJECT_DIR__/data/trader.db</string>
+        <key>OPEND_HOST</key>
+        <string>127.0.0.1</string>
+        <!-- 11122 = the SSM tunnel to EC2 OpenD (works with local OpenD off). -->
+        <key>OPEND_PORT</key>
+        <string>11122</string>
     </dict>
 
     <!-- 08:30 local (GMT+8), Mon–Sat — after the prior US session closes

@@ -105,26 +105,42 @@ def run_once(
     graph = build(trigger)
     config = {"configurable": {"thread_id": _thread_id(trigger, run_id, ts)}}
 
+    # Stream instead of invoke so we can record which nodes actually ran.
+    # "updates" chunks are keyed by node name; the last "values" chunk is
+    # the final state (identical to what invoke() would have returned).
+    nodes_visited: list[str] = []
+    final_state: dict | None = None
     try:
-        final_state = graph.invoke(state, config=config)
+        for mode, chunk in graph.stream(
+            state, config=config, stream_mode=["updates", "values"]
+        ):
+            if mode == "updates":
+                nodes_visited.extend(
+                    k for k in chunk if not k.startswith("__")
+                )
+            else:
+                final_state = chunk
     except Exception as e:
         emit(
             run_id=run_id,
             trigger=trigger,  # type: ignore[arg-type]
             agent="orchestrator",
             event_type="run_failed",
-            payload={"error": str(e), "ticker": ticker},
+            payload={"error": str(e), "ticker": ticker, "nodes_visited": nodes_visited},
             severity=2,
         )
         raise
     else:
+        if final_state is None:
+            final_state = dict(state)
+        final_state["nodes_visited"] = nodes_visited
         emit(
             run_id=run_id,
             trigger=trigger,  # type: ignore[arg-type]
             agent="orchestrator",
             event_type="run_finished",
             payload={
-                "nodes_visited": len(final_state.get("notifications", [])),
+                "nodes_visited": nodes_visited,
                 "ticker": ticker,
             },
         )
@@ -185,7 +201,7 @@ def main() -> None:
         print(json.dumps({
             "trigger": args.trigger,
             "run_id": final.get("run_id"),
-            "nodes_visited": [n.get("node") for n in final.get("notifications", [])],
+            "nodes_visited": final.get("nodes_visited", []),
         }, indent=2, default=str))
     except SystemExit as e:
         # Convert to plain exit_code so we still reach os._exit() below.
