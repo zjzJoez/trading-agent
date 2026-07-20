@@ -8,9 +8,12 @@ to DEFER on schema failure.
 """
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+log = logging.getLogger(__name__)
 
 
 class _Strict(BaseModel):
@@ -434,6 +437,25 @@ class TraderProposal(_Strict):
                     f"{min_rr}."
                 )
 
+        # Greeks are MANDATORY on OPT proposals (fail-closed). The spec-band
+        # gate below, build_trade_proposal's backstop AND sizing's R5 all
+        # skip a None dte/delta — so a model that simply drops the fields
+        # would evade every band check. The retry loop feeds this error
+        # back to the LLM, which always has the chain data to re-emit.
+        if self.asset_type == "OPT":
+            missing = [
+                name for name in ("option_delta", "option_dte")
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"{', '.join(missing)} missing: option_delta and "
+                    f"option_dte are mandatory for OPT proposals — the "
+                    f"DTE/delta band gates cannot run without them. "
+                    f"Re-emit the proposal with the contract's delta and "
+                    f"DTE from the option chain."
+                )
+
         # Spec-band gate (Week-1 Step 6b): a label mapped to a StrategySpec
         # must sit inside the spec's declared DTE/delta bands; an UNMAPPED
         # label on an OPT proposal falls back to the global R5 band — no
@@ -449,7 +471,11 @@ class TraderProposal(_Strict):
                 option_dte=self.option_dte,
                 option_delta=self.option_delta,
             )
-        except Exception:  # noqa: BLE001 — schema validation must never crash
+        except Exception as exc:  # noqa: BLE001 — schema validation must never crash
+            log.warning(
+                "spec-band schema check crashed, deferring to "
+                "build_trade_proposal backstop: %s", exc,
+            )
             band_violations = []
         if band_violations:
             raise ValueError(

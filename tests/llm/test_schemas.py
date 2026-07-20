@@ -267,6 +267,82 @@ def test_proposal_spec_band_accepts_compliant_contract():
     assert obj.option_dte == 30
 
 
+def test_proposal_spec_band_crash_logs_warning(monkeypatch, caplog):
+    """A dead schema layer must be VISIBLE: if spec_band_violations
+    crashes, the gate defers to the build_trade_proposal backstop but
+    logs a warning instead of swallowing silently."""
+    import logging
+
+    import trading_agent.strategy_specs as strategy_specs
+    from trading_agent.llm.schemas import TraderProposal
+
+    def _boom(**_kwargs):
+        raise RuntimeError("registry corrupted")
+
+    monkeypatch.setattr(strategy_specs, "spec_band_violations", _boom)
+    with caplog.at_level(logging.WARNING, logger="trading_agent.llm.schemas"):
+        obj = TraderProposal.model_validate(
+            _opt_payload(label="directional_long_call", dte=30, delta=0.45))
+    assert obj.option_dte == 30  # gate deferred, proposal still parses
+    assert any(
+        "spec-band schema check crashed" in rec.message
+        and "registry corrupted" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# Greeks omission — fail-closed on OPT proposals
+# ---------------------------------------------------------------------------
+
+
+def test_opt_proposal_missing_delta_rejected():
+    """Dropping option_delta must NOT slip past the band gates."""
+    from pydantic import ValidationError
+    from trading_agent.llm.schemas import TraderProposal
+
+    payload = _opt_payload(label="directional_long_call", dte=30, delta=0.45)
+    payload["option_delta"] = None
+    with pytest.raises(ValidationError,
+                       match="option_delta.*mandatory for OPT"):
+        TraderProposal.model_validate(payload)
+
+
+def test_opt_proposal_missing_dte_rejected():
+    from pydantic import ValidationError
+    from trading_agent.llm.schemas import TraderProposal
+
+    payload = _opt_payload(label="directional_long_call", dte=30, delta=0.45)
+    del payload["option_dte"]  # omitted entirely, not just None
+    with pytest.raises(ValidationError,
+                       match="option_dte.*mandatory for OPT"):
+        TraderProposal.model_validate(payload)
+
+
+def test_opt_proposal_missing_both_greeks_names_both_fields():
+    """The retry loop feeds the error back to the LLM — it must name
+    every missing field so the model can fix them in one shot."""
+    from pydantic import ValidationError
+    from trading_agent.llm.schemas import TraderProposal
+
+    payload = _opt_payload(label="momentum-continuation-ITM-call",
+                           dte=30, delta=0.45)
+    payload["option_delta"] = None
+    payload["option_dte"] = None
+    with pytest.raises(ValidationError,
+                       match="option_delta, option_dte.*mandatory for OPT"):
+        TraderProposal.model_validate(payload)
+
+
+def test_stk_proposal_without_greeks_fine():
+    """Greeks requirement is OPT-only — stock proposals carry none."""
+    from trading_agent.llm.schemas import TraderProposal
+
+    obj = TraderProposal.model_validate(_proposal_payload(stop=8.0, target=13.0))
+    assert obj.asset_type == "STK"
+    assert obj.option_delta is None and obj.option_dte is None
+
+
 # ---------------------------------------------------------------------------
 # SHORT direction — geometry inversion + R7 exemption
 # ---------------------------------------------------------------------------
@@ -274,13 +350,20 @@ def test_proposal_spec_band_accepts_compliant_contract():
 
 def _short_payload(direction: str, stop: float, target: float,
                    entry: float = 3.0) -> dict:
-    """SHORT premium: entry is premium collected; stop > entry > target."""
+    """SHORT premium: entry is premium collected; stop > entry > target.
+
+    Greeks are mandatory on OPT proposals (fail-closed omission gate), so
+    realistic short-premium values sit inside the global R5 band
+    (|delta| 0.25–0.65, DTE 14–60).
+    """
     return {
         "ticker": "SPY", "symbol": f"US.SPY260817{direction[6:7]}00500000",
         "asset_type": "OPT", "direction": direction,
         "strategy_label": "csp" if direction == "SHORT_PUT" else "naked_call",
         "entry_price": entry, "stop": stop, "target": target,
         "expected_return_pct": 100.0, "max_loss_pct": 50.0,
+        "option_delta": -0.30 if direction == "SHORT_PUT" else 0.30,
+        "option_dte": 30,
         "qty_request": 1,
     }
 
