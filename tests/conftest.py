@@ -48,3 +48,49 @@ def _block_real_ntfy():
     """
     with patch("trading_agent.notify.send"):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _block_real_postgres(request, monkeypatch):
+    """No unit test may reach a real Postgres. Mirrors _block_real_ntfy.
+
+    Background: 2026-07-20 incident. The auto-deploy pytest gate runs on
+    the EC2 host with the production POSTGRES_DSN in its environment
+    (the same EnvironmentFile that lets the deploy script apply
+    migrations). The combo dual-write path exercised by
+    test_posttool_combo_capture is best-effort — locally, with no DSN,
+    it silently no-ops and the test passes; on the gate it connected to
+    the LIVE journal and leaked a fixture row (journal_trades id=9,
+    broker_order_id 'L1'), which the nightly reconcile then flagged.
+
+    Stripping env vars is not enough: _resolve_dsn falls back to reading
+    ~/.env.postgres off disk, which exists on the EC2 host. So this
+    patches _resolve_dsn itself to raise — best-effort callers degrade
+    to their intended no-DSN behavior, strict callers fail loudly in
+    the test instead of touching production. checkpointer.py binds
+    _resolve_dsn by name at import, so both bindings are patched.
+
+    Integration-marked tests are exempt (the deploy gate deselects them
+    with -m 'not integration'; running them locally against a real DB
+    is a deliberate act).
+    """
+    if request.node.get_closest_marker("integration"):
+        yield
+        return
+    for var in ("POSTGRES_DSN", "DATABASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+
+    def _refuse(*_a, **_k):
+        raise RuntimeError(
+            "unit test attempted real Postgres access — mock the store "
+            "or mark the test @pytest.mark.integration"
+        )
+
+    from trading_agent.graph import checkpointer as _ckpt
+    from trading_agent.store import postgres as _pg
+    monkeypatch.setattr(_pg, "_resolve_dsn", _refuse)
+    monkeypatch.setattr(_ckpt, "_resolve_dsn", _refuse)
+    # A pool created by an exempt (integration) test earlier in the same
+    # session must not be reachable from unit tests either.
+    monkeypatch.setattr(_pg, "_pool", None)
+    yield
