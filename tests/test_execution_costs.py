@@ -104,3 +104,113 @@ def test_negative_calibration_values_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "CONFIG", new_cfg)
     ec.reset_calibration_cache()
     assert ec.fees_per_side(1, "OPT") == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# M1-0.3 — per-underlying calibration + vertical friction_r
+# ---------------------------------------------------------------------------
+
+
+def _write_calibration(tmp_path, payload: dict) -> None:
+    (tmp_path / "execution_costs.json").write_text(json.dumps(payload))
+    ec.reset_calibration_cache()
+
+
+def test_per_underlying_persistence_round_trip(tmp_path):
+    _write_calibration(tmp_path, {
+        "opt_half_spread_pct_of_mark": 0.04,
+        "per_underlying": {
+            "SPY": {"median_spread_pct_mid": 0.01, "n_quotes": 62,
+                    "calibrated_at": "2026-07-22T00:00:00+00:00",
+                    "zone": "puts 30-45 DTE"},
+        },
+    })
+    # SPY: full spread 1% of mid → half 0.5%: 2.00 × 0.005 × 1 × 100 = $1
+    assert ec.half_spread_cost(2.00, 1, "OPT", underlying="SPY") == pytest.approx(1.0)
+    # 'US.SPY' and lowercase normalize to the same entry
+    assert ec.half_spread_cost(2.00, 1, "OPT", underlying="US.SPY") == pytest.approx(1.0)
+    assert ec.half_spread_cost(2.00, 1, "OPT", underlying="spy") == pytest.approx(1.0)
+
+
+def test_per_underlying_fallback_semantics(tmp_path):
+    _write_calibration(tmp_path, {
+        "per_underlying": {
+            "SPY": {"median_spread_pct_mid": 0.01},
+        },
+    })
+    # Uncalibrated name → global default 4% of mark: 2.00 × 0.04 × 100 = $8
+    assert ec.half_spread_cost(2.00, 1, "OPT", underlying="TSLA") == pytest.approx(8.0)
+    # No underlying at all → unchanged legacy behavior
+    assert ec.half_spread_cost(2.00, 1, "OPT") == pytest.approx(8.0)
+    # Live quote still beats the per-underlying figure
+    assert ec.half_spread_cost(
+        2.00, 1, "OPT", bid=1.90, ask=2.10, underlying="SPY"
+    ) == pytest.approx(10.0)
+    # Stocks never consult per_underlying (10 bps half-spread default)
+    assert ec.half_spread_cost(
+        100.0, 10, "STK", underlying="SPY") == pytest.approx(0.5)
+
+
+def test_per_underlying_malformed_entries_ignored(tmp_path):
+    _write_calibration(tmp_path, {
+        "per_underlying": {
+            "SPY": {"median_spread_pct_mid": 0},        # not > 0
+            "QQQ": {"median_spread_pct_mid": -0.01},    # negative
+            "IWM": {"median_spread_pct_mid": 7.3},      # percentage, not frac
+            "DIA": "garbage",                            # not a dict
+        },
+    })
+    for u in ("SPY", "QQQ", "IWM", "DIA"):
+        assert ec.half_spread_cost(2.00, 1, "OPT", underlying=u) == pytest.approx(8.0)
+
+
+def test_net_pnl_threads_underlying_to_spread(tmp_path):
+    _write_calibration(tmp_path, {
+        "per_underlying": {"SPY": {"median_spread_pct_mid": 0.01}},
+    })
+    _, costs = ec.net_pnl(
+        200.0, 2, "OPT",
+        entry_price=2.0, exit_price=3.0,
+        entry_is_dealt=True, exit_is_dealt=False,
+        underlying="SPY",
+    )
+    # exit mark 3.00 × half-spread 0.5% × 2 × 100 = $3
+    assert costs.exit_spread_cost == pytest.approx(3.0)
+
+
+def test_friction_r_hand_computed_per_underlying(tmp_path):
+    _write_calibration(tmp_path, {
+        "per_underlying": {"SPY": {"median_spread_pct_mid": 0.01}},
+    })
+    # width 5, credit 1.25, 1 contract:
+    #   R      = (5 − 1.25) × 100          = $375
+    #   fees   = 4 fills × $1              = $4
+    #   spread = 2 legs × 2 dirs × (0.01/2 × 1.25 × 100) = 4 × 0.625 = $2.50
+    #   friction_r = 6.50 / 375 = 0.017333…
+    assert ec.friction_r("SPY", 5.0, 1.25) == pytest.approx(6.5 / 375.0, abs=1e-6)
+
+
+def test_friction_r_global_fallback_default():
+    # No calibration file: half-spread 4% of mark.
+    #   spread = 4 × (0.04 × 1.25 × 100) = $20 ; fees $4 ; R $375
+    assert ec.friction_r("IWM", 5.0, 1.25) == pytest.approx(24.0 / 375.0, abs=1e-6)
+    assert ec.friction_r(None, 5.0, 1.25) == pytest.approx(24.0 / 375.0, abs=1e-6)
+
+
+def test_friction_r_contracts_invariant(tmp_path):
+    _write_calibration(tmp_path, {
+        "per_underlying": {"QQQ": {"median_spread_pct_mid": 0.012}},
+    })
+    assert ec.friction_r("QQQ", 5.0, 1.25, contracts=1) == pytest.approx(
+        ec.friction_r("QQQ", 5.0, 1.25, contracts=3), abs=1e-9)
+
+
+def test_friction_r_validates_inputs():
+    with pytest.raises(ValueError):
+        ec.friction_r("SPY", 5.0, 0.0)          # no credit
+    with pytest.raises(ValueError):
+        ec.friction_r("SPY", 5.0, 5.0)          # credit >= width (no risk)
+    with pytest.raises(ValueError):
+        ec.friction_r("SPY", 5.0, -1.0)         # negative credit
+    with pytest.raises(ValueError):
+        ec.friction_r("SPY", 5.0, 1.25, contracts=0)

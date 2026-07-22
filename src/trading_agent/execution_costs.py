@@ -50,12 +50,23 @@ _CALIBRATION_FILENAME = "execution_costs.json"
 _calibrated: dict | None = None
 
 
+def _norm_underlying(underlying: str | None) -> str | None:
+    """'US.SPY' / 'spy' → 'SPY'; None stays None."""
+    if not underlying:
+        return None
+    u = str(underlying).strip().upper()
+    if u.startswith("US."):
+        u = u[3:]
+    return u or None
+
+
 def _load_calibration() -> dict:
     """Merge calibrated values over defaults. Lazy, once per process."""
     global _calibrated
     if _calibrated is not None:
         return _calibrated
     merged = dict(_DEFAULTS)
+    merged["per_underlying"] = {}
     try:
         from trading_agent.config import CONFIG
         path = Path(CONFIG.data_dir) / _CALIBRATION_FILENAME
@@ -65,6 +76,22 @@ def _load_calibration() -> dict:
                 v = raw.get(k)
                 if isinstance(v, (int, float)) and v >= 0:
                     merged[k] = float(v)
+            # M1-0.3 per-underlying spread calibration. Shape:
+            #   {"SPY": {"median_spread_pct_mid": 0.008, "n_quotes": 62,
+            #            "calibrated_at": "...", "zone": "..."}, ...}
+            # Only entries with a sane median (0 < x < 1, i.e. a fraction of
+            # mid, not a percentage) are kept — a malformed entry silently
+            # falls back to the global figure rather than poisoning costs.
+            pu = raw.get("per_underlying")
+            if isinstance(pu, dict):
+                for sym, entry in pu.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    v = entry.get("median_spread_pct_mid")
+                    key = _norm_underlying(sym)
+                    if key and isinstance(v, (int, float)) and 0 < v < 1:
+                        merged["per_underlying"][key] = {
+                            **entry, "median_spread_pct_mid": float(v)}
             log.info("execution_costs: calibration loaded from %s", path)
     except Exception as e:  # never let cost loading break a trade path
         log.warning("execution_costs: calibration load failed (%s) — defaults", e)
@@ -104,12 +131,19 @@ def half_spread_cost(
     *,
     bid: float | None = None,
     ask: float | None = None,
+    underlying: str | None = None,
 ) -> float:
     """Dollar cost of crossing half the spread at ``price`` for ``qty`` units.
 
     Uses the live quoted spread when bid/ask are both present and sane;
     otherwise falls back to the calibrated percent-of-mark estimate. Only
     call this for NON-dealt prices (marks, mids, virtual fills).
+
+    ``underlying`` (optional, options only): prefer that name's M1-0.3
+    per-underlying calibrated spread over the global figure — index chains
+    (SPY/QQQ) quote far tighter than the single-name watchlist median the
+    global number was calibrated on. Unknown/uncalibrated names fall back
+    to the global percent-of-mark; live bid/ask still wins over both.
     """
     c = _load_calibration()
     is_opt = str(asset_type).upper() == "OPT"
@@ -122,6 +156,11 @@ def half_spread_cost(
         half = (float(ask) - float(bid)) / 2.0
     else:
         pct = c["opt_half_spread_pct_of_mark"] if is_opt else c["stk_half_spread_pct_of_mark"]
+        if is_opt:
+            entry = c.get("per_underlying", {}).get(_norm_underlying(underlying) or "")
+            if entry:
+                # stored as FULL spread as fraction of mid → half-spread pct
+                pct = entry["median_spread_pct_mid"] / 2.0
         half = p * pct
     return round(half * q * mult, 4)
 
@@ -138,6 +177,7 @@ def round_trip_costs(
     entry_ask: float | None = None,
     exit_bid: float | None = None,
     exit_ask: float | None = None,
+    underlying: str | None = None,
 ) -> CostBreakdown:
     """Full friction stack for one round trip.
 
@@ -148,9 +188,11 @@ def round_trip_costs(
         entry_fees=fees_per_side(qty, asset_type),
         exit_fees=fees_per_side(qty, asset_type),
         entry_spread_cost=0.0 if entry_is_dealt else half_spread_cost(
-            entry_price, qty, asset_type, bid=entry_bid, ask=entry_ask),
+            entry_price, qty, asset_type, bid=entry_bid, ask=entry_ask,
+            underlying=underlying),
         exit_spread_cost=0.0 if exit_is_dealt else half_spread_cost(
-            exit_price, qty, asset_type, bid=exit_bid, ask=exit_ask),
+            exit_price, qty, asset_type, bid=exit_bid, ask=exit_ask,
+            underlying=underlying),
     )
 
 
@@ -167,6 +209,7 @@ def net_pnl(
     entry_ask: float | None = None,
     exit_bid: float | None = None,
     exit_ask: float | None = None,
+    underlying: str | None = None,
 ) -> tuple[float, CostBreakdown]:
     """``(gross − friction, breakdown)`` for one closed position."""
     costs = round_trip_costs(
@@ -175,6 +218,7 @@ def net_pnl(
         entry_is_dealt=entry_is_dealt, exit_is_dealt=exit_is_dealt,
         entry_bid=entry_bid, entry_ask=entry_ask,
         exit_bid=exit_bid, exit_ask=exit_ask,
+        underlying=underlying,
     )
     return round(float(gross_pnl) - costs.total, 2), costs
 
@@ -192,6 +236,49 @@ def round_trip_fee_per_unit(asset_type: str) -> float:
     return round(2.0 * c["stk_fee_per_share_per_side"], 6)
 
 
+def friction_r(
+    underlying: str | None,
+    width: float,
+    net_credit: float,
+    contracts: int = 1,
+) -> float:
+    """Modeled round-trip friction of a defined-risk credit vertical, in R.
+
+    ``R = max_loss = (width − net_credit)`` per contract-set (× 100 × qty in
+    dollars). The friction stack (REVIVAL_PLAN M1-0.3):
+
+    * **fees on 4 fills** — 2 legs × (open + close);
+    * **spread on 2 legs × 2 directions** — each leg crosses half the quoted
+      spread at entry AND at exit, at the per-underlying calibrated spread
+      (global percent-of-mark fallback when the name is uncalibrated).
+
+    Per-leg mark proxy: ``net_credit``. The true per-leg spread cost sums
+    over both leg mids (short + long); with only (width, net_credit) known we
+    charge each of the two legs at the net_credit mark, i.e. leg-mid-sum ≈
+    2 × net_credit. For short − long = net_credit and wing ratio
+    long/short = r this is exact at r = 1/3 (the typical 30-45 DTE vertical)
+    and conservative — overstates friction — for cheaper wings (r < 1/3).
+
+    Both the friction stack and R scale linearly in ``contracts``, so the
+    result is contracts-invariant; the parameter exists for call-site
+    clarity and future non-linear fee schedules.
+    """
+    w = float(width)
+    cr = float(net_credit)
+    n = int(contracts)
+    if n < 1:
+        raise ValueError(f"contracts must be >= 1, got {contracts}")
+    if not (0 < cr < w):
+        raise ValueError(
+            f"need 0 < net_credit < width for a credit vertical, "
+            f"got width={width}, net_credit={net_credit}")
+    fees = 4.0 * fees_per_side(n, "OPT")                    # 2 legs × 2 dirs
+    spread = 4.0 * half_spread_cost(                        # 2 legs × 2 dirs
+        cr, n, "OPT", underlying=underlying)
+    risk = (w - cr) * 100.0 * n
+    return round((fees + spread) / risk, 6)
+
+
 def reset_calibration_cache() -> None:
     """Test hook — force the next call to re-read data/execution_costs.json."""
     global _calibrated
@@ -201,6 +288,7 @@ def reset_calibration_cache() -> None:
 __all__ = [
     "CostBreakdown",
     "fees_per_side",
+    "friction_r",
     "half_spread_cost",
     "net_pnl",
     "reset_calibration_cache",
