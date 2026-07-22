@@ -34,7 +34,13 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ComboMeta:
-    """Parsed canonical combo payload for one journaled vertical."""
+    """Parsed canonical combo payload for one journaled vertical.
+
+    ``short_bid/short_ask/long_bid/long_ask`` are the per-leg ENTRY touch
+    captured from the R5d guard snapshots at placement time (payload key
+    ``leg_quotes``); None when the payload predates M1-0.2 or a side had no
+    quote. ``_sync_combo_entry`` uses them to clamp the journaled net
+    credit to "fill no better than the touch"."""
 
     short_leg: str
     long_leg: str
@@ -43,6 +49,10 @@ class ComboMeta:
     max_loss: float | None
     contracts: float
     broker_order_ids: tuple[str, ...]
+    short_bid: float | None = None
+    short_ask: float | None = None
+    long_bid: float | None = None
+    long_ask: float | None = None
 
 
 def _opt_float(v: Any) -> float | None:
@@ -76,6 +86,15 @@ def combo_meta(payload: Any) -> ComboMeta | None:
         order_ids = tuple(str(x) for x in raw_ids if x is not None)
     else:
         order_ids = ()
+
+    def _leg_quote(role: str, side: str) -> float | None:
+        lq = payload.get("leg_quotes")
+        entry = lq.get(role) if isinstance(lq, dict) else None
+        v = _opt_float(entry.get(side)) if isinstance(entry, dict) else None
+        # 0/negative means "no quote on that side" — same convention as
+        # order_guard._pos_float.
+        return v if v is not None and v > 0 else None
+
     return ComboMeta(
         short_leg=short_leg,
         long_leg=long_leg,
@@ -84,6 +103,10 @@ def combo_meta(payload: Any) -> ComboMeta | None:
         max_loss=_opt_float(payload.get("max_loss")),
         contracts=_opt_float(payload.get("contracts")) or 0.0,
         broker_order_ids=order_ids,
+        short_bid=_leg_quote("short", "bid"),
+        short_ask=_leg_quote("short", "ask"),
+        long_bid=_leg_quote("long", "bid"),
+        long_ask=_leg_quote("long", "ask"),
     )
 
 

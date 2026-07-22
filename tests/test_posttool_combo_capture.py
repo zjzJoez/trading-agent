@@ -97,6 +97,39 @@ def test_combo_journals_exactly_one_row(post_db, monkeypatch):
     assert payload_j["max_loss"] == 380.0
 
 
+def test_combo_payload_stores_entry_leg_quotes(post_db, monkeypatch):
+    """M1-0.2: the entry touch echoed by place_paper_option_combo
+    (leg_quotes) must land in BOTH stores' combo payloads so
+    _sync_combo_entry can clamp the journaled net credit; a response
+    without it (or malformed) stores None (fallback = calibrated spread)."""
+    from trading_agent.db import connection
+    lq = {"short": {"bid": 1.10, "ask": 1.30},
+          "long": {"bid": 0.28, "ask": 0.40}}
+    _PgCaptureCtx.calls = []
+    monkeypatch.setattr("trading_agent.store.postgres.cursor",
+                        lambda: _PgCaptureCtx())
+    tid = _insert_thesis("SPY")
+    rc = _run_post(monkeypatch, _combo_payload(thesis_id=tid, leg_quotes=lq))
+    assert rc == 0
+    with connection() as conn:
+        snaps = conn.execute("SELECT payload FROM market_snapshots").fetchall()
+    assert json.loads(snaps[0]["payload"])["leg_quotes"] == lq
+    inserts = [(sql, p) for sql, p in _PgCaptureCtx.calls
+               if "INSERT INTO journal_trades" in sql]
+    fill = json.loads(inserts[0][1][5])
+    assert fill["combo"]["leg_quotes"] == lq
+
+
+def test_combo_payload_leg_quotes_absent_stores_none(post_db, monkeypatch):
+    from trading_agent.db import connection
+    tid = _insert_thesis("SPY")
+    rc = _run_post(monkeypatch, _combo_payload(thesis_id=tid))
+    assert rc == 0
+    with connection() as conn:
+        snaps = conn.execute("SELECT payload FROM market_snapshots").fetchall()
+    assert json.loads(snaps[0]["payload"])["leg_quotes"] is None
+
+
 def test_combo_rollback_response_journals_nothing(post_db, monkeypatch):
     """A rolled-back combo (combo=False) must NOT create a trade row."""
     from trading_agent.db import connection

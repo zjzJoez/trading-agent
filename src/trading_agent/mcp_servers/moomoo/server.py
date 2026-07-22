@@ -745,6 +745,11 @@ def place_paper_option_combo(
         "net_credit": summary.get("net_credit"),
         "width": summary.get("width"),
         "max_loss": summary.get("max_loss"),
+        # Per-leg ENTRY touch ({short: {bid, ask}, long: {bid, ask}}) from
+        # the SAME R5d snapshots the guard just evaluated — the fill-capture
+        # hook persists these so _sync_combo_entry can clamp the journaled
+        # net credit to "fill no better than the touch" (M1-0.2).
+        "leg_quotes": summary.get("leg_quotes"),
         "combo_rows": long_rows + _df_records(df_s),
     }
 

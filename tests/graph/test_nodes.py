@@ -2803,7 +2803,14 @@ class TestSyncFillStatusCombo:
                    if c.args and "UPDATE journal_trades" in c.args[0]]
         assert updates == [], f"combo row must not sync one-legged: {updates}"
 
-    def test_sync_combo_both_legs_filled_sets_actual_net_credit(self):
+    def test_sync_combo_both_legs_filled_sets_honest_net_credit(self):
+        """M1-0.2: entry_price = the HONEST credit — each dealt leg clamped
+        to "fill no better than the touch" against the entry quotes in the
+        combo payload — with the raw dealt credit stored alongside."""
+        payload = dict(
+            self._combo_payload(),
+            leg_quotes={"short": {"bid": 2.00, "ask": 2.10},
+                        "long": {"bid": 0.80, "ask": 0.90}})
         pg = self._run([
             {"order_id": "L1", "code": self.LONG,
              "order_status": "FILLED_ALL", "dealt_qty": 2,
@@ -2811,12 +2818,17 @@ class TestSyncFillStatusCombo:
             {"order_id": "S1", "code": self.SHORT,
              "order_status": "FILLED_ALL", "dealt_qty": 2,
              "dealt_avg_price": 2.05},
-        ])
+        ], combo_payload=payload)
         updates = [c for c in pg.execute.call_args_list
                    if c.args and "UPDATE journal_trades" in c.args[0]]
         assert len(updates) == 1
-        # actual net credit = 2.05 − 0.85 = 1.20
-        assert updates[0].args[1][0] == pytest.approx(1.20)
+        params = updates[0].args[1]
+        # raw dealt credit = 2.05 − 0.85 = 1.20; honest = min(2.05, bid
+        # 2.00) − max(0.85, ask 0.90) = 1.10
+        honest, avg_fill, raw = params[0], params[1], params[2]
+        assert honest == pytest.approx(1.10)
+        assert avg_fill == pytest.approx(1.10)
+        assert raw == pytest.approx(1.20)
 
     def test_sync_combo_unparseable_payload_skips_single_order_branch(self):
         """Combo payload PRESENT but unparseable → fail closed: the single-

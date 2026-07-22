@@ -210,15 +210,17 @@ def test_e2e_50pct_profit_take_closes_atomically_with_net_of_legs_pnl():
     assert call["long_price"] == pytest.approx(round(0.20 * 0.98, 2))
     assert sim.single_leg_orders == []  # never the single-leg path
 
-    # both legs deal → settle: net_debit = 0.64 − 0.21 = 0.43
+    # both legs deal → settle. M1-0.2 honest clamp: BTC dealt 0.64 beats
+    # the quoted ask 0.65 → 0.65; STC dealt 0.21 beats the quoted bid
+    # 0.20 → 0.20. net_debit = 0.45 (raw 0.43).
     params = sim.finalize(short_dealt=0.64, long_dealt=0.21)
     assert params is not None, "full close must journal once both legs deal"
     dealt_price, outcome = params[0], params[1]
     net = params[8]
-    assert dealt_price == pytest.approx(0.43)
-    # gross (1.2 − 0.43) × 2 × 100 = 154; fees 4 entry + 4 exit (2 legs × 2
-    # contracts × $1 each way) → 146
-    assert net == pytest.approx(146.0)
+    assert dealt_price == pytest.approx(0.45)
+    # gross (1.2 − 0.45) × 2 × 100 = 150; fees 4 entry + 4 exit (2 legs × 2
+    # contracts × $1 each way) → 142
+    assert net == pytest.approx(142.0)
     assert outcome == "WIN"
 
 

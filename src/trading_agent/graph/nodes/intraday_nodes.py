@@ -54,13 +54,39 @@ def _order_status_of(order: dict | None) -> str:
                or order.get("order_status_str") or "").upper()
 
 
+def _honest_entry_leg(dealt_avg: float, touch: float | None, *,
+                      is_short: bool, underlying: str) -> float:
+    """Clamp one combo ENTRY leg's dealt price to "fill no better than the
+    touch" (M1-0.2 cost honesty).
+
+    Moomoo SIMULATE books limit orders at the caller's limit price — a
+    mid-priced entry "fills" at mid and never pays the spread. Honest
+    accounting caps the fill at the quoted touch captured at placement:
+      * short leg (we SOLD)   → can't receive more than the bid;
+      * long leg  (we BOUGHT) → can't pay less than the ask.
+    Missing touch → charge the calibrated per-underlying half-spread off
+    the dealt price instead (global percent-of-mark fallback). The clamp is
+    correct under either SIMULATE fill regime (books-at-limit or
+    books-at-touch) — see the M1-0.2 cost audit Q4."""
+    from trading_agent.execution_costs import half_spread_cost
+    if touch is not None and touch > 0:
+        return min(dealt_avg, touch) if is_short else max(dealt_avg, touch)
+    hs = half_spread_cost(dealt_avg, 1, "OPT", underlying=underlying) / 100.0
+    if is_short:
+        return max(0.0, dealt_avg - hs)
+    return dealt_avg + hs
+
+
 def _sync_combo_entry(cursor, trade_id, symbol, meta, order_map,
                       *, run_id: str, trigger: str) -> None:
     """Combo twin of the single-order entry sync (3a).
 
     Resolves BOTH leg orders from the canonical combo payload and:
-      * both FILLED_ALL → entry_price = short_dealt_avg − long_dealt_avg
-        (the ACTUAL net credit), stamp fill_synced;
+      * both FILLED_ALL → entry_price = the HONEST net credit:
+        clamp(short_dealt_avg) − clamp(long_dealt_avg), each leg capped at
+        the entry touch persisted in the combo payload (leg_quotes) via
+        _honest_entry_leg; the raw dealt credit is kept alongside in
+        broker_fill_json (entry_credit_raw / entry_credit_honest);
       * both dead      → outcome='UNFILLED' (same as single-leg);
       * mixed (one filled, one dead/absent) → sev-2 combo_entry_leg_mismatch,
         touch NOTHING (an operator problem, not a sync problem).
@@ -98,7 +124,16 @@ def _sync_combo_entry(cursor, trade_id, symbol, meta, order_map,
             return
         if s_avg <= 0 or l_avg <= 0:
             return
-        actual_credit = round(s_avg - l_avg, 4)
+        raw_credit = round(s_avg - l_avg, 4)
+        # M1-0.2 "fill no better than the touch": clamp each leg at the
+        # entry quote captured with the R5d guard snapshot; a leg with no
+        # quote is charged the calibrated per-underlying half-spread.
+        underlying = _bare_ticker(meta.short_leg)
+        honest_short = _honest_entry_leg(
+            s_avg, meta.short_bid, is_short=True, underlying=underlying)
+        honest_long = _honest_entry_leg(
+            l_avg, meta.long_ask, is_short=False, underlying=underlying)
+        honest_credit = round(honest_short - honest_long, 4)
         try:
             with cursor() as cur:
                 cur.execute(
@@ -110,10 +145,13 @@ def _sync_combo_entry(cursor, trade_id, symbol, meta, order_map,
                                'status', 'FILLED_ALL'::text,
                                'combo_fill_synced', TRUE,
                                'avg_fill_price', %s::numeric,
+                               'entry_credit_raw', %s::numeric,
+                               'entry_credit_honest', %s::numeric,
                                'fill_synced_at', NOW()::text)
                     WHERE id = %s AND outcome = 'OPEN'
                     """,
-                    (actual_credit, actual_credit, int(trade_id)),
+                    (honest_credit, honest_credit, raw_credit,
+                     honest_credit, int(trade_id)),
                 )
         except Exception as e:
             log.warning("[sync_fill_status] combo fill update id=%s failed: %s",
