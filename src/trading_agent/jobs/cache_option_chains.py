@@ -13,8 +13,11 @@ the strategies actually traded backtestable someday — "what would the
 other strike/expiry have cost" stops being unanswerable.
 
 Per underlying: spot quote → expiries in the 7-90 DTE band (max 4, spread
-across the band) → ~12 strikes each side of spot per expiry → batch quote
-for bid/ask/greeks/iv. One underlying failing (halted name, missing chain)
+across the band; core index names additionally force-include the expiry
+nearest 37 DTE — the middle of the sleeve-1 30-45 entry band — and the
+exact expiry of any OPEN journal option position on the name, capped at
+6) → ~12 strikes each side of spot per expiry → batch quote for
+bid/ask/greeks/iv. One underlying failing (halted name, missing chain)
 must not kill the run; rows commit per-underlying so a mid-run crash keeps
 everything captured so far.
 
@@ -34,7 +37,7 @@ import sys
 from datetime import date, datetime, timezone
 
 from trading_agent import events
-from trading_agent.order_guard import ticker_from_any_symbol
+from trading_agent.order_guard import OCC_RE, ticker_from_any_symbol
 from trading_agent.store import postgres
 
 log = logging.getLogger(__name__)
@@ -45,6 +48,16 @@ log = logging.getLogger(__name__)
 DTE_MIN, DTE_MAX = 7, 90
 MAX_EXPIRIES_PER_UNDERLYING = 4
 STRIKES_EACH_SIDE = 12
+# Sleeve 1 enters at 30-45 DTE. The 4 spread picks on a dense Mon/Wed/Fri
+# weekly calendar land near DTE {7, ~34, ~62, 90} — nothing GUARANTEES a
+# pick inside the entry band, and on a thin calendar the M1-0.4 replay gate
+# ("qualifying verticals exist on >=60% of snapshot days") would lose days
+# spuriously. Core names therefore force-include the in-window expiry
+# nearest the band's middle, plus any expiry actually held by an OPEN
+# journal option position (the held contract must get its nightly mark),
+# with a higher cap so the forced picks never evict the spread coverage.
+SLEEVE_DTE_TARGET = 37
+CORE_MAX_EXPIRIES = 6
 
 # Sleeve 1 (credit_vertical_index_30_45, docs/REVIVAL_PLAN_2026-07-20.md M1-0)
 # trades SPY/QQQ/IWM verticals — these indexes must be in EVERY nightly
@@ -166,6 +179,31 @@ def _shadow_underlyings() -> list[str]:
     return out
 
 
+def _held_option_expiries() -> dict[str, set[str]]:
+    """Expiries (ISO date strings) of OPEN journal OPTION positions, keyed
+    by underlying ticker. Once a position is open its specific expiry is
+    usually NOT among the 4 spread picks, so without this the held contract
+    would get no nightly snapshot mark — the exact post-mortem gap this job
+    exists to close. None from the store means UNKNOWN (PG unreachable);
+    for a cache job that degrades to empty, never fatal."""
+    rows = postgres.get_open_journal_trades()
+    out: dict[str, set[str]] = {}
+    for r in rows or []:
+        s = (r.get("symbol") or "").strip().upper()
+        if s.startswith("US."):
+            s = s[3:]
+        mm = OCC_RE.match(s)
+        if not mm:
+            continue  # stock position or unparseable — no expiry to pin
+        yymmdd = mm.group(2)
+        try:
+            exp = date(2000 + int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6]))
+        except ValueError:
+            continue
+        out.setdefault(mm.group(1), set()).add(exp.isoformat())
+    return out
+
+
 def build_underlying_set(override: str | None = None) -> list[str]:
     """Sorted, deduped underlying tickers for today's snapshot.
 
@@ -183,31 +221,66 @@ def build_underlying_set(override: str | None = None) -> list[str]:
                   | set(_shadow_underlyings()))
 
 
-def _pick_expiries(expiry_rows: list[dict], today: date) -> list[str]:
+def _pick_expiries(expiry_rows: list[dict], today: date, *,
+                   core: bool = False,
+                   held: frozenset[str] | set[str] = frozenset()) -> list[str]:
     """In-window expiries, at most MAX_EXPIRIES_PER_UNDERLYING, spread evenly
     across the DTE band (nearest + farthest always kept) rather than the
     first N — four weeklies in a row would leave the 30-90 DTE region,
-    where swing entries actually live, completely unpriced."""
-    in_window: list[str] = []
+    where swing entries actually live, completely unpriced.
+
+    Two force-includes on top of the spread picks (cap CORE_MAX_EXPIRIES for
+    core names so forcing never evicts spread coverage):
+    - core=True pins the in-window expiry nearest SLEEVE_DTE_TARGET, so a
+      dense weekly calendar is GUARANTEED a pick inside the sleeve-1 30-45
+      entry band instead of getting one probabilistically;
+    - ``held`` expiries (OPEN journal option positions on this underlying)
+      are kept whenever the broker still lists them and they haven't
+      expired — even outside the DTE window, because the held contract's
+      nightly mark matters most in its final week.
+    """
+    dte_by_exp: dict[str, int] = {}
     for row in expiry_rows:
         st = str(row.get("strike_time") or "")[:10]
         try:
             dte = (date.fromisoformat(st) - today).days
         except ValueError:
             continue
-        if DTE_MIN <= dte <= DTE_MAX:
-            in_window.append(st)
-    in_window.sort()
+        dte_by_exp[st] = dte
+    in_window = sorted(e for e, d in dte_by_exp.items() if DTE_MIN <= d <= DTE_MAX)
     n = len(in_window)
     if n <= MAX_EXPIRIES_PER_UNDERLYING:
-        return in_window
-    k = MAX_EXPIRIES_PER_UNDERLYING
-    idx = sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
-    return [in_window[i] for i in idx]
+        picked = list(in_window)
+    else:
+        k = MAX_EXPIRIES_PER_UNDERLYING
+        idx = sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+        picked = [in_window[i] for i in idx]
+
+    forced = {e for e in held if e in dte_by_exp and dte_by_exp[e] >= 0}
+    if core and in_window:
+        forced.add(min(in_window,
+                       key=lambda e: abs(dte_by_exp[e] - SLEEVE_DTE_TARGET)))
+
+    cap = CORE_MAX_EXPIRIES if core else MAX_EXPIRIES_PER_UNDERLYING
+    out = forced | set(picked)
+    if len(out) > cap:
+        # Forced picks always survive; spread picks fill the remaining
+        # slots nearest-first.
+        keep = set(forced)
+        for e in picked:
+            if len(keep) >= cap:
+                break
+            keep.add(e)
+        out = keep
+    return sorted(out)
 
 
-def snapshot_underlying(underlying: str, today: date) -> list[tuple]:
-    """Fetch one underlying's chain slice; return rows shaped for _INSERT_SQL.
+def snapshot_underlying(underlying: str, today: date,
+                        held_expiries: frozenset[str] | set[str] = frozenset(),
+                        ) -> tuple[list[tuple], int]:
+    """Fetch one underlying's chain slice; return (rows shaped for
+    _INSERT_SQL, count of expiries whose quote batches partially or wholly
+    failed).
 
     Raises on total failure (no spot, expiry list unreachable) so the caller
     counts it as a failed underlying; per-expiry hiccups are logged and
@@ -221,9 +294,12 @@ def snapshot_underlying(underlying: str, today: date) -> list[tuple]:
     if not spot or spot <= 0:
         raise RuntimeError(f"no spot price for {code}")
 
-    expiries = _pick_expiries(list_option_expiries(code).get("rows") or [], today)
+    expiries = _pick_expiries(list_option_expiries(code).get("rows") or [], today,
+                              core=underlying in CORE_UNDERLYINGS,
+                              held=held_expiries)
 
     rows: list[tuple] = []
+    partial_expiries = 0
     for exp in expiries:
         try:
             chain = get_option_chain(code, exp).get("rows") or []
@@ -256,16 +332,25 @@ def snapshot_underlying(underlying: str, today: date) -> list[tuple]:
                 by_code[c["code"]] = c
         if not keep:
             continue
-        try:
-            keep.sort()
-            quotes: list[dict] = []
-            for i in range(0, len(keep), _QUOTE_BATCH_MAX):
-                quotes.extend(
-                    get_quote(keep[i:i + _QUOTE_BATCH_MAX]).get("rows") or [])
-        except Exception as e:  # noqa: BLE001
-            log.warning("[cache_option_chains] %s %s option quotes failed: %s",
-                        underlying, exp, e)
-            continue
+        # Chunk failures are isolated: a transient hiccup on chunk 2 of 2
+        # must not discard the chunk-1 quotes already fetched (partial beats
+        # none — this module's own principle). A wholly-failed expiry just
+        # yields zero quotes and falls through the row loop.
+        keep.sort()
+        quotes: list[dict] = []
+        chunk_failed = False
+        for i in range(0, len(keep), _QUOTE_BATCH_MAX):
+            chunk = keep[i:i + _QUOTE_BATCH_MAX]
+            try:
+                quotes.extend(get_quote(chunk).get("rows") or [])
+            except Exception as e:  # noqa: BLE001
+                chunk_failed = True
+                log.warning(
+                    "[cache_option_chains] %s %s option quote chunk of %d "
+                    "failed (keeping other chunks): %s",
+                    underlying, exp, len(chunk), e)
+        if chunk_failed:
+            partial_expiries += 1
         for q in quotes:
             qcode = q.get("code") or ""
             ref = by_code.get(qcode, {})
@@ -290,7 +375,7 @@ def snapshot_underlying(underlying: str, today: date) -> list[tuple]:
                 _f(q.get("option_vega")),
                 _f(q.get("option_theta")),
             ))
-    return rows
+    return rows, partial_expiries
 
 
 def _insert_rows(rows: list[tuple]) -> None:
@@ -317,17 +402,25 @@ def main(argv: list[str] | None = None) -> int:
     run_id = events.new_run_id("chaincache")
 
     underlyings = build_underlying_set(args.underlyings)
+    # Held-position expiries are sourced even under --underlyings: the
+    # override picks WHICH names to snapshot; a held contract on one of
+    # those names still needs its exact expiry marked.
+    held_by_underlying = _held_option_expiries()
     per_underlying: dict[str, int] = {}
     failures: dict[str, str] = {}
+    partial_expiries: dict[str, int] = {}
     total_rows = 0
 
     try:
         for u in underlyings:
             try:
-                rows = snapshot_underlying(u, today)
+                rows, n_partial = snapshot_underlying(
+                    u, today, held_by_underlying.get(u, frozenset()))
                 if not args.dry_run and rows:
                     _insert_rows(rows)
                 per_underlying[u] = len(rows)
+                if n_partial:
+                    partial_expiries[u] = n_partial
                 total_rows += len(rows)
                 log.info("[cache_option_chains] %s: %d contracts", u, len(rows))
             except Exception as e:  # noqa: BLE001 — per-underlying isolation
@@ -349,9 +442,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         # One audit row per run. Every underlying failing means OpenD itself
         # is down/unreachable — that's a sev-2 (operator should look), a few
-        # individual misses are a warn.
+        # individual misses (including partially-quoted expiries) are a warn.
         severity = (events.SEV_ERROR if all_failed
-                    else events.SEV_WARN if failures else events.SEV_INFO)
+                    else events.SEV_WARN if (failures or partial_expiries)
+                    else events.SEV_INFO)
         events.emit(
             run_id=run_id, trigger="chain_cache", agent="cache_option_chains",
             event_type="chain_cache_complete",
@@ -361,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
                 "rows": total_rows,
                 "per_underlying": per_underlying,
                 "failures": failures,
+                "partial_expiries": partial_expiries,
                 "all_failed": all_failed,
             },
             severity=severity,
@@ -376,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         "rows": total_rows,
         "per_underlying": per_underlying,
         "failures": failures,
+        "partial_expiries": partial_expiries,
     }
     print(json.dumps(summary, indent=2, default=str))
     return 1 if all_failed else 0
