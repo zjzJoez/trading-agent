@@ -273,8 +273,41 @@ def test_e2e_p0b_regime_trim_closes_one_whole_unit_and_stays_open():
     assert len(trimmed) == 1
     p = trimmed[0]["payload"]
     assert p["net_debit"] == pytest.approx(0.80)
+    # No honest synced credit on this row → basis falls back to the
+    # requested meta.net_credit, and the payload says which was used.
+    assert p["net_credit"] == pytest.approx(1.2)
     # realized = (1.2 − 0.80) × 1 × 100 − 2-leg exit fees ($2) = 38
     assert p["realized"] == pytest.approx(38.0)
+
+
+def test_e2e_trim_realized_uses_honest_synced_entry_credit():
+    """combo_trimmed 'realized' must pair the CLAMPED exit debit with the
+    HONEST synced entry credit (broker_fill_json.entry_credit_honest via
+    the journal enrichment), never the requested meta.net_credit — the raw
+    credit would flatter the scale-out by exactly the entry spread charge.
+    The basis used is echoed in the payload (net_credit)."""
+    sim = _Sim(downsize_labels=["VOLATILE_TRANSITION"],
+               regime_label="VOLATILE_TRANSITION",
+               short_quote={"last_price": 0.90, "bid_price": 0.88,
+                            "ask_price": 0.93},
+               long_quote={"last_price": 0.20, "bid_price": 0.18,
+                           "ask_price": 0.22})
+    # PG returns broker_fill_json->>'entry_credit_honest' as TEXT.
+    sim.journal_row["entry_credit_honest"] = "1.05"
+    sim.run_intraday_tick()
+    assert sim.decisions[0]["action"] == "EXIT_REGIME_DOWNSIZE"
+    _tid, pending = sim.pending_writes[-1]
+    assert pending["settle_mode"] == "trim"
+    assert pending["net_credit"] == pytest.approx(1.05)
+
+    params = sim.finalize(short_dealt=0.95, long_dealt=0.15)
+    assert params is None                       # row stays OPEN (C8)
+    p = next(e for e in sim.events
+             if e.get("event_type") == "combo_trimmed")["payload"]
+    assert p["net_credit"] == pytest.approx(1.05)
+    assert p["net_debit"] == pytest.approx(0.80)
+    # realized = (1.05 − 0.80) × 1 × 100 − 2-leg exit fees ($2) = 23
+    assert p["realized"] == pytest.approx(23.0)
 
 
 def test_e2e_p0b_trim_qty1_skips_and_stamps_without_any_order():

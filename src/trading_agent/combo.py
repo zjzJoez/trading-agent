@@ -26,10 +26,22 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+def underlying_of(occ_symbol: str | None) -> str:
+    """'US.SPY261016P00100000' → 'SPY' (best-effort; bare symbol on miss).
+
+    Canonical OCC-symbol → underlying parser for combo code paths
+    (fill_confirm's per-underlying half-spread fallback, intraday_nodes'
+    ``_bare_ticker``) — one copy so the regex can never drift."""
+    s = str(occ_symbol or "").split(".", 1)[-1]
+    m = re.match(r"^([A-Z\.]+?)\d{6,8}[CP]\d+$", s)
+    return m.group(1) if m else s
 
 
 @dataclass(frozen=True)
@@ -183,4 +195,5 @@ __all__ = [
     "combo_meta",
     "open_combo_long_legs",
     "sqlite_combo_payloads",
+    "underlying_of",
 ]

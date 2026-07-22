@@ -424,6 +424,64 @@ def test_close_clamp_missing_quote_charges_half_spread(combo_db):
         0.55 + 0.55 * 0.005)
 
 
+def test_replace_leg_failed_requote_preserves_placement_touch(combo_db,
+                                                              monkeypatch):
+    """No fill is ever spread-charged twice: a failed re-quote (OpenD hiccup
+    → get_quote empty) must NOT wipe the placement-time touch off the leg.
+
+    The dealt tranche filled at a marketable spread-crossing limit
+    (ask × 1.02) — its price already embeds the spread. If the reprice
+    overwrote quoted_bid/quoted_ask with None, _honest_close_leg would take
+    the missing-quote fallback and charge the calibrated half-spread ON TOP
+    of that dealt price. With the touch preserved, the clamp is a no-op
+    against marketable fills: honest == blended dealt."""
+    from trading_agent.exits import fill_confirm as fc
+
+    state = _pending_close_state(2.0)
+    leg = next(l for l in state["legs"] if l["leg"] == "short_close")
+    # One tranche dealt at the marketable limit (ask 0.60 × 1.02) before
+    # the order died.
+    leg["dealt_legs"].append({"qty": 1.0, "price": 0.612})
+    leg["order_id"] = None
+
+    # OpenD hiccup: the fresh quote fetch fails → compounded limit off the
+    # old one, and NO quotes (the documented _fresh_marketable_exit
+    # degraded shape).
+    monkeypatch.setattr(
+        fc, "_fresh_marketable_exit",
+        lambda symbol, side, fallback: (round(fallback * 1.02, 2),
+                                        None, None))
+    monkeypatch.setattr(
+        "trading_agent.mcp_servers.moomoo.server.place_paper_option_order",
+        lambda **kw: {"rows": [{"order_id": "BTC-2"}]})
+    monkeypatch.setattr(fc, "emit", lambda **kw: None)
+
+    fc._replace_combo_leg(7, state, leg, "r", "t")
+    assert leg["order_id"] == "BTC-2"
+    # Placement-time touch preserved — not overwritten with None.
+    assert leg["quoted_bid"] == pytest.approx(0.50)
+    assert leg["quoted_ask"] == pytest.approx(0.60)
+
+    # The remainder deals at the compounded marketable limit; the blended
+    # dealt average must settle honest UNCHANGED (no fallback charge).
+    leg["dealt_legs"].append({"qty": 1.0, "price": 0.6242})
+    blended = fc._leg_avg_price(leg)
+    assert blended == pytest.approx(0.6181)
+    assert fc._honest_close_leg(leg, blended,
+                                is_buy=True) == pytest.approx(blended)
+
+    # A successful re-quote still refreshes the touch (staleness is only
+    # ever kept when the alternative is NO quote at all).
+    leg["qty"] = 3.0          # one more unit to close → re-place is live
+    leg["order_id"] = None
+    monkeypatch.setattr(
+        fc, "_fresh_marketable_exit",
+        lambda symbol, side, fallback: (0.66, 0.55, 0.65))
+    fc._replace_combo_leg(7, state, leg, "r", "t")
+    assert leg["quoted_bid"] == pytest.approx(0.55)
+    assert leg["quoted_ask"] == pytest.approx(0.65)
+
+
 # ---------------------------------------------------------------------------
 # _close_sqlite n_legs=1 hazard guard
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from trading_agent.combo import underlying_of as _underlying_of
 from trading_agent.events import emit
 
 log = logging.getLogger(__name__)
@@ -800,14 +801,6 @@ def _leg_avg_price(leg: dict) -> float | None:
     return sum(float(x["qty"]) * float(x["price"]) for x in legs) / total
 
 
-def _underlying_of(occ_symbol: str) -> str:
-    """'US.SPY261016P00100000' → 'SPY' (best-effort; bare symbol on miss)."""
-    import re
-    s = str(occ_symbol or "").split(".", 1)[-1]
-    m = re.match(r"^([A-Z\.]+?)\d{6,8}[CP]\d+$", s)
-    return m.group(1) if m else s
-
-
 def _honest_close_leg(leg: dict, dealt_avg: float, *, is_buy: bool) -> float:
     """Clamp one combo CLOSE leg's dealt avg to "fill no better than the
     touch" (M1-0.2 cost honesty), using the quote persisted in the pending
@@ -886,8 +879,16 @@ def _replace_combo_leg(trade_id: int, state: dict, leg: dict,
         leg.update({
             "order_id": new_id,
             "requested_exit_price": new_limit,
-            "quoted_bid": bid,
-            "quoted_ask": ask,
+            # A failed re-quote (OpenD hiccup → bid/ask None) must NOT wipe
+            # the placement-time touch: earlier tranches on this leg filled
+            # at marketable spread-crossing limits, and losing the quote
+            # would route _honest_close_leg into the half-spread fallback —
+            # charging the spread a SECOND time on prices that already
+            # embed it. A stale touch only makes the clamp a no-op against
+            # marketable dealt fills (correct); a leg quote-less from birth
+            # still falls through to the calibrated fallback.
+            "quoted_bid": bid if bid is not None else leg.get("quoted_bid"),
+            "quoted_ask": ask if ask is not None else leg.get("quoted_ask"),
             "placed_at": _now_iso(),
             "missing_ticks": 0,
         })
@@ -1172,6 +1173,13 @@ def _finalize_combo_close(trade_id: int, state: dict,
     # BTC the short at >= quoted ask, STC the long at <= quoted bid (quotes
     # persisted in the pending state at placement). No-op for today's
     # marketable limits; defense against better-than-touch SIMULATE fills.
+    # TODO(M1-0.3): clamp per TRANCHE, not per blended average — stamp the
+    # in-effect quoted_bid/quoted_ask into each dealt_legs entry when
+    # _advance_combo_leg appends it, and clamp each tranche against its own
+    # contemporaneous touch before averaging. Today, a partial fill + reprice
+    # + adverse move hoists early marketable tranches to the NEW touch via
+    # max(blended_avg, new_ask) — an overcharge bounded by the intra-close
+    # market move (conservative direction, so deferred, not forgotten).
     net_debit = round(
         _honest_close_leg(short_leg, short_avg, is_buy=True)
         - _honest_close_leg(long_leg, long_avg, is_buy=False), 4)
@@ -1185,6 +1193,12 @@ def _finalize_combo_close(trade_id: int, state: dict,
             exit_fees = fees_per_side(units, "OPT") * 2
         except Exception:
             exit_fees = 0.0
+        # state.net_credit is the HONEST synced entry credit when available
+        # (route reads pos.entry_credit_honest, falling back to the
+        # requested meta.net_credit for pre-M1-0.2 / pre-sync rows) — so
+        # 'realized' pairs like with like: honest credit − honest debit.
+        # Echoed into the payload so the P&L basis is auditable. Trim P&L
+        # stays event-only (C8: it never reaches the journal row).
         net_credit = float(state.get("net_credit") or 0)
         realized = round((net_credit - net_debit) * units * 100.0 - exit_fees, 2)
         _clear_pending(trade_id, state)
@@ -1193,6 +1207,7 @@ def _finalize_combo_close(trade_id: int, state: dict,
              payload={"trade_id": trade_id, "symbol": state.get("symbol"),
                       "units": units, "net_debit": net_debit,
                       "net_debit_raw": net_debit_raw,
+                      "net_credit": net_credit,
                       "realized": realized, "unconfirmed": unconfirmed})
         return
 

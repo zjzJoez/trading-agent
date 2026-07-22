@@ -29,12 +29,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _bare_ticker(code: str) -> str:
-    import re
-    if not code:
-        return ""
-    s = code.split(".", 1)[-1]
-    m = re.match(r"^([A-Z\.]+?)\d{6,8}[CP]\d+$", s)
-    return m.group(1) if m else s
+    from trading_agent.combo import underlying_of
+    return underlying_of(code)
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +572,16 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
         # enrichment merge and the row would silently manage as single-leg).
         combo_raw = row.get("combo")
         combo_parsed = combo_meta(combo_raw)
+        # Honest synced entry credit (broker_fill_json.entry_credit_honest,
+        # M1-0.2) — None for pre-sync / pre-M1-0.2 rows or non-combos. The
+        # combo close lane prefers it over meta.net_credit (the REQUESTED
+        # credit) so trim P&L never mixes a raw entry with a clamped exit.
+        try:
+            ech_raw = row.get("entry_credit_honest")
+            entry_credit_honest = (
+                float(ech_raw) if ech_raw is not None else None)
+        except (TypeError, ValueError):
+            entry_credit_honest = None
         out[str(symbol)] = {
             "trade_id": int(trade_id) if trade_id is not None else None,
             "thesis_id": int(thesis_id) if thesis_id is not None else None,
@@ -593,6 +599,7 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
             "invalidation": row.get("invalidation"),
             "combo": combo_parsed,
             "combo_unparseable": bool(combo_raw) and combo_parsed is None,
+            "entry_credit_honest": entry_credit_honest,
         }
     return out
 
@@ -748,6 +755,13 @@ def _merge_combo_positions(
         synth = dict(short_pos)
         synth["asset_type"] = "OPT"
         synth["qty"] = short_qty                 # whole spread units
+        # TODO(M1-0.3): prefer the honest synced credit (the journal row's
+        # entry_price / enrichment entry_credit_honest — already merged into
+        # short_pos) over meta.net_credit here, keeping net_credit as the
+        # pre-sync fallback. Today the 50%-PT / P&L% triggers fire against
+        # the flattering REQUESTED credit while the journal records the
+        # honest one — a deliberate hold-over (changes live exit timing;
+        # not a tonight change), tracked for the M1-0.3 round.
         synth["entry_price"] = meta.net_credit   # per-unit net credit
         synth["mark"] = spread_mark              # net-of-both-legs value
         synth["combo_legs"] = {"short": short_q, "long": long_q}
@@ -1177,13 +1191,25 @@ def _route_combo_close(
     short_oid = result.get("short_close_order_id") or None
     long_oid = (None if partial
                 else (result.get("long_close_order_id") or None))
+    # Trim P&L basis: the HONEST synced entry credit when the fill sync has
+    # run (pos.entry_credit_honest ← broker_fill_json), falling back to the
+    # requested meta.net_credit for pre-sync rows. Without this, the
+    # combo_trimmed 'realized' pairs a raw (better-than-touch) entry with
+    # the clamped exit debit — flattering by exactly the entry spread. The
+    # FULL-close path is unaffected (_settle re-reads the journal row's
+    # entry_price, which the sync already set to the honest credit).
+    try:
+        ech = pos.get("entry_credit_honest")
+        net_credit_basis = float(ech) if ech is not None else meta.net_credit
+    except (TypeError, ValueError):
+        net_credit_basis = meta.net_credit
     state = build_pending_combo_state(
         symbol=symbol,
         action=action,
         reason=reason,
         units=close_units,
         settle_mode="trim" if is_trim else "full",
-        net_credit=meta.net_credit,
+        net_credit=net_credit_basis,
         short_leg=meta.short_leg,
         long_leg=meta.long_leg,
         short_order_id=short_oid,
