@@ -29,12 +29,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _bare_ticker(code: str) -> str:
-    import re
-    if not code:
-        return ""
-    s = code.split(".", 1)[-1]
-    m = re.match(r"^([A-Z\.]+?)\d{6,8}[CP]\d+$", s)
-    return m.group(1) if m else s
+    from trading_agent.combo import underlying_of
+    return underlying_of(code)
 
 
 # ---------------------------------------------------------------------------
@@ -54,13 +50,39 @@ def _order_status_of(order: dict | None) -> str:
                or order.get("order_status_str") or "").upper()
 
 
+def _honest_entry_leg(dealt_avg: float, touch: float | None, *,
+                      is_short: bool, underlying: str) -> float:
+    """Clamp one combo ENTRY leg's dealt price to "fill no better than the
+    touch" (M1-0.2 cost honesty).
+
+    Moomoo SIMULATE books limit orders at the caller's limit price — a
+    mid-priced entry "fills" at mid and never pays the spread. Honest
+    accounting caps the fill at the quoted touch captured at placement:
+      * short leg (we SOLD)   → can't receive more than the bid;
+      * long leg  (we BOUGHT) → can't pay less than the ask.
+    Missing touch → charge the calibrated per-underlying half-spread off
+    the dealt price instead (global percent-of-mark fallback). The clamp is
+    correct under either SIMULATE fill regime (books-at-limit or
+    books-at-touch) — see the M1-0.2 cost audit Q4."""
+    from trading_agent.execution_costs import half_spread_cost
+    if touch is not None and touch > 0:
+        return min(dealt_avg, touch) if is_short else max(dealt_avg, touch)
+    hs = half_spread_cost(dealt_avg, 1, "OPT", underlying=underlying) / 100.0
+    if is_short:
+        return max(0.0, dealt_avg - hs)
+    return dealt_avg + hs
+
+
 def _sync_combo_entry(cursor, trade_id, symbol, meta, order_map,
                       *, run_id: str, trigger: str) -> None:
     """Combo twin of the single-order entry sync (3a).
 
     Resolves BOTH leg orders from the canonical combo payload and:
-      * both FILLED_ALL → entry_price = short_dealt_avg − long_dealt_avg
-        (the ACTUAL net credit), stamp fill_synced;
+      * both FILLED_ALL → entry_price = the HONEST net credit:
+        clamp(short_dealt_avg) − clamp(long_dealt_avg), each leg capped at
+        the entry touch persisted in the combo payload (leg_quotes) via
+        _honest_entry_leg; the raw dealt credit is kept alongside in
+        broker_fill_json (entry_credit_raw / entry_credit_honest);
       * both dead      → outcome='UNFILLED' (same as single-leg);
       * mixed (one filled, one dead/absent) → sev-2 combo_entry_leg_mismatch,
         touch NOTHING (an operator problem, not a sync problem).
@@ -98,7 +120,16 @@ def _sync_combo_entry(cursor, trade_id, symbol, meta, order_map,
             return
         if s_avg <= 0 or l_avg <= 0:
             return
-        actual_credit = round(s_avg - l_avg, 4)
+        raw_credit = round(s_avg - l_avg, 4)
+        # M1-0.2 "fill no better than the touch": clamp each leg at the
+        # entry quote captured with the R5d guard snapshot; a leg with no
+        # quote is charged the calibrated per-underlying half-spread.
+        underlying = _bare_ticker(meta.short_leg)
+        honest_short = _honest_entry_leg(
+            s_avg, meta.short_bid, is_short=True, underlying=underlying)
+        honest_long = _honest_entry_leg(
+            l_avg, meta.long_ask, is_short=False, underlying=underlying)
+        honest_credit = round(honest_short - honest_long, 4)
         try:
             with cursor() as cur:
                 cur.execute(
@@ -110,10 +141,13 @@ def _sync_combo_entry(cursor, trade_id, symbol, meta, order_map,
                                'status', 'FILLED_ALL'::text,
                                'combo_fill_synced', TRUE,
                                'avg_fill_price', %s::numeric,
+                               'entry_credit_raw', %s::numeric,
+                               'entry_credit_honest', %s::numeric,
                                'fill_synced_at', NOW()::text)
                     WHERE id = %s AND outcome = 'OPEN'
                     """,
-                    (actual_credit, actual_credit, int(trade_id)),
+                    (honest_credit, honest_credit, raw_credit,
+                     honest_credit, int(trade_id)),
                 )
         except Exception as e:
             log.warning("[sync_fill_status] combo fill update id=%s failed: %s",
@@ -538,6 +572,16 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
         # enrichment merge and the row would silently manage as single-leg).
         combo_raw = row.get("combo")
         combo_parsed = combo_meta(combo_raw)
+        # Honest synced entry credit (broker_fill_json.entry_credit_honest,
+        # M1-0.2) — None for pre-sync / pre-M1-0.2 rows or non-combos. The
+        # combo close lane prefers it over meta.net_credit (the REQUESTED
+        # credit) so trim P&L never mixes a raw entry with a clamped exit.
+        try:
+            ech_raw = row.get("entry_credit_honest")
+            entry_credit_honest = (
+                float(ech_raw) if ech_raw is not None else None)
+        except (TypeError, ValueError):
+            entry_credit_honest = None
         out[str(symbol)] = {
             "trade_id": int(trade_id) if trade_id is not None else None,
             "thesis_id": int(thesis_id) if thesis_id is not None else None,
@@ -555,6 +599,7 @@ def _load_journal_enrichment_by_symbol() -> dict[str, dict]:
             "invalidation": row.get("invalidation"),
             "combo": combo_parsed,
             "combo_unparseable": bool(combo_raw) and combo_parsed is None,
+            "entry_credit_honest": entry_credit_honest,
         }
     return out
 
@@ -710,6 +755,13 @@ def _merge_combo_positions(
         synth = dict(short_pos)
         synth["asset_type"] = "OPT"
         synth["qty"] = short_qty                 # whole spread units
+        # TODO(M1-0.3): prefer the honest synced credit (the journal row's
+        # entry_price / enrichment entry_credit_honest — already merged into
+        # short_pos) over meta.net_credit here, keeping net_credit as the
+        # pre-sync fallback. Today the 50%-PT / P&L% triggers fire against
+        # the flattering REQUESTED credit while the journal records the
+        # honest one — a deliberate hold-over (changes live exit timing;
+        # not a tonight change), tracked for the M1-0.3 round.
         synth["entry_price"] = meta.net_credit   # per-unit net credit
         synth["mark"] = spread_mark              # net-of-both-legs value
         synth["combo_legs"] = {"short": short_q, "long": long_q}
@@ -1139,13 +1191,25 @@ def _route_combo_close(
     short_oid = result.get("short_close_order_id") or None
     long_oid = (None if partial
                 else (result.get("long_close_order_id") or None))
+    # Trim P&L basis: the HONEST synced entry credit when the fill sync has
+    # run (pos.entry_credit_honest ← broker_fill_json), falling back to the
+    # requested meta.net_credit for pre-sync rows. Without this, the
+    # combo_trimmed 'realized' pairs a raw (better-than-touch) entry with
+    # the clamped exit debit — flattering by exactly the entry spread. The
+    # FULL-close path is unaffected (_settle re-reads the journal row's
+    # entry_price, which the sync already set to the honest credit).
+    try:
+        ech = pos.get("entry_credit_honest")
+        net_credit_basis = float(ech) if ech is not None else meta.net_credit
+    except (TypeError, ValueError):
+        net_credit_basis = meta.net_credit
     state = build_pending_combo_state(
         symbol=symbol,
         action=action,
         reason=reason,
         units=close_units,
         settle_mode="trim" if is_trim else "full",
-        net_credit=meta.net_credit,
+        net_credit=net_credit_basis,
         short_leg=meta.short_leg,
         long_leg=meta.long_leg,
         short_order_id=short_oid,

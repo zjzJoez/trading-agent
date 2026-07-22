@@ -144,7 +144,10 @@ def test_both_legs_filled_settles_net_debit_with_two_leg_fees(cap, monkeypatch):
     trade_id, qty, price, unconfirmed, n_legs = cap.settles[0]
     assert trade_id == 7
     assert qty == pytest.approx(2.0)
-    assert price == pytest.approx(0.64 - 0.21)   # net debit, net-of-legs
+    # M1-0.2 clamp: dealt 0.64 beats the quoted ask 0.65 on the BTC leg →
+    # honest short close = 0.65; dealt 0.21 beats the quoted bid 0.20 on
+    # the STC leg → honest long close = 0.20. net_debit = 0.45, raw 0.43.
+    assert price == pytest.approx(0.65 - 0.20)   # honest net debit
     assert unconfirmed is False
     assert n_legs == 2                            # 双腿双向 fee accounting
     types = cap.types()
@@ -152,7 +155,8 @@ def test_both_legs_filled_settles_net_debit_with_two_leg_fees(cap, monkeypatch):
     closed = next(e for e in cap.events
                   if e.get("event_type") == "position_closed")
     assert closed["payload"]["combo"] is True
-    assert closed["payload"]["exit_price"] == pytest.approx(0.43)
+    assert closed["payload"]["exit_price"] == pytest.approx(0.45)
+    assert closed["payload"]["net_debit_raw"] == pytest.approx(0.43)
 
 
 def test_net_pnl_two_leg_fee_arithmetic():
@@ -275,7 +279,9 @@ def test_vanished_leg_reconciles_per_leg_position(cap, fake_moomoo, monkeypatch)
     assert len(cap.settles) == 1
     _tid, qty, price, unconfirmed, n_legs = cap.settles[0]
     assert unconfirmed is True
-    assert price == pytest.approx(0.64 - 0.19)   # long settled at requested
+    # long settled at its requested price 0.19 (below the quoted bid 0.20 →
+    # clamp no-op); short dealt 0.64 clamps up to the quoted ask 0.65.
+    assert price == pytest.approx(0.65 - 0.19)
     assert "combo_close_leg_unconfirmed" in cap.types()
 
 
@@ -313,9 +319,12 @@ def test_trim_completion_leaves_row_open(cap, monkeypatch):
     assert cap.cleared == [7]                    # pending cleared
     trimmed = next(e for e in cap.events
                    if e.get("event_type") == "combo_trimmed")
-    # realized = (1.2 − 0.40)×1×100 − 2-leg exit fees (2×$1) = 78
-    assert trimmed["payload"]["net_debit"] == pytest.approx(0.40)
-    assert trimmed["payload"]["realized"] == pytest.approx(78.0)
+    # M1-0.2 clamp: BTC dealt 0.60 < quoted ask 0.65 → honest 0.65; STC
+    # dealt 0.20 = quoted bid → no-op. net_debit 0.45 (raw 0.40).
+    # realized = (1.2 − 0.45)×1×100 − 2-leg exit fees (2×$1) = 73
+    assert trimmed["payload"]["net_debit"] == pytest.approx(0.45)
+    assert trimmed["payload"]["net_debit_raw"] == pytest.approx(0.40)
+    assert trimmed["payload"]["realized"] == pytest.approx(73.0)
 
 
 def test_long_leg_replacement_passes_guard_or_alerts(cap, fake_moomoo, monkeypatch):
@@ -516,7 +525,8 @@ def test_full_settle_closes_sqlite_twin_and_frees_wing(cap, twin_db,
             "SELECT outcome, exit_price, pnl FROM trades WHERE id = ?",
             (tid,)).fetchone()
     assert row["outcome"] == "WIN"
-    assert row["exit_price"] == pytest.approx(0.43)
+    # honest net debit: 0.64 clamps up to ask 0.65, 0.21 down to bid 0.20
+    assert row["exit_price"] == pytest.approx(0.45)
     assert row["pnl"] == pytest.approx(146.0)
     assert long not in open_combo_long_legs()    # wing freed
 

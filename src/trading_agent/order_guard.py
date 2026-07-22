@@ -1064,6 +1064,12 @@ def evaluate_combo(
     # R5d liquidity on BOTH legs (each must independently pass). A combo only
     # opens, so liquidity always applies; the protective long wing gets the
     # same gate (a thin wing you can't price is a spread you skip).
+    # The same snapshots are echoed into proposed["leg_quotes"] (role-keyed
+    # {short: {bid, ask}, long: {bid, ask}}) so place_paper_option_combo can
+    # pass the ENTRY touch out to the fill-capture hook — _sync_combo_entry
+    # clamps the journaled net credit to "fill no better than the touch"
+    # (M1-0.2 cost honesty) against exactly these quotes.
+    entry_leg_quotes: dict[str, dict] = {}
     for leg in combo.legs:
         if leg_quotes is not None:
             q = leg_quotes.get(leg.option_symbol)
@@ -1072,7 +1078,14 @@ def evaluate_combo(
                 q = fetch_option_quote(leg.option_symbol)
             except Exception:
                 q = None
+        if isinstance(q, dict):
+            role = "short" if leg.side == "SELL" else "long"
+            entry_leg_quotes[role] = {
+                "bid": _pos_float(q.get("bid_price"), q.get("bid")),
+                "ask": _pos_float(q.get("ask_price"), q.get("ask")),
+            }
         vs += check_option_liquidity(leg.option_symbol, q)
+    proposed_summary["leg_quotes"] = entry_leg_quotes
 
     bs = blockers(vs)
     warns = tuple(f"{v.rule}: {v.message}" for v in vs if v.severity == "warn")

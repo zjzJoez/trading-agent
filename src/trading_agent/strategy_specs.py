@@ -47,6 +47,7 @@ def round_trip_friction_r(
     typical_premium: float,
     risk_per_unit: float,
     n_option_legs: int = 1,
+    underlying: str | None = None,
 ) -> float:
     """Round-trip friction expressed in R units (fraction of one risk unit).
 
@@ -56,6 +57,11 @@ def round_trip_friction_r(
     model charges on non-dealt prices). ``risk_per_unit`` is the dollar
     value of 1R for one contract(-set): premium × stop-fraction × 100 for
     single-leg long premium, (width − credit) × 100 for a vertical.
+
+    ``underlying`` (optional): use that name's M1-0.3 per-underlying
+    calibrated spread instead of the global percent-of-mark — index chains
+    (SPY/QQQ) quote far tighter than the pooled single-name median.
+    Uncalibrated/None falls back to the global figure unchanged.
     """
     if typical_premium <= 0 or risk_per_unit <= 0 or n_option_legs < 1:
         raise ValueError(
@@ -63,7 +69,8 @@ def round_trip_friction_r(
             f"risk={risk_per_unit}, legs={n_option_legs}"
         )
     fees = 2.0 * n_option_legs * fees_per_side(1, "OPT")
-    spread = 2.0 * n_option_legs * half_spread_cost(typical_premium, 1, "OPT")
+    spread = 2.0 * n_option_legs * half_spread_cost(
+        typical_premium, 1, "OPT", underlying=underlying)
     return (fees + spread) / risk_per_unit
 
 

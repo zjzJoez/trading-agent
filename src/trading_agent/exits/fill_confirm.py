@@ -39,6 +39,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from trading_agent.combo import underlying_of as _underlying_of
 from trading_agent.events import emit
 
 log = logging.getLogger(__name__)
@@ -388,11 +389,24 @@ def _net_pnl_for_close(
 def _settle(trade_id: int, state: dict, final_qty: float, final_price: float,
             *, unconfirmed: bool = False, n_legs: int = 1) -> tuple[bool, float]:
     """Close the journal row over the TOTAL dealt quantity (legs + final fill)
-    at the blended exit price. Returns (ok, net_pnl)."""
+    at the blended exit price. Returns (ok, net_pnl).
+
+    Combo states NEVER route to ``_close_sqlite``: its close path has no
+    ``n_legs`` and would silently charge single-leg fees (halving the
+    modeled exit cost of a vertical). Combos are only ever built with
+    ``source="postgres"`` (intraday_nodes' combo close lane); a sqlite-
+    sourced combo state is a bug — refuse to settle (fail closed, the row
+    stays OPEN and _finalize_combo_close logs the failed settle)."""
     total_qty, avg_price = _blended_exit(state, final_qty, final_price)
     if total_qty <= 0:
         return False, 0.0
     if state.get("source") == "sqlite":
+        if state.get("combo"):
+            log.error(
+                "_settle(%s): combo pending state with source='sqlite' — "
+                "unsupported (single-leg fee math would undercharge a "
+                "2-leg close); refusing to settle", trade_id)
+            return False, 0.0
         return _close_sqlite(trade_id, state, avg_price, total_qty,
                              unconfirmed=unconfirmed)
     return _close_pg(trade_id, state, avg_price, total_qty,
@@ -787,6 +801,35 @@ def _leg_avg_price(leg: dict) -> float | None:
     return sum(float(x["qty"]) * float(x["price"]) for x in legs) / total
 
 
+def _honest_close_leg(leg: dict, dealt_avg: float, *, is_buy: bool) -> float:
+    """Clamp one combo CLOSE leg's dealt avg to "fill no better than the
+    touch" (M1-0.2 cost honesty), using the quote persisted in the pending
+    state at placement time.
+
+      * BUY-to-close the short  → can't pay less than the quoted ask;
+      * SELL-to-close the long  → can't receive more than the quoted bid.
+
+    With today's marketable placement (ask×1.02 / bid×0.98 limits) the
+    clamp is normally a no-op — it is defense against SIMULATE booking a
+    better-than-touch price. A leg whose quote was missing at placement
+    (close limit came off the bare mark) is charged the calibrated
+    per-underlying half-spread instead. Correct under either SIMULATE fill
+    regime (books-at-limit or books-at-touch) — M1-0.2 cost audit Q4."""
+    from trading_agent.execution_costs import half_spread_cost
+    quote = leg.get("quoted_ask") if is_buy else leg.get("quoted_bid")
+    try:
+        q = float(quote) if quote is not None else None
+    except (TypeError, ValueError):
+        q = None
+    if q is not None and q > 0:
+        return max(dealt_avg, q) if is_buy else min(dealt_avg, q)
+    hs = half_spread_cost(dealt_avg, 1, "OPT",
+                          underlying=_underlying_of(leg.get("symbol"))) / 100.0
+    if is_buy:
+        return dealt_avg + hs
+    return max(0.0, dealt_avg - hs)
+
+
 def _replace_combo_leg(trade_id: int, state: dict, leg: dict,
                        run_id: str, trigger: str) -> None:
     """Place a fresh close order for one combo leg's not-yet-dealt remainder.
@@ -836,8 +879,16 @@ def _replace_combo_leg(trade_id: int, state: dict, leg: dict,
         leg.update({
             "order_id": new_id,
             "requested_exit_price": new_limit,
-            "quoted_bid": bid,
-            "quoted_ask": ask,
+            # A failed re-quote (OpenD hiccup → bid/ask None) must NOT wipe
+            # the placement-time touch: earlier tranches on this leg filled
+            # at marketable spread-crossing limits, and losing the quote
+            # would route _honest_close_leg into the half-spread fallback —
+            # charging the spread a SECOND time on prices that already
+            # embed it. A stale touch only makes the clamp a no-op against
+            # marketable dealt fills (correct); a leg quote-less from birth
+            # still falls through to the calibrated fallback.
+            "quoted_bid": bid if bid is not None else leg.get("quoted_bid"),
+            "quoted_ask": ask if ask is not None else leg.get("quoted_ask"),
             "placed_at": _now_iso(),
             "missing_ticks": 0,
         })
@@ -1082,7 +1133,11 @@ def _finalize_combo_close(trade_id: int, state: dict,
     legs are fully dealt (invariant: the journal row is never settled while
     any leg has a live broker order).
 
-    Settlement: ``net_debit = short_avg − long_avg`` (per-leg blended avgs).
+    Settlement: ``net_debit = clamp(short_avg) − clamp(long_avg)`` — per-leg
+    blended dealt avgs, each clamped to "fill no better than the touch"
+    against the placement-time quotes persisted in the pending state
+    (``_honest_close_leg``, M1-0.2); the raw unclamped debit is carried in
+    the emitted payloads as ``net_debit_raw``.
       * settle_mode "full" → journal close at dealt_price=net_debit,
         dealt_qty=units, 2-leg exit fees. SHORT side_opened math gives
         gross = (net_credit − net_debit) × qty × 100. Thesis flip as today.
@@ -1113,7 +1168,21 @@ def _finalize_combo_close(trade_id: int, state: dict,
     if short_avg is None or long_avg is None:
         write_pending_close(trade_id, state)
         return
-    net_debit = round(short_avg - long_avg, 4)
+    net_debit_raw = round(short_avg - long_avg, 4)
+    # M1-0.2 "fill no better than the touch", symmetric to the entry clamp:
+    # BTC the short at >= quoted ask, STC the long at <= quoted bid (quotes
+    # persisted in the pending state at placement). No-op for today's
+    # marketable limits; defense against better-than-touch SIMULATE fills.
+    # TODO(M1-0.3): clamp per TRANCHE, not per blended average — stamp the
+    # in-effect quoted_bid/quoted_ask into each dealt_legs entry when
+    # _advance_combo_leg appends it, and clamp each tranche against its own
+    # contemporaneous touch before averaging. Today, a partial fill + reprice
+    # + adverse move hoists early marketable tranches to the NEW touch via
+    # max(blended_avg, new_ask) — an overcharge bounded by the intra-close
+    # market move (conservative direction, so deferred, not forgotten).
+    net_debit = round(
+        _honest_close_leg(short_leg, short_avg, is_buy=True)
+        - _honest_close_leg(long_leg, long_avg, is_buy=False), 4)
     units = float(state.get("qty") or 0)
     unconfirmed = bool(short_leg.get("unconfirmed")
                        or long_leg.get("unconfirmed"))
@@ -1124,6 +1193,12 @@ def _finalize_combo_close(trade_id: int, state: dict,
             exit_fees = fees_per_side(units, "OPT") * 2
         except Exception:
             exit_fees = 0.0
+        # state.net_credit is the HONEST synced entry credit when available
+        # (route reads pos.entry_credit_honest, falling back to the
+        # requested meta.net_credit for pre-M1-0.2 / pre-sync rows) — so
+        # 'realized' pairs like with like: honest credit − honest debit.
+        # Echoed into the payload so the P&L basis is auditable. Trim P&L
+        # stays event-only (C8: it never reaches the journal row).
         net_credit = float(state.get("net_credit") or 0)
         realized = round((net_credit - net_debit) * units * 100.0 - exit_fees, 2)
         _clear_pending(trade_id, state)
@@ -1131,6 +1206,8 @@ def _finalize_combo_close(trade_id: int, state: dict,
              event_type="combo_trimmed",
              payload={"trade_id": trade_id, "symbol": state.get("symbol"),
                       "units": units, "net_debit": net_debit,
+                      "net_debit_raw": net_debit_raw,
+                      "net_credit": net_credit,
                       "realized": realized, "unconfirmed": unconfirmed})
         return
 
@@ -1148,7 +1225,8 @@ def _finalize_combo_close(trade_id: int, state: dict,
             payload={
                 "trade_id": trade_id, "symbol": state.get("symbol"),
                 "action": state.get("action"), "qty_closed": units,
-                "exit_price": net_debit, "net_pnl": net,
+                "exit_price": net_debit, "net_debit_raw": net_debit_raw,
+                "net_pnl": net,
                 "reason": state.get("reason"), "combo": True,
                 "fill_confirmed": not unconfirmed,
             },

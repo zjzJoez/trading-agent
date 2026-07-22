@@ -273,6 +273,14 @@ def main() -> int:
             "combo": True, "short_leg": short_sym, "long_leg": long_sym,
             "broker_order_ids": order_ids, "net_credit": net_credit,
             "width": width, "max_loss": max_loss, "contracts": contracts,
+            # Entry touch per leg ({short: {bid, ask}, long: {bid, ask}}),
+            # echoed by place_paper_option_combo from the R5d guard
+            # snapshots. _sync_combo_entry clamps the journaled net credit
+            # against these ("fill no better than the touch", M1-0.2);
+            # absent/None → it falls back to the calibrated half-spread.
+            "leg_quotes": (resp.get("leg_quotes")
+                           if isinstance(resp.get("leg_quotes"), dict)
+                           else None),
         }
         # Each store's write is independently try/excepted: a Mac-side
         # SQLite hiccup must NOT abort the Postgres dual-write — the PG row

@@ -259,6 +259,14 @@ def test_valid_combo_places_both_legs_long_first(stub_ctx, monkeypatch):
     assert resp["combo"] is True
     assert resp["net_credit"] == 2.0 - 0.8
     assert resp["max_loss"] == (5.0 - 1.2) * 100.0
+    # The guard-echoed per-leg ENTRY touch must survive the server's success
+    # dict verbatim — posttool_fill_capture persists it, and every entry
+    # would silently fall back to the calibrated half-spread if a refactor
+    # dropped this passthrough (M1-0.2 cost honesty).
+    assert resp["leg_quotes"] == {
+        "short": {"bid": 1.00, "ask": 1.02},
+        "long": {"bid": 1.00, "ask": 1.02},
+    }
     assert "rows" not in resp and len(resp["combo_rows"]) == 2
     # protective LONG leg placed FIRST, then the SHORT leg
     assert len(stub_ctx.place_order_calls) == 2

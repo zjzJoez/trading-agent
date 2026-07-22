@@ -210,15 +210,17 @@ def test_e2e_50pct_profit_take_closes_atomically_with_net_of_legs_pnl():
     assert call["long_price"] == pytest.approx(round(0.20 * 0.98, 2))
     assert sim.single_leg_orders == []  # never the single-leg path
 
-    # both legs deal → settle: net_debit = 0.64 − 0.21 = 0.43
+    # both legs deal → settle. M1-0.2 honest clamp: BTC dealt 0.64 beats
+    # the quoted ask 0.65 → 0.65; STC dealt 0.21 beats the quoted bid
+    # 0.20 → 0.20. net_debit = 0.45 (raw 0.43).
     params = sim.finalize(short_dealt=0.64, long_dealt=0.21)
     assert params is not None, "full close must journal once both legs deal"
     dealt_price, outcome = params[0], params[1]
     net = params[8]
-    assert dealt_price == pytest.approx(0.43)
-    # gross (1.2 − 0.43) × 2 × 100 = 154; fees 4 entry + 4 exit (2 legs × 2
-    # contracts × $1 each way) → 146
-    assert net == pytest.approx(146.0)
+    assert dealt_price == pytest.approx(0.45)
+    # gross (1.2 − 0.45) × 2 × 100 = 150; fees 4 entry + 4 exit (2 legs × 2
+    # contracts × $1 each way) → 142
+    assert net == pytest.approx(142.0)
     assert outcome == "WIN"
 
 
@@ -271,8 +273,41 @@ def test_e2e_p0b_regime_trim_closes_one_whole_unit_and_stays_open():
     assert len(trimmed) == 1
     p = trimmed[0]["payload"]
     assert p["net_debit"] == pytest.approx(0.80)
+    # No honest synced credit on this row → basis falls back to the
+    # requested meta.net_credit, and the payload says which was used.
+    assert p["net_credit"] == pytest.approx(1.2)
     # realized = (1.2 − 0.80) × 1 × 100 − 2-leg exit fees ($2) = 38
     assert p["realized"] == pytest.approx(38.0)
+
+
+def test_e2e_trim_realized_uses_honest_synced_entry_credit():
+    """combo_trimmed 'realized' must pair the CLAMPED exit debit with the
+    HONEST synced entry credit (broker_fill_json.entry_credit_honest via
+    the journal enrichment), never the requested meta.net_credit — the raw
+    credit would flatter the scale-out by exactly the entry spread charge.
+    The basis used is echoed in the payload (net_credit)."""
+    sim = _Sim(downsize_labels=["VOLATILE_TRANSITION"],
+               regime_label="VOLATILE_TRANSITION",
+               short_quote={"last_price": 0.90, "bid_price": 0.88,
+                            "ask_price": 0.93},
+               long_quote={"last_price": 0.20, "bid_price": 0.18,
+                           "ask_price": 0.22})
+    # PG returns broker_fill_json->>'entry_credit_honest' as TEXT.
+    sim.journal_row["entry_credit_honest"] = "1.05"
+    sim.run_intraday_tick()
+    assert sim.decisions[0]["action"] == "EXIT_REGIME_DOWNSIZE"
+    _tid, pending = sim.pending_writes[-1]
+    assert pending["settle_mode"] == "trim"
+    assert pending["net_credit"] == pytest.approx(1.05)
+
+    params = sim.finalize(short_dealt=0.95, long_dealt=0.15)
+    assert params is None                       # row stays OPEN (C8)
+    p = next(e for e in sim.events
+             if e.get("event_type") == "combo_trimmed")["payload"]
+    assert p["net_credit"] == pytest.approx(1.05)
+    assert p["net_debit"] == pytest.approx(0.80)
+    # realized = (1.05 − 0.80) × 1 × 100 − 2-leg exit fees ($2) = 23
+    assert p["realized"] == pytest.approx(23.0)
 
 
 def test_e2e_p0b_trim_qty1_skips_and_stamps_without_any_order():

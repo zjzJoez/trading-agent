@@ -664,6 +664,22 @@ def test_valid_credit_put_spread_combo_allowed(guard_db, monkeypatch):
     assert d.proposed["max_loss"] == (5.0 - 1.2) * 100.0  # 380
 
 
+def test_combo_proposed_echoes_entry_leg_quotes(guard_db, monkeypatch):
+    """M1-0.2: the R5d snapshots must be echoed into proposed['leg_quotes']
+    ({short: {bid, ask}, long: {bid, ask}}) so place_paper_option_combo can
+    hand the ENTRY touch to the fill-capture hook — _sync_combo_entry clamps
+    the journaled net credit against exactly these quotes."""
+    _insert_thesis("SPY")
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    d = _eval_combo(_combo_params())
+    assert d.allowed
+    lq = d.proposed["leg_quotes"]
+    assert lq == {
+        "short": {"bid": 1.00, "ask": 1.02},
+        "long": {"bid": 1.00, "ask": 1.02},
+    }
+
+
 def test_combo_requires_fresh_thesis(guard_db, monkeypatch):
     _patch_quote(monkeypatch, dict(GOOD_QUOTE))
     d = _eval_combo(_combo_params())  # no thesis inserted

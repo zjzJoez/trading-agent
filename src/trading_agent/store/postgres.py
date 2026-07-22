@@ -238,6 +238,7 @@ def get_open_journal_trades() -> list[dict] | None:
             t.opened_at, t.thesis_id,
             t.broker_fill_json->>'strategy_label' AS strategy_label,
             t.broker_fill_json->'combo' AS combo,
+            t.broker_fill_json->>'entry_credit_honest' AS entry_credit_honest,
             th.direction, th.thesis_text, th.invalidation,
             th.status AS thesis_status
         FROM journal_trades t
