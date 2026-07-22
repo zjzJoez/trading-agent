@@ -4,8 +4,10 @@ Moomoo's free tier has no historical option quotes — once a session ends,
 the chain the agent saw is gone. This job runs after US close (systemd
 timer, 21:15 UTC weekdays, before the 21:30 eod_review) and persists a
 near-the-money slice of every chain the system could plausibly trade:
-today's watchlist UNION the underlyings of OPEN journal trades UNION the
-underlyings of today's SHADOW_ONLY proposals (the retired-strategy
+the CORE_UNDERLYINGS index set (SPY/QQQ/IWM — sleeve 1 needs those chains
+daily, with a wider ±15%-of-spot strike window) UNION today's watchlist
+UNION the underlyings of OPEN journal trades UNION the underlyings of
+today's SHADOW_ONLY proposals (the retired-strategy
 counterfactual book must have its contracts priced). That makes
 the strategies actually traded backtestable someday — "what would the
 other strike/expiry have cost" stops being unanswerable.
@@ -43,6 +45,21 @@ log = logging.getLogger(__name__)
 DTE_MIN, DTE_MAX = 7, 90
 MAX_EXPIRIES_PER_UNDERLYING = 4
 STRIKES_EACH_SIDE = 12
+
+# Sleeve 1 (credit_vertical_index_30_45, docs/REVIVAL_PLAN_2026-07-20.md M1-0)
+# trades SPY/QQQ/IWM verticals — these indexes must be in EVERY nightly
+# snapshot regardless of what the rotating watchlist holds (SPY had 4 days
+# of history, QQQ 1, IWM 4 when this gap was found). The DTE band above
+# already spans the 30-45 sleeve window and the ~60 DTE roll tail; strikes,
+# however, need ±15% of spot (a 30-delta short leg + further-OTM long leg
+# sit well outside the nearest-12 band on a $600 index), so the core set
+# gets a percent-of-spot strike window instead of nearest-N-only.
+CORE_UNDERLYINGS = ("SPY", "QQQ", "IWM")
+CORE_STRIKE_PCT = 0.15
+
+# moomoo's get_market_snapshot caps codes per request (400 on the free
+# tier); the core strike window can push one expiry past that, so batch.
+_QUOTE_BATCH_MAX = 300
 
 _INSERT_SQL = """
     INSERT INTO option_chain_snapshots
@@ -150,10 +167,18 @@ def _shadow_underlyings() -> list[str]:
 
 
 def build_underlying_set(override: str | None = None) -> list[str]:
-    """Sorted, deduped underlying tickers for today's snapshot."""
+    """Sorted, deduped underlying tickers for today's snapshot.
+
+    CORE_UNDERLYINGS are always present in the sourced set — sleeve 1 needs
+    SPY/QQQ/IWM chain history every day even when the rotating watchlist,
+    the journal, and the shadow book contain none of them. An explicit
+    --underlyings override stays a pure override (a targeted manual re-run
+    must be able to snapshot exactly the names asked for).
+    """
     if override:
         return sorted({t.strip().upper() for t in override.split(",") if t.strip()})
-    return sorted(set(_watchlist_underlyings())
+    return sorted(set(CORE_UNDERLYINGS)
+                  | set(_watchlist_underlyings())
                   | set(_open_trade_underlyings())
                   | set(_shadow_underlyings()))
 
@@ -208,18 +233,35 @@ def snapshot_underlying(underlying: str, today: date) -> list[tuple]:
             continue
         chain = [c for c in chain if c.get("code") and _f(c.get("strike_price"))]
         # Nearest STRIKES_EACH_SIDE strikes per side — the band that trades.
+        # Core (sleeve-1 index) names instead take every strike within
+        # ±CORE_STRIKE_PCT of spot, floored at the nearest-N band so a
+        # coarse chain can never leave a core name with LESS than default.
+        is_core = underlying in CORE_UNDERLYINGS
+        band = CORE_STRIKE_PCT * spot
         by_code: dict[str, dict] = {}
         keep: list[str] = []
         for side in ("CALL", "PUT"):
             side_rows = [c for c in chain if (c.get("option_type") or c.get("type")) == side]
             side_rows.sort(key=lambda c: abs(float(c["strike_price"]) - spot))
-            for c in side_rows[:STRIKES_EACH_SIDE]:
+            selected = side_rows[:STRIKES_EACH_SIDE]
+            if is_core:
+                # side_rows is distance-sorted, so the pct window is a
+                # prefix; take the longer of the two selections.
+                in_band = [c for c in side_rows
+                           if abs(float(c["strike_price"]) - spot) <= band]
+                if len(in_band) > len(selected):
+                    selected = in_band
+            for c in selected:
                 keep.append(c["code"])
                 by_code[c["code"]] = c
         if not keep:
             continue
         try:
-            quotes = get_quote(sorted(keep)).get("rows") or []
+            keep.sort()
+            quotes: list[dict] = []
+            for i in range(0, len(keep), _QUOTE_BATCH_MAX):
+                quotes.extend(
+                    get_quote(keep[i:i + _QUOTE_BATCH_MAX]).get("rows") or [])
         except Exception as e:  # noqa: BLE001
             log.warning("[cache_option_chains] %s %s option quotes failed: %s",
                         underlying, exp, e)

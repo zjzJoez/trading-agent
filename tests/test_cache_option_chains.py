@@ -251,7 +251,8 @@ def test_underlying_set_unions_watchlist_and_open_journal(monkeypatch):
         "trading_agent.store.postgres.get_open_journal_trades",
         lambda: [{"symbol": "US.QQQ260626C734000"}, {"symbol": "US.SPY"}],
     )
-    assert m.build_underlying_set() == ["AAPL", "QQQ", "SPY"]
+    # IWM arrives via CORE_UNDERLYINGS; SPY/QQQ dedupe against it.
+    assert m.build_underlying_set() == ["AAPL", "IWM", "QQQ", "SPY"]
 
 
 def test_underlying_set_includes_todays_shadow_book(monkeypatch):
@@ -262,7 +263,7 @@ def test_underlying_set_includes_todays_shadow_book(monkeypatch):
     monkeypatch.setattr(m, "_shadow_underlyings", lambda: ["CRNX"])
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades", lambda: [])
-    assert m.build_underlying_set() == ["CRNX", "SPY"]
+    assert m.build_underlying_set() == ["CRNX", "IWM", "QQQ", "SPY"]
 
 
 def test_shadow_underlyings_store_failure_is_empty(monkeypatch):
@@ -281,7 +282,7 @@ def test_underlying_set_journal_unreadable_falls_back_to_watchlist(monkeypatch):
     monkeypatch.setattr(m, "_shadow_underlyings", lambda: [])
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades", lambda: None)
-    assert m.build_underlying_set() == ["SPY"]
+    assert m.build_underlying_set() == ["IWM", "QQQ", "SPY"]
 
 
 def test_underlyings_override_skips_sourcing(monkeypatch):
@@ -295,6 +296,94 @@ def test_underlyings_override_skips_sourcing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Core (sleeve 1) index set — always cached, wider strike window
+# ---------------------------------------------------------------------------
+
+def test_core_set_present_with_empty_watchlist(monkeypatch):
+    """Sleeve 1 needs SPY/QQQ/IWM chain history daily even when the rotating
+    watchlist, journal, and shadow book contain none of them."""
+    monkeypatch.setattr(m, "_watchlist_underlyings", lambda: [])
+    monkeypatch.setattr(m, "_shadow_underlyings", lambda: [])
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.get_open_journal_trades", lambda: [])
+    assert m.build_underlying_set() == ["IWM", "QQQ", "SPY"]
+
+
+def test_core_window_constants_cover_sleeve():
+    """The snapshot window must span the sleeve-1 trade band: expiries out to
+    ~60 DTE (entries at 30-45 plus the roll tail) and strikes to ±15% of
+    spot for the index names."""
+    assert m.DTE_MIN <= 30 and m.DTE_MAX >= 60
+    assert m.CORE_STRIKE_PCT >= 0.15
+    assert set(m.CORE_UNDERLYINGS) == {"SPY", "QQQ", "IWM"}
+
+
+def test_core_underlying_gets_pct_of_spot_strike_window(monkeypatch, pg, emits, frozen_today):
+    """A core index name keeps every strike within ±15% of spot — well past
+    the nearest-12 band a watchlist single name gets."""
+    calls: dict = {}
+    market = _fake_market(spot=100.0, n_strikes_each_side=40, calls=calls)
+    _wire(monkeypatch, market)
+
+    assert m.main(["--underlyings", "SPY"]) == 0
+
+    option_batches = [b for b in calls["quote_batches"] if b != ["US.SPY"]]
+    codes = [c for b in option_batches for c in b]
+    strikes = sorted(_code_parts(c)[1] for c in codes)
+    # $1 grid straddling 100 → 30 strikes per side inside ±15%, both sides.
+    assert len(codes) == 60
+    assert strikes[0] == 85.5 and strikes[-1] == 114.5
+    assert all(abs(k - 100.0) <= 15.0 for k in strikes)
+    # And the window genuinely widened past the nearest-12 default.
+    assert any(abs(k - 100.0) > 6.5 for k in strikes)
+
+    inserts = [p for sql, p in pg.executes
+               if "INSERT INTO option_chain_snapshots" in sql]
+    assert len(inserts) == 60
+
+
+def test_core_quote_batches_respect_snapshot_cap(monkeypatch, pg, emits, frozen_today):
+    """The widened core window can exceed moomoo's per-request snapshot cap;
+    option quotes must go out in chunks of at most _QUOTE_BATCH_MAX."""
+    calls: dict = {}
+    market = _fake_market(spot=1000.0, n_strikes_each_side=400, calls=calls)
+    _wire(monkeypatch, market)
+
+    assert m.main(["--underlyings", "QQQ"]) == 0
+
+    option_batches = [b for b in calls["quote_batches"] if b != ["US.QQQ"]]
+    assert len(option_batches) > 1
+    assert all(len(b) <= m._QUOTE_BATCH_MAX for b in option_batches)
+    codes = [c for b in option_batches for c in b]
+    # ±15% of 1000 on a $1 grid → 300 strikes per side, none lost to chunking.
+    assert len(codes) == len(set(codes)) == 600
+    inserts = [p for sql, p in pg.executes
+               if "INSERT INTO option_chain_snapshots" in sql]
+    assert len(inserts) == 600
+
+
+def test_one_core_failure_does_not_skip_other_core(monkeypatch, pg, emits, frozen_today):
+    """Sourced (no override) run: SPY's spot failing must still leave QQQ and
+    IWM fully snapped — one core name down cannot blank the sleeve's data."""
+    market = _fake_market(spot=100.0, fail_spot_for={"SPY"})
+    _wire(monkeypatch, market)
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.get_open_journal_trades", lambda: [])
+
+    assert m.main([]) == 0
+
+    inserts = [p for sql, p in pg.executes
+               if "INSERT INTO option_chain_snapshots" in sql]
+    # Default fake grid spans ±20 → 15 strikes/side inside ±15% x2 sides = 60.
+    assert {p[1] for p in inserts} == {"QQQ", "IWM"}
+    assert len(emits) == 1
+    payload = emits[0]["payload"]
+    assert set(payload["failures"]) == {"SPY"}
+    assert payload["per_underlying"] == {"IWM": 60, "QQQ": 60}
+    assert emits[0]["severity"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Failure isolation + all-failed escalation
 # ---------------------------------------------------------------------------
 
@@ -302,16 +391,16 @@ def test_one_underlying_failing_does_not_kill_the_run(monkeypatch, pg, emits, fr
     market = _fake_market(spot=100.0, fail_spot_for={"AAPL"})
     _wire(monkeypatch, market)
 
-    assert m.main(["--underlyings", "AAPL,QQQ"]) == 0
+    assert m.main(["--underlyings", "AAPL,MSFT"]) == 0
 
     inserts = [p for sql, p in pg.executes if "INSERT INTO option_chain_snapshots" in sql]
-    assert len(inserts) == 24                      # QQQ snapped fine
-    assert all(p[1] == "QQQ" for p in inserts)
+    assert len(inserts) == 24                      # MSFT snapped fine
+    assert all(p[1] == "MSFT" for p in inserts)
 
     assert len(emits) == 1
     payload = emits[0]["payload"]
     assert "AAPL" in payload["failures"]
-    assert payload["per_underlying"] == {"QQQ": 24}
+    assert payload["per_underlying"] == {"MSFT": 24}
     assert emits[0]["severity"] == 1               # partial failure = warn
 
 
