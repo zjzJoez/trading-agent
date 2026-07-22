@@ -76,7 +76,12 @@ def _collect_spreads(tickers: list[str]) -> list[dict]:
                 try:
                     bid = float(r.get("bid_price") or r.get("bid") or 0)
                     ask = float(r.get("ask_price") or r.get("ask") or 0)
-                    delta = abs(float(r.get("delta") or 0))
+                    # Real moomoo get_market_snapshot rows carry the greek as
+                    # ``option_delta``; ``delta`` is the legacy fallback. (The
+                    # 2026-06 global calibration ran with the dead ``delta``
+                    # read, so its delta gate never fired — the strike
+                    # prefilter alone bounded that sample.)
+                    delta = abs(float(r.get("option_delta") or r.get("delta") or 0))
                 except (TypeError, ValueError):
                     continue
                 if bid <= 0 or ask <= bid:
