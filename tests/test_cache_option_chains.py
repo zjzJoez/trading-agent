@@ -240,6 +240,102 @@ def test_expiry_dte_filter_and_cap(frozen_today):
     assert (TODAY + timedelta(days=120)).isoformat() not in picked
 
 
+def _exp_rows(dtes):
+    return [{"strike_time": (TODAY + timedelta(days=d)).isoformat()} for d in dtes]
+
+
+def test_core_pick_guarantees_sleeve_entry_band_expiry():
+    """Dense Mon/Wed/Fri weekly calendar: the 4 spread picks land near DTE
+    {7, ~34, ~62, 90} only PROBABILISTICALLY inside 30-45; core names must
+    be GUARANTEED one — the M1-0.4 replay gate counts days on it."""
+    weekly_dtes = [d for d in range(1, 101)
+                   if (TODAY + timedelta(days=d)).weekday() in (0, 2, 4)]
+    rows = _exp_rows(weekly_dtes)
+    picked = m._pick_expiries(rows, TODAY, core=True)
+    dtes = [(date.fromisoformat(e) - TODAY).days for e in picked]
+    assert any(30 <= d <= 45 for d in dtes)
+    assert len(picked) <= m.CORE_MAX_EXPIRIES
+    # Spread anchors survive the forcing.
+    assert min(dtes) == min(d for d in weekly_dtes if d >= m.DTE_MIN)
+    assert max(dtes) == max(d for d in weekly_dtes if d <= m.DTE_MAX)
+
+
+def test_core_pick_pins_nearest_37_on_thin_calendar():
+    """Thin calendar where the spread picks {7,21,55,90} all miss 30-45:
+    core forcing adds the expiry nearest SLEEVE_DTE_TARGET; non-core
+    keeps the plain spread pick."""
+    dtes = [7, 14, 21, 28, 37, 55, 75, 90]
+    rows = _exp_rows(dtes)
+    exp_37 = (TODAY + timedelta(days=37)).isoformat()
+    assert exp_37 not in m._pick_expiries(rows, TODAY)            # spread misses it
+    picked = m._pick_expiries(rows, TODAY, core=True)
+    assert exp_37 in picked
+    assert len(picked) == 5
+
+
+def test_held_expiry_forced_even_outside_dte_window():
+    """An OPEN journal position's expiry is kept whenever the broker still
+    lists it — including DTE < 7, where the nightly mark matters most —
+    but an expiry the broker no longer lists is ignored."""
+    dtes = [4, 7, 14, 21, 28, 37, 55, 75, 90]
+    rows = _exp_rows(dtes)
+    exp_4 = (TODAY + timedelta(days=4)).isoformat()
+    exp_14 = (TODAY + timedelta(days=14)).isoformat()
+    unlisted = (TODAY + timedelta(days=33)).isoformat()
+
+    base = m._pick_expiries(rows, TODAY)
+    assert exp_4 not in base and exp_14 not in base
+
+    picked = m._pick_expiries(rows, TODAY, core=True, held={exp_4, exp_14, unlisted})
+    assert exp_4 in picked and exp_14 in picked
+    assert unlisted not in picked
+    assert len(picked) <= m.CORE_MAX_EXPIRIES
+
+
+def test_held_option_expiries_parsed_from_journal(monkeypatch):
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.get_open_journal_trades",
+        lambda: [{"symbol": "US.QQQ260814C600000"},
+                 {"symbol": "US.QQQ260918P550000"},
+                 {"symbol": "US.SPY"},          # stock — no expiry
+                 {"symbol": "garbage"},
+                 {}])
+    assert m._held_option_expiries() == {
+        "QQQ": {"2026-08-14", "2026-09-18"}}
+    # Unreachable store (None) degrades to empty, never raises.
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.get_open_journal_trades", lambda: None)
+    assert m._held_option_expiries() == {}
+
+
+def test_main_snapshots_held_and_sleeve_band_expiries(monkeypatch, pg, emits, frozen_today):
+    """End-to-end: a held QQQ contract's expiry (DTE 14, not a spread pick)
+    and the ~37 DTE sleeve-band expiry both land in the snapshot."""
+    calls: dict = {}
+    get_quote, _default_exp, chain = _fake_market(spot=100.0, calls=calls)
+    dtes = [7, 14, 21, 28, 37, 55, 75, 90]
+
+    def expiries_fn(underlying):
+        return {"rows": [{"strike_time": (TODAY + timedelta(days=d)).isoformat()}
+                         for d in dtes]}
+
+    held_symbol = "US.QQQ" + (TODAY + timedelta(days=14)).strftime("%y%m%d") + "C100000"
+    _wire(monkeypatch, (get_quote, expiries_fn, chain),
+          journal_rows=[{"symbol": held_symbol}])
+
+    assert m.main(["--underlyings", "QQQ"]) == 0
+
+    inserts = [p for sql, p in pg.executes
+               if "INSERT INTO option_chain_snapshots" in sql]
+    snapped_expiries = {p[4] for p in inserts}
+    # 4 spread picks (7,21,55,90) + forced 37 (sleeve band) + forced 14 (held).
+    assert snapped_expiries == {TODAY + timedelta(days=d)
+                                for d in (7, 14, 21, 37, 55, 90)}
+    assert len(snapped_expiries) == m.CORE_MAX_EXPIRIES
+    # Core strike window: 30 strikes/side inside ±15% x 2 sides = 60/expiry.
+    assert len(inserts) == 6 * 60
+
+
 # ---------------------------------------------------------------------------
 # Underlying set
 # ---------------------------------------------------------------------------
@@ -251,7 +347,8 @@ def test_underlying_set_unions_watchlist_and_open_journal(monkeypatch):
         "trading_agent.store.postgres.get_open_journal_trades",
         lambda: [{"symbol": "US.QQQ260626C734000"}, {"symbol": "US.SPY"}],
     )
-    assert m.build_underlying_set() == ["AAPL", "QQQ", "SPY"]
+    # IWM arrives via CORE_UNDERLYINGS; SPY/QQQ dedupe against it.
+    assert m.build_underlying_set() == ["AAPL", "IWM", "QQQ", "SPY"]
 
 
 def test_underlying_set_includes_todays_shadow_book(monkeypatch):
@@ -262,7 +359,7 @@ def test_underlying_set_includes_todays_shadow_book(monkeypatch):
     monkeypatch.setattr(m, "_shadow_underlyings", lambda: ["CRNX"])
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades", lambda: [])
-    assert m.build_underlying_set() == ["CRNX", "SPY"]
+    assert m.build_underlying_set() == ["CRNX", "IWM", "QQQ", "SPY"]
 
 
 def test_shadow_underlyings_store_failure_is_empty(monkeypatch):
@@ -281,7 +378,7 @@ def test_underlying_set_journal_unreadable_falls_back_to_watchlist(monkeypatch):
     monkeypatch.setattr(m, "_shadow_underlyings", lambda: [])
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades", lambda: None)
-    assert m.build_underlying_set() == ["SPY"]
+    assert m.build_underlying_set() == ["IWM", "QQQ", "SPY"]
 
 
 def test_underlyings_override_skips_sourcing(monkeypatch):
@@ -295,6 +392,128 @@ def test_underlyings_override_skips_sourcing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Core (sleeve 1) index set — always cached, wider strike window
+# ---------------------------------------------------------------------------
+
+def test_core_set_present_with_empty_watchlist(monkeypatch):
+    """Sleeve 1 needs SPY/QQQ/IWM chain history daily even when the rotating
+    watchlist, journal, and shadow book contain none of them."""
+    monkeypatch.setattr(m, "_watchlist_underlyings", lambda: [])
+    monkeypatch.setattr(m, "_shadow_underlyings", lambda: [])
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.get_open_journal_trades", lambda: [])
+    assert m.build_underlying_set() == ["IWM", "QQQ", "SPY"]
+
+
+def test_core_window_constants_cover_sleeve():
+    """The snapshot window must span the sleeve-1 trade band: expiries out to
+    ~60 DTE (entries at 30-45 plus the roll tail) and strikes to ±15% of
+    spot for the index names."""
+    assert m.DTE_MIN <= 30 and m.DTE_MAX >= 60
+    assert m.CORE_STRIKE_PCT >= 0.15
+    assert set(m.CORE_UNDERLYINGS) == {"SPY", "QQQ", "IWM"}
+
+
+def test_core_underlying_gets_pct_of_spot_strike_window(monkeypatch, pg, emits, frozen_today):
+    """A core index name keeps every strike within ±15% of spot — well past
+    the nearest-12 band a watchlist single name gets."""
+    calls: dict = {}
+    market = _fake_market(spot=100.0, n_strikes_each_side=40, calls=calls)
+    _wire(monkeypatch, market)
+
+    assert m.main(["--underlyings", "SPY"]) == 0
+
+    option_batches = [b for b in calls["quote_batches"] if b != ["US.SPY"]]
+    codes = [c for b in option_batches for c in b]
+    strikes = sorted(_code_parts(c)[1] for c in codes)
+    # $1 grid straddling 100 → 30 strikes per side inside ±15%, both sides.
+    assert len(codes) == 60
+    assert strikes[0] == 85.5 and strikes[-1] == 114.5
+    assert all(abs(k - 100.0) <= 15.0 for k in strikes)
+    # And the window genuinely widened past the nearest-12 default.
+    assert any(abs(k - 100.0) > 6.5 for k in strikes)
+
+    inserts = [p for sql, p in pg.executes
+               if "INSERT INTO option_chain_snapshots" in sql]
+    assert len(inserts) == 60
+
+
+def test_core_quote_batches_respect_snapshot_cap(monkeypatch, pg, emits, frozen_today):
+    """The widened core window can exceed moomoo's per-request snapshot cap;
+    option quotes must go out in chunks of at most _QUOTE_BATCH_MAX."""
+    calls: dict = {}
+    market = _fake_market(spot=1000.0, n_strikes_each_side=400, calls=calls)
+    _wire(monkeypatch, market)
+
+    assert m.main(["--underlyings", "QQQ"]) == 0
+
+    option_batches = [b for b in calls["quote_batches"] if b != ["US.QQQ"]]
+    assert len(option_batches) > 1
+    assert all(len(b) <= m._QUOTE_BATCH_MAX for b in option_batches)
+    codes = [c for b in option_batches for c in b]
+    # ±15% of 1000 on a $1 grid → 300 strikes per side, none lost to chunking.
+    assert len(codes) == len(set(codes)) == 600
+    inserts = [p for sql, p in pg.executes
+               if "INSERT INTO option_chain_snapshots" in sql]
+    assert len(inserts) == 600
+
+
+def test_failed_quote_chunk_keeps_other_chunks(monkeypatch, pg, emits, frozen_today):
+    """A transient OpenD hiccup on chunk 2 of 2 must not discard chunk 1:
+    the fetched quotes are inserted, the expiry is counted partial, and the
+    run escalates to warn instead of silently halving core coverage."""
+    calls: dict = {}
+    get_quote, expiries, chain = _fake_market(
+        spot=1000.0, n_strikes_each_side=400, calls=calls)
+    seen = {"option_batches": 0}
+
+    def flaky_quote(symbols):
+        symbols = list(symbols)
+        if not symbols[0].split(".", 1)[-1].isalpha():   # option batch
+            seen["option_batches"] += 1
+            if seen["option_batches"] == 2:
+                raise RuntimeError("OpenD hiccup on chunk 2")
+        return get_quote(symbols)
+
+    _wire(monkeypatch, (flaky_quote, expiries, chain))
+
+    assert m.main(["--underlyings", "QQQ"]) == 0
+
+    inserts = [p for sql, p in pg.executes
+               if "INSERT INTO option_chain_snapshots" in sql]
+    # ±15% of 1000 → 600 codes → two chunks of 300; chunk 2 died, chunk 1
+    # survives instead of the whole expiry being dropped.
+    assert len(inserts) == 300
+    assert len(emits) == 1
+    payload = emits[0]["payload"]
+    assert payload["failures"] == {}                     # not a failed name
+    assert payload["partial_expiries"] == {"QQQ": 1}
+    assert payload["per_underlying"] == {"QQQ": 300}
+    assert emits[0]["severity"] == 1                     # partial data = warn
+
+
+def test_one_core_failure_does_not_skip_other_core(monkeypatch, pg, emits, frozen_today):
+    """Sourced (no override) run: SPY's spot failing must still leave QQQ and
+    IWM fully snapped — one core name down cannot blank the sleeve's data."""
+    market = _fake_market(spot=100.0, fail_spot_for={"SPY"})
+    _wire(monkeypatch, market)
+    monkeypatch.setattr(
+        "trading_agent.store.postgres.get_open_journal_trades", lambda: [])
+
+    assert m.main([]) == 0
+
+    inserts = [p for sql, p in pg.executes
+               if "INSERT INTO option_chain_snapshots" in sql]
+    # Default fake grid spans ±20 → 30 strikes/side inside ±15% x 2 sides = 60.
+    assert {p[1] for p in inserts} == {"QQQ", "IWM"}
+    assert len(emits) == 1
+    payload = emits[0]["payload"]
+    assert set(payload["failures"]) == {"SPY"}
+    assert payload["per_underlying"] == {"IWM": 60, "QQQ": 60}
+    assert emits[0]["severity"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Failure isolation + all-failed escalation
 # ---------------------------------------------------------------------------
 
@@ -302,16 +521,16 @@ def test_one_underlying_failing_does_not_kill_the_run(monkeypatch, pg, emits, fr
     market = _fake_market(spot=100.0, fail_spot_for={"AAPL"})
     _wire(monkeypatch, market)
 
-    assert m.main(["--underlyings", "AAPL,QQQ"]) == 0
+    assert m.main(["--underlyings", "AAPL,MSFT"]) == 0
 
     inserts = [p for sql, p in pg.executes if "INSERT INTO option_chain_snapshots" in sql]
-    assert len(inserts) == 24                      # QQQ snapped fine
-    assert all(p[1] == "QQQ" for p in inserts)
+    assert len(inserts) == 24                      # MSFT snapped fine
+    assert all(p[1] == "MSFT" for p in inserts)
 
     assert len(emits) == 1
     payload = emits[0]["payload"]
     assert "AAPL" in payload["failures"]
-    assert payload["per_underlying"] == {"QQQ": 24}
+    assert payload["per_underlying"] == {"MSFT": 24}
     assert emits[0]["severity"] == 1               # partial failure = warn
 
 
