@@ -27,6 +27,7 @@ import os
 import statistics
 import sys
 import tempfile
+import time
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -41,6 +42,13 @@ DELTA_MIN, DELTA_MAX = 0.03, 0.40
 STRIKE_MIN_FRAC_OF_SPOT = 0.80
 QUOTE_BATCH = 16          # codes per get_quote call (matches the 2026-06 run)
 MAX_CODES_PER_EXPIRY = 32
+# futu OpenAPI limits get_option_chain to ~10 requests per 30 s. Cap expiries
+# per name (4 × 32 strikes = 128 candidates, ample for --min-quotes 40) and
+# space the chain calls so a default SPY,QQQ,IWM run never breaches the limit
+# mid-run and starves the last name (IWM — the decision line) below
+# --min-quotes. Tests set CHAIN_SLEEP_S to 0.
+MAX_EXPIRIES_PER_NAME = 4
+CHAIN_SLEEP_S = 3.5
 
 # IWM decision-line parameters (M1-1 spec): $5-wide vertical at the gate
 # floor credit = width/4; whitelist bar friction_r <= 0.06R.
@@ -67,6 +75,7 @@ def collect_spreads(underlyings: list[str], quote_fns) -> dict[str, list[float]]
     get_quote, list_option_expiries, get_option_chain = quote_fns
     out: dict[str, list[float]] = {}
     today = date.today()
+    first_chain_call = True
     for t in underlyings:
         code = f"US.{t}"
         samples: list[float] = []
@@ -90,7 +99,10 @@ def collect_spreads(underlyings: list[str], quote_fns) -> dict[str, list[float]]
             print(f"  {t}: no spot price — skipped", file=sys.stderr)
             out[t] = samples
             continue
-        for exp in expiries:
+        for exp in expiries[:MAX_EXPIRIES_PER_NAME]:
+            if not first_chain_call and CHAIN_SLEEP_S:
+                time.sleep(CHAIN_SLEEP_S)  # futu chain-request rate limit
+            first_chain_call = False
             try:
                 chain = get_option_chain(code, exp, option_type="PUT").get("rows") or []
             except Exception as e:
@@ -116,7 +128,9 @@ def collect_spreads(underlyings: list[str], quote_fns) -> dict[str, list[float]]
                     try:
                         bid = float(r.get("bid_price") or r.get("bid") or 0)
                         ask = float(r.get("ask_price") or r.get("ask") or 0)
-                        delta = abs(float(r.get("delta") or 0))
+                        # Real moomoo get_market_snapshot rows carry the greek
+                        # as ``option_delta``; ``delta`` is the legacy fallback.
+                        delta = abs(float(r.get("option_delta") or r.get("delta") or 0))
                     except (TypeError, ValueError):
                         continue
                     if bid <= 0 or ask <= bid:
@@ -266,6 +280,10 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, json.JSONDecodeError) as e:
             print(f"FATAL: refusing to overwrite unparseable {out_path}: {e}",
                   file=sys.stderr)
+            return 1
+        if not isinstance(existing, dict):
+            print(f"FATAL: refusing to overwrite non-object JSON in {out_path} "
+                  f"(top-level {type(existing).__name__})", file=sys.stderr)
             return 1
     per = dict(existing.get("per_underlying") or {})
     per.update(calibrated)

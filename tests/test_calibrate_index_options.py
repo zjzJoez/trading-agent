@@ -23,6 +23,7 @@ def _hermetic(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "CONFIG", new_cfg)
     emitted: list[dict] = []
     monkeypatch.setattr(cal, "_emit_calibration_event", emitted.append)
+    monkeypatch.setattr(cal, "CHAIN_SLEEP_S", 0)  # no rate-limit pacing in tests
     ec.reset_calibration_cache()
     yield tmp_path
     ec.reset_calibration_cache()
@@ -40,16 +41,19 @@ def _mk_quote_fns(spread_by_name: dict[str, float], *, n_strikes=40,
 
     def get_quote(codes):
         rows = []
-        for c in codes:
+        for i, c in enumerate(codes):
             if "PUT" in c:
                 name = c[3:c.index("PUT")]
                 pct = spread_by_name[name]
-                rows.append({
+                row = {
                     "code": c,
                     "bid_price": mid * (1 - pct / 2),
                     "ask_price": mid * (1 + pct / 2),
-                    "delta": -delta,
-                })
+                }
+                # Real snapshot rows carry ``option_delta``; keep the first
+                # row of each batch on legacy ``delta`` to pin the fallback.
+                row["delta" if i == 0 else "option_delta"] = -delta
+                rows.append(row)
             else:
                 rows.append({"code": c, "last_price": SPOT})
         return {"rows": rows}
@@ -167,6 +171,41 @@ def test_out_of_zone_delta_filtered_out(_hermetic, monkeypatch):
     rc = _run(monkeypatch, fns, ["--underlyings", "SPY", "--min-quotes", "40"])
     assert rc == 1
     assert not (tmp_path / "execution_costs.json").exists()
+
+
+def test_expiry_cap_limits_chain_calls(_hermetic, monkeypatch):
+    """Futu rate limit: at most MAX_EXPIRIES_PER_NAME chain calls per name."""
+    get_quote, _, _ = _mk_quote_fns({"SPY": 0.010})
+    many = [(date.today() + timedelta(days=d)).isoformat() for d in range(31, 40)]
+
+    def list_exp(code):
+        return {"rows": [{"strike_time": s} for s in many]}
+
+    calls: list[str] = []
+
+    def counting_chain(code, expiry, option_type="ALL"):
+        calls.append(expiry)
+        return {"rows": [
+            {"code": f"US.SPYPUT{99.5 - 0.5 * i:.1f}",
+             "strike_price": 99.5 - 0.5 * i}
+            for i in range(40)
+        ]}
+
+    rc = _run(monkeypatch, (get_quote, list_exp, counting_chain),
+              ["--underlyings", "SPY", "--min-quotes", "40"])
+    assert rc == 0
+    assert len(calls) == cal.MAX_EXPIRIES_PER_NAME
+    assert calls == many[:cal.MAX_EXPIRIES_PER_NAME]
+
+
+def test_non_dict_json_refused_without_overwrite(_hermetic, monkeypatch, capsys):
+    tmp_path = _hermetic
+    (tmp_path / "execution_costs.json").write_text("[1, 2, 3]")
+    fns = _mk_quote_fns({"SPY": 0.010})
+    rc = _run(monkeypatch, fns, ["--underlyings", "SPY", "--min-quotes", "40"])
+    assert rc == 1
+    assert "refusing to overwrite non-object JSON" in capsys.readouterr().err
+    assert (tmp_path / "execution_costs.json").read_text() == "[1, 2, 3]"
 
 
 def test_opend_unreachable_fails_fast(_hermetic, monkeypatch, capsys):
