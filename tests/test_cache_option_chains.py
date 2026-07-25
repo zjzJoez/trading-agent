@@ -16,6 +16,22 @@ import pytest
 
 from trading_agent.jobs import cache_option_chains as m
 
+
+@pytest.fixture(autouse=True)
+def _no_chain_pacing(request, monkeypatch):
+    """Never sleep for the broker's 10-per-30s chain cap inside tests.
+
+    The pacing is production behaviour (see _ChainRateLimiter); a 3.2s wait
+    per expiry turned this file into a multi-minute hang. The test that
+    exercises the real limiter opts out with @pytest.mark.real_pacing and
+    injects its own clock."""
+    if request.node.get_closest_marker("real_pacing"):
+        return
+    monkeypatch.setattr(
+        "trading_agent.jobs.cache_option_chains._ChainRateLimiter.acquire",
+        lambda self: 0.0)
+
+
 TODAY = date(2026, 6, 12)
 EXP_NEAR = (TODAY + timedelta(days=21)).isoformat()   # in 7-90 window
 
@@ -608,7 +624,8 @@ class TestCoreOrderingAndTripwire:
         monkeypatch.setattr(job, "_insert_rows", lambda rows: None)
         monkeypatch.setattr(
             job, "snapshot_underlying",
-            lambda u, today, held: ([("row",)] * per_underlying_rows.get(u, 0), 0))
+            lambda u, today, held, limiter=None: (
+                [("row",)] * per_underlying_rows.get(u, 0), 0, 0))
         emitted = []
         monkeypatch.setattr(job.events, "emit",
                             lambda **kw: emitted.append(kw))
@@ -636,3 +653,108 @@ class TestCoreOrderingAndTripwire:
         assert payload["core_empty"] == []
         assert emitted[0]["severity"] == ev.SEV_INFO
         assert pushes == []
+
+
+# ---------------------------------------------------------------------------
+# Chain-call pacing + the failures that used to vanish (2026-07-25)
+# ---------------------------------------------------------------------------
+
+class TestChainRateLimitAndVisibility:
+    """The broker refuses get_option_chain past "no more than 10 times every
+    30 seconds". The old code logged that and moved on, so rate-limited
+    expiries disappeared while the run reported failures: {} — IWM lost its
+    37-DTE chain (the only expiry sleeve 1 trades) every single night and the
+    event looked clean."""
+
+    @pytest.mark.real_pacing
+    def test_limiter_paces_bursts_within_the_broker_window(self):
+        from trading_agent.jobs import cache_option_chains as job
+        clock = {"t": 0.0}
+        sleeps: list[float] = []
+
+        def _sleep(s):
+            sleeps.append(s)
+            clock["t"] += s
+
+        lim = job._ChainRateLimiter(now=lambda: clock["t"], sleep=_sleep)
+        for _ in range(job._CHAIN_CALLS_PER_WINDOW):
+            lim.acquire()
+        # The first window's calls are spaced, never simultaneous...
+        assert len(sleeps) == job._CHAIN_CALLS_PER_WINDOW - 1
+        assert all(abs(s - job._CHAIN_MIN_SPACING_S) < 1e-6 for s in sleeps)
+        # Guard the float-epsilon spin directly: accumulated error made
+        # `wait` land at 6.7e-16 > 0 and the limiter looped forever on
+        # sub-nanosecond sleeps.
+        assert all(s > 1e-6 for s in sleeps), "no sub-microsecond spin sleeps"
+        # ...and 10 calls fit inside the 30s window rather than overflowing it.
+        assert clock["t"] < job._CHAIN_WINDOW_S
+        before = clock["t"]
+        lim.acquire()                      # the 11th must wait for the roll
+        assert clock["t"] - before > 0
+
+    def test_chain_fetch_failures_are_counted_not_swallowed(self, monkeypatch):
+        from datetime import date
+        from trading_agent.jobs import cache_option_chains as job
+
+        def _chain(code, exp):
+            if exp == "2026-09-18":        # the sleeve's 37-DTE expiry
+                raise RuntimeError("Get Option Chain is too frequent")
+            return {"rows": []}
+
+        monkeypatch.setattr(job, "_market_fns", lambda: (
+            lambda codes: {"rows": [{"last_price": 600.0}]},
+            lambda code: {"rows": [{"strike_time": "2026-09-18"},
+                                   {"strike_time": "2026-08-21"}]},
+            _chain))
+        monkeypatch.setattr(job, "_pick_expiries",
+                            lambda *a, **k: ["2026-09-18", "2026-08-21"])
+        monkeypatch.setattr(job._ChainRateLimiter, "acquire", lambda self: 0.0)
+        rows, n_partial, n_chain_fail = job.snapshot_underlying(
+            "SPY", date(2026, 8, 12))
+        assert n_chain_fail == 1, "a rate-limited expiry must be counted"
+        assert rows == []
+
+    def test_core_chain_failure_is_sev_error(self, monkeypatch):
+        from trading_agent import events as ev
+        from trading_agent.jobs import cache_option_chains as job
+        monkeypatch.setattr(job, "_watchlist_underlyings", lambda: [])
+        monkeypatch.setattr(job, "_open_trade_underlyings", lambda: [])
+        monkeypatch.setattr(job, "_shadow_underlyings", lambda: [])
+        monkeypatch.setattr(job, "_held_option_expiries", lambda: {})
+        monkeypatch.setattr(job, "_insert_rows", lambda rows: None)
+        monkeypatch.setattr(
+            job, "snapshot_underlying",
+            lambda u, today, held, limiter=None: (
+                [("row",)], 0, 1 if u == "IWM" else 0))
+        emitted = []
+        monkeypatch.setattr(job.events, "emit", lambda **kw: emitted.append(kw))
+        monkeypatch.setattr("trading_agent.notify.send", lambda *a, **kw: None)
+        job.main([])
+        assert emitted[0]["payload"]["chain_failures"] == {"IWM": 1}
+        assert emitted[0]["severity"] == ev.SEV_ERROR
+
+    def test_budget_skips_the_tail_but_never_core_and_reports_it(self, monkeypatch):
+        from trading_agent.jobs import cache_option_chains as job
+        monkeypatch.setattr(job, "_watchlist_underlyings",
+                            lambda: ["AAA", "BBB", "CCC"])
+        monkeypatch.setattr(job, "_open_trade_underlyings", lambda: [])
+        monkeypatch.setattr(job, "_shadow_underlyings", lambda: [])
+        monkeypatch.setattr(job, "_held_option_expiries", lambda: {})
+        monkeypatch.setattr(job, "_insert_rows", lambda rows: None)
+        clock = {"t": 0.0}
+        monkeypatch.setattr(job, "_run_clock", lambda: clock["t"])
+
+        def _snap(u, today, held, limiter=None):
+            clock["t"] += 100.0          # each name burns 100s
+            return [("row",)], 0, 0
+        monkeypatch.setattr(job, "snapshot_underlying", _snap)
+        emitted = []
+        monkeypatch.setattr(job.events, "emit", lambda **kw: emitted.append(kw))
+        monkeypatch.setattr("trading_agent.notify.send", lambda *a, **kw: None)
+        job.main(["--budget-seconds", "250"])
+        payload = emitted[0]["payload"]
+        # 3 core (0/100/200s) always run; the tail stops once past 250s.
+        for u in job.CORE_UNDERLYINGS:
+            assert u in payload["per_underlying"]
+        assert payload["budget_skipped"], "the skipped tail must be listed"
+        assert set(payload["budget_skipped"]) <= {"AAA", "BBB", "CCC"}

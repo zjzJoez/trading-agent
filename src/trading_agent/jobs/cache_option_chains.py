@@ -34,6 +34,8 @@ import argparse
 import json
 import logging
 import sys
+import time
+from collections import deque
 from datetime import date, datetime, timezone
 
 from trading_agent import events
@@ -73,6 +75,63 @@ CORE_STRIKE_PCT = 0.15
 # moomoo's get_market_snapshot caps codes per request (400 on the free
 # tier); the core strike window can push one expiry past that, so batch.
 _QUOTE_BATCH_MAX = 300
+
+# THE reason this job wrote ~1000 rows/night across 85 names while SPY alone
+# yields ~1100: the broker rejects get_option_chain past
+#   "no more than 10 times every 30 seconds"
+# and the per-expiry handler below only logged + continued, so rate-limited
+# expiries vanished into a warning while the run reported failures: {} and
+# partial_expiries: {}. IWM lost its 37-DTE chain that way — the ONE expiry
+# the sleeve trades — leaving zero in-zone rows from a run that looked clean.
+# 3.2s spacing keeps us just inside 10/30s with room for clock jitter.
+_CHAIN_CALLS_PER_WINDOW = 10
+_CHAIN_WINDOW_S = 30.0
+_CHAIN_MIN_SPACING_S = _CHAIN_WINDOW_S / _CHAIN_CALLS_PER_WINDOW + 0.2
+
+
+def _run_clock() -> float:
+    """Monotonic seam for main()'s wall-clock budget — a named indirection so
+    tests can advance the run clock without patching the time module."""
+    return time.monotonic()
+
+
+class _ChainRateLimiter:
+    """Sleeps so get_option_chain never exceeds the broker's 10-per-30s cap.
+
+    A sliding window rather than a fixed sleep: the first ten calls of a run
+    go out at spacing, and only a genuine burst waits for the window to roll.
+    """
+
+    def __init__(self, now=time.monotonic, sleep=time.sleep) -> None:
+        # Clock and sleep are injected rather than reached for through the
+        # module: patching time.monotonic globally to test pacing also breaks
+        # pytest's own timing (it hung the suite once).
+        self._calls: deque[float] = deque()
+        self._now = now
+        self._sleep = sleep
+
+    def acquire(self) -> float:
+        """Block until a call is allowed. Returns seconds slept."""
+        slept = 0.0
+        while True:
+            now = self._now()
+            while self._calls and now - self._calls[0] >= _CHAIN_WINDOW_S:
+                self._calls.popleft()
+            wait = 0.0
+            if len(self._calls) >= _CHAIN_CALLS_PER_WINDOW:
+                wait = _CHAIN_WINDOW_S - (now - self._calls[0]) + 0.1
+            elif self._calls:
+                wait = max(0.0, _CHAIN_MIN_SPACING_S - (now - self._calls[-1]))
+            # Epsilon, not `<= 0`: the spacing arithmetic accumulates float
+            # error (3.2 - (12.8 - 9.600000000000001) = 6.7e-16), which spins
+            # on sub-nanosecond sleeps — an infinite loop against a fake
+            # clock, and a busy spin against a real one.
+            if wait <= 1e-6:
+                self._calls.append(now)
+                return slept
+            self._sleep(wait)
+            slept += wait
+
 
 _INSERT_SQL = """
     INSERT INTO option_chain_snapshots
@@ -284,10 +343,16 @@ def _pick_expiries(expiry_rows: list[dict], today: date, *,
 
 def snapshot_underlying(underlying: str, today: date,
                         held_expiries: frozenset[str] | set[str] = frozenset(),
-                        ) -> tuple[list[tuple], int]:
+                        limiter: _ChainRateLimiter | None = None,
+                        ) -> tuple[list[tuple], int, int]:
     """Fetch one underlying's chain slice; return (rows shaped for
     _INSERT_SQL, count of expiries whose quote batches partially or wholly
-    failed).
+    failed, count of expiries whose CHAIN fetch failed outright).
+
+    ``limiter`` paces get_option_chain against the broker's 10-per-30s cap;
+    callers that snapshot more than one underlying MUST share one instance,
+    otherwise the cap is exceeded across names (which is how the 37-DTE
+    expiry — the only one sleeve 1 trades — went missing every night).
 
     Raises on total failure (no spot, expiry list unreachable) so the caller
     counts it as a failed underlying; per-expiry hiccups are logged and
@@ -307,10 +372,16 @@ def snapshot_underlying(underlying: str, today: date,
 
     rows: list[tuple] = []
     partial_expiries = 0
+    chain_failures = 0
+    limiter = limiter or _ChainRateLimiter()
     for exp in expiries:
+        limiter.acquire()
         try:
             chain = get_option_chain(code, exp).get("rows") or []
         except Exception as e:  # noqa: BLE001 — one bad expiry must not sink the name
+            # Counted, not just logged: a rate-limited or halted expiry used
+            # to disappear into a warning while the run reported failures: {}.
+            chain_failures += 1
             log.warning("[cache_option_chains] %s %s chain fetch failed: %s",
                         underlying, exp, e)
             continue
@@ -382,7 +453,7 @@ def snapshot_underlying(underlying: str, today: date,
                 _f(q.get("option_vega")),
                 _f(q.get("option_theta")),
             ))
-    return rows, partial_expiries
+    return rows, partial_expiries, chain_failures
 
 
 def _insert_rows(rows: list[tuple]) -> None:
@@ -401,6 +472,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--underlyings", default=None,
                     help="comma-separated override, e.g. AAPL,QQQ (skips "
                          "watchlist+journal sourcing)")
+    ap.add_argument("--budget-seconds", type=float, default=900.0,
+                    help="wall-clock budget for NON-core underlyings; core "
+                         "(SPY/QQQ/IWM) are always attempted. Chain calls are "
+                         "paced at 10/30s, so ~85 names cannot fit in a short "
+                         "unit timeout — skipped names are reported, never "
+                         "silently dropped.")
     args = ap.parse_args(argv)
 
     # The timer fires 21:15 UTC; the US trading date equals the UTC date at
@@ -416,20 +493,38 @@ def main(argv: list[str] | None = None) -> int:
     per_underlying: dict[str, int] = {}
     failures: dict[str, str] = {}
     partial_expiries: dict[str, int] = {}
+    chain_failures: dict[str, int] = {}
+    budget_skipped: list[str] = []
     total_rows = 0
+    # ONE limiter for the whole run: the broker's 10-per-30s chain cap is
+    # global, so a per-underlying limiter would still blow it across names.
+    limiter = _ChainRateLimiter()
+    started = _run_clock()
 
     try:
         for u in underlyings:
+            is_core = u in CORE_UNDERLYINGS
+            # Pacing makes the run minutes long, so the tail can outlive the
+            # unit's timeout. Core names are NEVER skipped (they are the
+            # sleeve's own feed); the rest stop at the budget and are LISTED
+            # — a silently truncated run reads as "we covered everything".
+            if not is_core and _run_clock() - started > args.budget_seconds:
+                budget_skipped.append(u)
+                continue
             try:
-                rows, n_partial = snapshot_underlying(
-                    u, today, held_by_underlying.get(u, frozenset()))
+                rows, n_partial, n_chain_fail = snapshot_underlying(
+                    u, today, held_by_underlying.get(u, frozenset()),
+                    limiter=limiter)
                 if not args.dry_run and rows:
                     _insert_rows(rows)
                 per_underlying[u] = len(rows)
                 if n_partial:
                     partial_expiries[u] = n_partial
+                if n_chain_fail:
+                    chain_failures[u] = n_chain_fail
                 total_rows += len(rows)
-                log.info("[cache_option_chains] %s: %d contracts", u, len(rows))
+                log.info("[cache_option_chains] %s: %d contracts%s", u, len(rows),
+                         f" ({n_chain_fail} chain fetch failures)" if n_chain_fail else "")
             except Exception as e:  # noqa: BLE001 — per-underlying isolation
                 failures[u] = repr(e)
                 log.warning("[cache_option_chains] %s failed: %s", u, e)
@@ -457,8 +552,13 @@ def main(argv: list[str] | None = None) -> int:
         # One audit row per run. Every underlying failing means OpenD itself
         # is down/unreachable — that's a sev-2 (operator should look), a few
         # individual misses (including partially-quoted expiries) are a warn.
-        severity = (events.SEV_ERROR if (all_failed or core_empty)
-                    else events.SEV_WARN if (failures or partial_expiries)
+        core_chain_failures = {u: n for u, n in chain_failures.items()
+                               if u in CORE_UNDERLYINGS}
+        severity = (events.SEV_ERROR
+                    if (all_failed or core_empty or core_chain_failures)
+                    else events.SEV_WARN
+                    if (failures or partial_expiries or chain_failures
+                        or budget_skipped)
                     else events.SEV_INFO)
         events.emit(
             run_id=run_id, trigger="chain_cache", agent="cache_option_chains",
@@ -472,6 +572,9 @@ def main(argv: list[str] | None = None) -> int:
                 "partial_expiries": partial_expiries,
                 "all_failed": all_failed,
                 "core_empty": core_empty,
+                "chain_failures": chain_failures,
+                "budget_skipped": budget_skipped,
+                "elapsed_s": round(_run_clock() - started, 1),
             },
             severity=severity,
         )
@@ -500,6 +603,9 @@ def main(argv: list[str] | None = None) -> int:
         "per_underlying": per_underlying,
         "failures": failures,
         "partial_expiries": partial_expiries,
+        "chain_failures": chain_failures,
+        "budget_skipped": budget_skipped,
+        "elapsed_s": round(_run_clock() - started, 1),
     }
     print(json.dumps(summary, indent=2, default=str))
     return 1 if all_failed else 0

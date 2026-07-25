@@ -73,4 +73,5 @@ select = ["E", "F", "W", "I", "UP", "B"]
 # otherwise every deploy retry spams the prod environment.
 markers = [
     "integration: requires live Postgres + ntfy + LLM; do NOT run in deploy gate",
+    "real_pacing: opts out of the chain-cache no-sleep fixture to exercise the real rate limiter",
 ]

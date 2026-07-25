@@ -21,7 +21,7 @@ ExecStart=/home/ubuntu/trading-agent/.venv/bin/python -m trading_agent.jobs.cach
 
 # ~40 underlyings x (1 spot + 1 expiry list + up to 4 chain + 4 batch quote)
 # calls; OpenD throttles quote requests, so allow up to 10 min.
-TimeoutStartSec=600
+TimeoutStartSec=1800
 
 StandardOutput=append:/var/log/trading-agent-chain-cache.log
 StandardError=append:/var/log/trading-agent-chain-cache.err
