@@ -65,6 +65,7 @@ from typing import Literal
 
 from trading_agent.config import CONFIG, ensure_dirs
 from trading_agent.db import connection
+from trading_agent.execution_costs import combo_friction_r
 from trading_agent.sizing import (
     MAX_SINGLE_RISK_PCT,
     R5E,
@@ -1039,6 +1040,16 @@ def evaluate_combo(
         "strategy_label": combo.strategy_label, "sector": combo.sector,
         "contracts": combo.contracts, "net_credit": combo.net_credit,
         "width": combo.width, "max_loss": combo.max_loss, "intent": "open",
+        # Modeled round-trip friction in R, priced off the REAL per-leg marks
+        # this combo carries — the only call site that never has to guess the
+        # wing ratio. REPORT ONLY (echoed into the decision/event payload so
+        # a post-mortem can compare modeled vs realized cost); no gate keys
+        # off it. None when the structure isn't a priceable credit vertical —
+        # check_combo below is what rejects those.
+        # This is the CALIBRATION-priced estimate, so the early
+        # thesis-freshness return below still carries a number; it is
+        # RECOMPUTED off the real leg touches once they are fetched.
+        "friction_r": combo_friction_r(combo),
     }
 
     # One fresh thesis on the underlying covers the whole combo.
@@ -1086,6 +1097,13 @@ def evaluate_combo(
             }
         vs += check_option_liquidity(leg.option_symbol, q)
     proposed_summary["leg_quotes"] = entry_leg_quotes
+    # Re-price friction off the quotes we just fetched. This is the ONE call
+    # site that holds fresh per-leg bid/ask, so the live path must charge the
+    # ACTUAL spread it will cross rather than a percent-of-mid median measured
+    # on other days; half_spread_cost falls back to the calibration per leg,
+    # so a single missing quote does not discard the other leg's real touch.
+    proposed_summary["friction_r"] = combo_friction_r(
+        combo, leg_quotes=entry_leg_quotes)
 
     bs = blockers(vs)
     warns = tuple(f"{v.rule}: {v.message}" for v in vs if v.severity == "warn")

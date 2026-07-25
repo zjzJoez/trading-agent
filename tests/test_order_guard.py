@@ -680,6 +680,55 @@ def test_combo_proposed_echoes_entry_leg_quotes(guard_db, monkeypatch):
     }
 
 
+def test_combo_friction_r_is_priced_off_the_fetched_leg_quotes(
+        guard_db, monkeypatch):
+    """FIX 2026-07-25: proposed['friction_r'] used to be computed ~35 lines
+    ABOVE the leg-quote fetch, so the ONE call site holding real bid/ask priced
+    friction off a calibrated percent-of-mid median instead. It must now be
+    recomputed from the touches the guard just fetched.
+
+    GOOD_QUOTE is 1.00/1.02 on both legs, i.e. a $0.01 half-spread each. The
+    combo is SPY $5-wide, credit 1.20, R = $380:
+      fees   4 × $1 = $4
+      spread 2 dirs × (0.01 + 0.01) × 100 = $4
+      friction_r = 8 / 380 = 0.021052...
+    """
+    from trading_agent import execution_costs as ec
+    _insert_thesis("SPY")
+    _patch_quote(monkeypatch, dict(GOOD_QUOTE))
+    d = _eval_combo(_combo_params())
+    assert d.allowed
+    got = d.proposed["friction_r"]
+    assert got == pytest.approx(8.0 / 380.0, abs=1e-6)
+    assert got == pytest.approx(
+        ec.friction_r("SPY", 5.0, 1.20, short_mark=2.0, long_mark=0.8,
+                      short_bid=1.00, short_ask=1.02,
+                      long_bid=1.00, long_ask=1.02), abs=1e-9)
+    # ... and NOT the calibration-only figure (the $0.01 touch is far tighter
+    # than the uncalibrated 4%-of-mark default)
+    assert got < ec.friction_r("SPY", 5.0, 1.20, short_mark=2.0, long_mark=0.8)
+
+
+def test_combo_friction_r_survives_when_no_leg_quote_is_available(
+        guard_db, monkeypatch):
+    """A guard/report field may never be the reason a decision path explodes:
+    with no quotes at all the figure falls back to the calibration, and the
+    early no-thesis return still carries one."""
+    from trading_agent import execution_costs as ec
+    _patch_quote(monkeypatch, None)
+    d = _eval_combo(_combo_params())          # no thesis → early return
+    assert not d.allowed and "no open thesis" in d.reason
+    assert d.proposed["friction_r"] == pytest.approx(
+        ec.friction_r("SPY", 5.0, 1.20, short_mark=2.0, long_mark=0.8),
+        abs=1e-9)
+    # ... and past the thesis gate, an unquotable leg still yields the
+    # calibration-priced number rather than None or a raise
+    _insert_thesis("SPY")
+    d2 = _eval_combo(_combo_params())
+    assert d2.proposed["friction_r"] == pytest.approx(
+        d.proposed["friction_r"], abs=1e-9)
+
+
 def test_combo_requires_fresh_thesis(guard_db, monkeypatch):
     _patch_quote(monkeypatch, dict(GOOD_QUOTE))
     d = _eval_combo(_combo_params())  # no thesis inserted

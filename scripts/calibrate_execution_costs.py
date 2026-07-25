@@ -97,6 +97,50 @@ def _collect_spreads(tickers: list[str]) -> list[dict]:
     return samples
 
 
+# The keys THIS calibrator owns. Everything else in the file belongs to
+# another writer (``scripts/calibrate_index_options.py`` owns
+# ``per_underlying``, which ``execution_costs.friction_r`` now depends on for
+# per-name / per-zone spreads and wing ratios) and must survive a run here.
+# Before 2026-07-25 this script did ``out.write_text(json.dumps(payload))``,
+# which WIPED per_underlying and silently returned every index name to the
+# blind 4%-of-mark global fallback.
+_OWNED_KEYS = (
+    "calibrated_at",
+    "n_samples",
+    "tickers",
+    "spread_pct_of_mid_median",
+    "spread_pct_of_mid_p75",
+    "opt_half_spread_pct_of_mark",
+)
+
+
+def _merge_write(out: Path, payload: dict) -> int:
+    """Read-merge ``payload``'s OWN keys into ``out``; 0 on success.
+
+    Mirrors ``calibrate_index_options.main`` (its per_underlying merge and its
+    refuse-to-overwrite-unparseable guard): a file we cannot parse is a file
+    whose other writer's data we cannot preserve, so we refuse rather than
+    clobber it.
+    """
+    existing: dict = {}
+    if out.exists():
+        try:
+            existing = json.loads(out.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"FATAL: refusing to overwrite unparseable {out}: {e}",
+                  file=sys.stderr)
+            return 1
+        if not isinstance(existing, dict):
+            print(f"FATAL: refusing to overwrite non-object JSON in {out} "
+                  f"(top-level {type(existing).__name__})", file=sys.stderr)
+            return 1
+    for k in _OWNED_KEYS:
+        if k in payload:
+            existing[k] = payload[k]
+    out.write_text(json.dumps(existing, indent=2) + "\n")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--tickers", nargs="+",
@@ -134,8 +178,10 @@ def main() -> int:
     if args.write:
         from trading_agent.config import CONFIG
         out = Path(CONFIG.data_dir) / "execution_costs.json"
-        out.write_text(json.dumps(payload, indent=2))
-        print(f"written: {out}")
+        rc = _merge_write(out, payload)
+        if rc:
+            return rc
+        print(f"written: {out} (global keys only; per_underlying preserved)")
     else:
         print("(report only — pass --write to apply)")
     return 0

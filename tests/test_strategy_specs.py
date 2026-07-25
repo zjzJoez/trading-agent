@@ -132,6 +132,109 @@ def test_breakeven_net_formula_and_monotonicity():
             > breakeven_wr_gross(2.0))
 
 
+def test_vertical_spec_friction_comes_from_the_vertical_cost_function():
+    """A vertical's friction must be priced from (width, credit) through
+    execution_costs.friction_r — which resolves BOTH leg marks — not from
+    round_trip_friction_r with a hand-typed per-leg premium.
+
+    Regression for the 2026-07-25 friction-truth fix: the old derivation
+    guessed $1.50 for both legs (leg-mid-sum $3.00 against a $1.43 credit,
+    ratio 2.1) where real vertical quotes measure 6.43 on a $5-wide.
+    """
+    from trading_agent.execution_costs import friction_r as ec_friction_r
+    spec = REGISTRY["credit_put_spread_30_45"]
+    min_rr = spec.min_risk_reward
+    width = 5.0
+    credit = width * min_rr / (1.0 + min_rr)
+    p = spec.expectancy_profile
+    assert p.breakeven_wr_net == pytest.approx(
+        breakeven_wr_net(min_rr, ec_friction_r(None, width, credit)))
+    # The old (understated) derivation must not survive.
+    old = round_trip_friction_r(typical_premium=1.50,
+                                risk_per_unit=(width - credit) * 100.0,
+                                n_option_legs=2)
+    assert p.breakeven_wr_net > breakeven_wr_net(min_rr, old)
+
+
+def test_vertical_spec_breakeven_now_exceeds_its_declared_wr_envelope(
+        tmp_path, monkeypatch):
+    """HONEST CONSEQUENCE, pinned deliberately (2026-07-25).
+
+    With the friction bill computed off real per-leg marks, a $5-wide
+    single-name vertical at the global uncalibrated 4%-of-mark half-spread
+    pays ~0.22R round trip, which puts breakeven_wr_net ABOVE the spec's own
+    declared 70-80% envelope: as specced and as costed, this structure cannot
+    make money. That is the spec system doing its job, not a number to tune
+    away — resolving it (wider widths, tighter names, a measured single-name
+    wing ratio, or retirement) is the operator's call. If the spec or the
+    calibration is deliberately changed, this test SHOULD fail and be
+    updated with the reasoning.
+
+    HERMETIC (fixed 2026-07-25): the pinned figure describes the UNCALIBRATED
+    fallback, so it is asserted against a spec rebuilt with an EMPTY tmp_path
+    data_dir. Reading the import-time REGISTRY instead made the pin depend on
+    whether a gitignored data/execution_costs.json happened to exist in the
+    developer's working tree — the number would silently change with a local
+    calibration run and pass or fail for reasons unrelated to the code.
+    """
+    import dataclasses
+
+    import trading_agent.strategy_specs as ss
+    from trading_agent import config as config_mod
+    from trading_agent import execution_costs as ec
+    monkeypatch.setattr(config_mod, "CONFIG",
+                        dataclasses.replace(config_mod.CONFIG,
+                                            data_dir=tmp_path))
+    ec.reset_calibration_cache()
+    try:
+        assert not (tmp_path / "execution_costs.json").exists()
+        p = ss._credit_put_spread_spec().expectancy_profile
+        lo, hi = p.expected_wr_range
+        assert p.breakeven_wr_net > hi
+        assert p.breakeven_wr_net == pytest.approx(0.8713, abs=1e-3)
+        # the pin is arithmetic, not a magic number: R:R 0.40 and the
+        # uncalibrated $5-wide friction the cost model reports for it
+        assert p.breakeven_wr_net == pytest.approx(
+            breakeven_wr_net(0.40, ec.friction_r(None, 5.0, 5.0 * 0.4 / 1.4)))
+    finally:
+        ec.reset_calibration_cache()
+
+
+def test_index_vertical_credit_floor_is_never_auto_tuned_from_measurements(
+        tmp_path, monkeypatch):
+    """A3: the 0.25 credit floor is an UNRESOLVED PLACEHOLDER.
+
+    Real IWM quotes measure credit/width medians of 0.191 ($5-wide) and
+    0.176 ($10-wide) — below the floor. Nothing may read a measured
+    credit_frac_median out of the calibration and quietly relax the gate to
+    make trades appear (the plan's "second better-documented zero-order
+    funnel"). The floor stays where it is and the spec stays untradeable
+    until the operator resolves it on SPY/QQQ data.
+    """
+    import dataclasses
+    import json
+
+    import trading_agent.strategy_specs as ss
+    from trading_agent import config as config_mod
+    from trading_agent import execution_costs as ec
+    (tmp_path / "execution_costs.json").write_text(json.dumps({
+        "per_underlying": {"IWM": {"median_spread_pct_mid": 0.046,
+                                   "credit_frac_median": 0.191,
+                                   "wing_ratio": 0.731}}}))
+    monkeypatch.setattr(config_mod, "CONFIG",
+                        dataclasses.replace(config_mod.CONFIG, data_dir=tmp_path))
+    ec.reset_calibration_cache()
+    try:
+        # rebuild the spec WITH the measured calibration loaded
+        spec = ss._credit_vertical_index_spec()
+        assert spec.entry_gates["min_credit_frac_of_width"] == 0.25
+        assert spec.status == "pending_prereqs" and not spec.is_tradeable
+        assert spec.expectancy_profile is None
+        assert spec == ss.REGISTRY["credit_vertical_index_30_45"]
+    finally:
+        ec.reset_calibration_cache()
+
+
 def test_friction_r_is_derived_from_cost_model_not_hardcoded():
     """round_trip_friction_r must agree with the execution-cost model's own
     primitives, whatever calibration is loaded — fees both sides per leg
