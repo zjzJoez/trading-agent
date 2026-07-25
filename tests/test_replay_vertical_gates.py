@@ -115,26 +115,95 @@ def test_select_vertical_width_10_fallback_when_5_wing_has_no_bar():
 def test_select_vertical_no_strike_in_band():
     chain = _chain(_put(85, 0.0414), _put(80, 0.0035))  # |delta| ~ .015/.002
     sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q)
-    assert sel == {"qualified": False, "reason": "no-strike-in-band"}
+    assert (sel["qualified"], sel["reason"]) == (False, "no-strike-in-band")
+    assert rv.REASON_CLASS[sel["reason"]] == "gate"
 
 
 def test_select_vertical_short_leg_liquidity_gate_n30():
-    strike, contract = _put(96, 1.3481, n=10)  # in band but too few trades
+    # In band, but the entry-day bar has too few trades: the liquidity screen
+    # is part of the GATE stack, and it gets its own reason so it is never
+    # confused with a missing-data skip.
+    strike, contract = _put(96, 1.3481, n=10)
     sel = rv.select_vertical(ENTRY, EXPIRY, S, {strike: contract}, Q)
-    assert sel == {"qualified": False, "reason": "no-strike-in-band"}
+    assert (sel["qualified"], sel["reason"]) == (False, "short-leg-illiquid")
+    assert rv.REASON_CLASS[sel["reason"]] == "gate"
+    assert sel["diag"]["n_entry_mark"] == 1  # the print existed...
+    assert sel["diag"]["n_liquid"] == 0      # ...it just failed n >= 30
 
 
-def test_select_vertical_wing_missing():
-    chain = _chain(_put(96, 1.3481))  # in band, but no 91 and no 86 contract
+def test_select_vertical_wing_missing_is_classified_as_data_limited():
+    # In band, but neither the 5- nor the 10-wide wing was ever fetched.
+    # That is a data gap, not the gate rejecting a tradeable chain.
+    chain = _chain(_put(96, 1.3481))
     sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q)
-    assert sel == {"qualified": False, "reason": "wing-missing"}
+    assert (sel["qualified"], sel["reason"]) == (False, "wing-missing")
+    assert rv.REASON_CLASS[sel["reason"]] == "data"
+    assert sel["diag"]["wing_unfetched"] == 2      # 91 and 86 both absent
+    assert sel["diag"]["n_constructible"] == 0     # no vertical constructible
 
 
 def test_select_vertical_credit_below_floor():
-    # Wing bar exists but credit 1.3481-0.60 = 0.748 < 1.25.
+    # Wing bar exists but credit 1.3481-0.60 = 0.7481 < 1.25.
     chain = _chain(_put(96, 1.3481), _put(91, 0.60))
     sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q)
-    assert sel == {"qualified": False, "reason": "credit-below-floor"}
+    assert (sel["qualified"], sel["reason"]) == (False, "credit-below-floor")
+    assert rv.REASON_CLASS[sel["reason"]] == "gate"
+    assert sel["diag"]["n_constructible"] == 1     # data was adequate
+    assert sel["diag"]["best_credit_frac"] == pytest.approx(0.7481 / 5.0)
+
+
+def test_select_vertical_credit_floor_override_admits_the_same_chain():
+    chain = _chain(_put(96, 1.3481), _put(91, 0.60))  # credit frac 0.14962
+    sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q, credit_floor_frac=0.10)
+    assert sel["qualified"] is True
+    assert sel["credit"] == pytest.approx(0.7481, abs=1e-9)
+
+
+def test_select_vertical_width_policy_any_widens_for_credit():
+    # 96 is in band (|delta| .339); its 5-wing 91 prints but is illiquid, so it
+    # is a usable WING yet never a short candidate. 5-wide credit 3.0-1.9 =
+    # 1.10 < 1.25 -> five-first refuses to widen; "any" takes the 10-wide,
+    # credit 3.0-0.4 = 2.60 >= 2.50.
+    chain = _chain(_put(96, 3.0), _put(91, 1.9, n=5), _put(86, 0.4))
+    five = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q,
+                              width_policy="five-first")
+    assert (five["qualified"], five["reason"]) == (False, "credit-below-floor")
+    any_ = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q, width_policy="any")
+    assert any_["qualified"] is True
+    assert (any_["long_strike"], any_["width"]) == (86, 10)
+    assert any_["credit"] == pytest.approx(2.6, abs=1e-9)
+
+
+def test_select_vertical_rejects_unknown_width_policy():
+    with pytest.raises(ValueError):
+        rv.select_vertical(ENTRY, EXPIRY, S, _chain(_put(96, 1.3481)), Q,
+                           width_policy="widest")
+
+
+def test_select_vertical_inverted_credit_mark_is_data_not_gate():
+    # Stale print: the further-OTM wing marks ABOVE the short leg.
+    chain = _chain(_put(96, 1.3481), _put(91, 2.50))
+    sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q)
+    assert (sel["qualified"], sel["reason"]) == (False, "inverted-credit-mark")
+    assert rv.REASON_CLASS[sel["reason"]] == "data"
+    assert sel["diag"]["n_bad_credit"] == 1
+
+
+def test_select_vertical_no_entry_day_mark_is_data():
+    # Contracts exist but none printed on the entry date.
+    chain = _chain(_put(96, 1.3481, day=date(2026, 5, 14)))
+    sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q)
+    assert (sel["qualified"], sel["reason"]) == (False, "no-entry-day-mark")
+    assert rv.REASON_CLASS[sel["reason"]] == "data"
+
+
+def test_count_constructible_needs_both_legs_on_the_entry_day():
+    assert rv.count_constructible(ENTRY, _chain(_put(96, 1.3), _put(91, 0.3))) == 1
+    assert rv.count_constructible(ENTRY, _chain(_put(96, 1.3), _put(86, 0.2))) == 1
+    assert rv.count_constructible(ENTRY, _chain(_put(96, 1.3), _put(92, 0.3))) == 0
+    # wing row exists but has no bar on the entry day -> not constructible
+    assert rv.count_constructible(
+        ENTRY, _chain(_put(96, 1.3), _put(91, 0.3, day=date(2026, 5, 14)))) == 0
 
 
 # --------------------------------------------------------- managed walk
@@ -325,10 +394,19 @@ def test_end_to_end_replay(tmp_path):
     disk_summary = json.loads((out_dir / "summary.json").read_text())
     assert disk_summary == summary
     avail = summary["availability"]
-    assert avail["overall"]["rate"] == pytest.approx(0.5)
-    assert avail["per_symbol"]["SPY"]["rate"] == pytest.approx(0.5)
-    assert avail["per_month"]["2026-05"]["rate"] == pytest.approx(0.5)
+    # 2 planned entries; 5/20 has no spot bar at all, so it is a DATA gap and
+    # must NOT be charged against the gate. Coverage 1/2, availability 1/1.
+    overall = avail["overall"]
+    assert overall["n_entries"] == 2
+    assert overall["n_data_adequate"] == 1
+    assert overall["data_coverage_rate"] == pytest.approx(0.5)
+    assert overall["availability_rate"] == pytest.approx(1.0)
+    assert overall["availability_rate_strict"] == pytest.approx(1.0)
+    assert avail["per_symbol"]["SPY"]["availability_rate"] == pytest.approx(1.0)
+    assert avail["per_month"]["2026-05"]["data_coverage_rate"] == pytest.approx(0.5)
     assert avail["unqualified_reasons"] == {"no-underlying-bar": 1}
+    assert avail["unqualified_reason_classes"] == {"data": 1}
+    assert summary["data_inventory"]["skipped_call_rows"] == 1
     mp = summary["managed_payoff"]
     assert mp["n_trades"] == 1
     assert mp["win_rate"] == 1.0
@@ -338,3 +416,91 @@ def test_end_to_end_replay(tmp_path):
         "profit_take": 1, "dte_21": 0, "data_end": 0}
     # The European-BS approximation must be disclosed in the report.
     assert any("EUROPEAN" in note for note in summary["approximation_notes"])
+
+
+# ------------------------------------------------- real-data edge cases
+
+
+def test_load_put_contracts_missing_file_is_a_counted_gap_not_a_raise(tmp_path):
+    puts, diag = rv.load_put_contracts(tmp_path, "SPY", EXPIRY)
+    assert puts is None            # data gap, reported, never fabricated
+    assert diag["file"] is None
+
+
+def test_load_put_contracts_skips_junk_and_unions_duplicates(tmp_path):
+    lines = [
+        '{"ticker": "O:SPY260619P00095000", "strike": 95, "bars": '
+        '[{"t": "2026-05-15", "c": 1.0, "n": 40}]}',
+        "{not json",                                            # bad_json
+        '{"ticker": "O:SPY260619C00095000", "strike": 95, "bars": []}',  # call
+        '{"ticker": "weird", "bars": []}',                      # no strike
+        '{"ticker": "O:SPY260619P00090000", "strike": 90, "bars": []}',  # empty
+        # zero close, missing close, unparsable t: each skipped, never filled in
+        '{"ticker": "O:SPY260619P00085000", "strike": 85, "bars": '
+        '[{"t": "2026-05-15", "c": 0}, {"t": "2026-05-18"}, '
+        '{"t": "not-a-date", "c": 1.0}, {"t": "2026-05-19", "c": 0.5, "n": 9}]}',
+        # duplicate strike row: bars are unioned, not dropped
+        '{"ticker": "O:SPY260619P00095000", "strike": 95, "bars": '
+        '[{"t": "2026-05-18", "c": 0.8, "n": 40}]}',
+    ]
+    (tmp_path / "contracts_SPY_2026-06-19.jsonl").write_text("\n".join(lines))
+    puts, diag = rv.load_put_contracts(tmp_path, "SPY", EXPIRY)
+
+    assert sorted(puts) == [85.0, 90.0, 95.0]
+    assert diag["bad_json"] == 1
+    assert diag["calls"] == 1
+    assert diag["no_strike"] == 1
+    assert diag["empty_bars"] == 1
+    assert diag["bad_bars"] == 3           # zero close, no close, bad date
+    assert diag["dup_strikes"] == 1
+    assert sorted(puts[95.0]["bars"]) == [date(2026, 5, 15), date(2026, 5, 18)]
+    assert sorted(puts[85.0]["bars"]) == [date(2026, 5, 19)]  # only usable bar
+
+
+def test_replay_entry_missing_contract_file_is_data_not_gate():
+    rec = rv.replay_entry(ENTRY, "SPY", [EXPIRY], {ENTRY: 100.0},
+                          {EXPIRY: None}, 0.0049, Q)
+    assert rec["qualified"] is False
+    assert rec["reason"] == "no-contract-file"
+    assert rec["reason_class"] == "data"
+    assert rec["data_adequate"] is False    # excluded from the availability denominator
+
+
+def test_replay_entry_all_contracts_empty_is_data_not_gate():
+    puts = {95.0: {"ticker": "O:SPY260619P00095000", "bars": {}}}
+    rec = rv.replay_entry(ENTRY, "SPY", [EXPIRY], {ENTRY: 100.0},
+                          {EXPIRY: puts}, 0.0049, Q)
+    assert rec["reason"] == "no-contract-bars"
+    assert rec["reason_class"] == "data"
+    assert rec["data_adequate"] is False
+
+
+def test_managed_walk_skips_unusable_days_without_filling_them():
+    credit = 1.4
+    short = {date(2026, 5, 18): {"c": 0.0},        # unusable print
+             date(2026, 5, 19): {"c": 1.30},
+             date(2026, 5, 20): {"c": 0.80}}
+    long_ = {date(2026, 5, 18): {"c": 0.15},
+             date(2026, 5, 19): {"c": 0.20},
+             date(2026, 5, 20): {"c": 0.15}}
+    walk = rv.managed_walk(ENTRY, EXPIRY, credit, short, long_)
+    assert walk["skipped_days"] == 1
+    assert walk["walk_days"] == 3
+    assert walk["exit_reason"] == "profit_take"
+    assert walk["exit_date"] == date(2026, 5, 20)  # 5/18 skipped, not marked
+
+
+def test_credit_floor_sensitivity_is_exact_at_and_below_the_floor_used():
+    records = [
+        {"qualified": True, "data_adequate": True, "best_credit_frac": 0.30},
+        {"qualified": False, "data_adequate": True, "best_credit_frac": 0.22},
+        {"qualified": False, "data_adequate": True, "best_credit_frac": 0.12},
+        {"qualified": False, "data_adequate": False, "best_credit_frac": None},
+    ]
+    sens = rv.credit_floor_sensitivity(records, 0.25, (0.10, 0.20, 0.25, 0.30))
+    assert "0.3" not in sens                  # never projects ABOVE the floor used
+    assert sens["0.25"]["n_data_adequate"] == 3   # the data-gap row is excluded
+    assert sens["0.25"]["n_qualified"] == 1
+    assert sens["0.2"]["n_qualified"] == 2
+    assert sens["0.1"]["n_qualified"] == 3
+    assert sens["0.2"]["availability_rate"] == pytest.approx(2 / 3)
