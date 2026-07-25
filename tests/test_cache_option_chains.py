@@ -348,7 +348,7 @@ def test_underlying_set_unions_watchlist_and_open_journal(monkeypatch):
         lambda: [{"symbol": "US.QQQ260626C734000"}, {"symbol": "US.SPY"}],
     )
     # IWM arrives via CORE_UNDERLYINGS; SPY/QQQ dedupe against it.
-    assert m.build_underlying_set() == ["AAPL", "IWM", "QQQ", "SPY"]
+    assert m.build_underlying_set() == ["SPY", "QQQ", "IWM", "AAPL"]
 
 
 def test_underlying_set_includes_todays_shadow_book(monkeypatch):
@@ -359,7 +359,7 @@ def test_underlying_set_includes_todays_shadow_book(monkeypatch):
     monkeypatch.setattr(m, "_shadow_underlyings", lambda: ["CRNX"])
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades", lambda: [])
-    assert m.build_underlying_set() == ["CRNX", "IWM", "QQQ", "SPY"]
+    assert m.build_underlying_set() == ["SPY", "QQQ", "IWM", "CRNX"]
 
 
 def test_shadow_underlyings_store_failure_is_empty(monkeypatch):
@@ -378,7 +378,7 @@ def test_underlying_set_journal_unreadable_falls_back_to_watchlist(monkeypatch):
     monkeypatch.setattr(m, "_shadow_underlyings", lambda: [])
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades", lambda: None)
-    assert m.build_underlying_set() == ["IWM", "QQQ", "SPY"]
+    assert m.build_underlying_set() == ["SPY", "QQQ", "IWM"]
 
 
 def test_underlyings_override_skips_sourcing(monkeypatch):
@@ -402,7 +402,7 @@ def test_core_set_present_with_empty_watchlist(monkeypatch):
     monkeypatch.setattr(m, "_shadow_underlyings", lambda: [])
     monkeypatch.setattr(
         "trading_agent.store.postgres.get_open_journal_trades", lambda: [])
-    assert m.build_underlying_set() == ["IWM", "QQQ", "SPY"]
+    assert m.build_underlying_set() == ["SPY", "QQQ", "IWM"]
 
 
 def test_core_window_constants_cover_sleeve():
@@ -567,3 +567,72 @@ def test_dry_run_fetches_but_writes_nothing(monkeypatch, emits, frozen_today, ca
     assert summary["dry_run"] is True
     assert summary["rows"] == 24
     assert summary["per_underlying"] == {"AAPL": 24}
+
+
+# ---------------------------------------------------------------------------
+# Core-first ordering + the core-empty tripwire (2026-07-25)
+# ---------------------------------------------------------------------------
+
+class TestCoreOrderingAndTripwire:
+    """The 7/22-24 runs wrote ~1000 rows/night across 85 names while SPY alone
+    yields ~1100: the broker's quota drains mid-run and later names return
+    EMPTY without raising. Alphabetically SPY/QQQ/IWM were last, so the
+    sleeve's feed got the leftovers (QQQ: 1 day in 3 weeks)."""
+
+    def test_core_underlyings_come_first(self, monkeypatch):
+        from trading_agent.jobs import cache_option_chains as job
+        monkeypatch.setattr(job, "_watchlist_underlyings",
+                            lambda: ["AAPL", "AAON", "ZM", "SPY"])
+        monkeypatch.setattr(job, "_open_trade_underlyings", lambda: ["IBM"])
+        monkeypatch.setattr(job, "_shadow_underlyings", lambda: ["NVDA"])
+        out = job.build_underlying_set()
+        assert out[:3] == list(job.CORE_UNDERLYINGS)
+        # tail stays deduped + sorted, and never repeats a core name
+        assert out[3:] == sorted({"AAPL", "AAON", "ZM", "IBM", "NVDA"})
+        assert out.count("SPY") == 1
+
+    def test_explicit_override_is_still_a_pure_override(self, monkeypatch):
+        from trading_agent.jobs import cache_option_chains as job
+        monkeypatch.setattr(job, "_watchlist_underlyings", lambda: ["AAPL"])
+        monkeypatch.setattr(job, "_open_trade_underlyings", lambda: [])
+        monkeypatch.setattr(job, "_shadow_underlyings", lambda: [])
+        assert job.build_underlying_set("nvda,aapl") == ["AAPL", "NVDA"]
+
+    def _run_main(self, monkeypatch, per_underlying_rows):
+        """Drive main() with a stubbed snapshot_underlying."""
+        from trading_agent.jobs import cache_option_chains as job
+        monkeypatch.setattr(job, "_watchlist_underlyings", lambda: ["AAPL"])
+        monkeypatch.setattr(job, "_open_trade_underlyings", lambda: [])
+        monkeypatch.setattr(job, "_shadow_underlyings", lambda: [])
+        monkeypatch.setattr(job, "_held_option_expiries", lambda: {})
+        monkeypatch.setattr(job, "_insert_rows", lambda rows: None)
+        monkeypatch.setattr(
+            job, "snapshot_underlying",
+            lambda u, today, held: ([("row",)] * per_underlying_rows.get(u, 0), 0))
+        emitted = []
+        monkeypatch.setattr(job.events, "emit",
+                            lambda **kw: emitted.append(kw))
+        pushes = []
+        monkeypatch.setattr("trading_agent.notify.send",
+                            lambda *a, **kw: pushes.append((a, kw)))
+        rc = job.main([])
+        return rc, emitted, pushes
+
+    def test_core_empty_is_sev_error_and_pushes(self, monkeypatch):
+        from trading_agent import events as ev
+        rc, emitted, pushes = self._run_main(
+            monkeypatch, {"SPY": 100, "IWM": 100, "AAPL": 50})  # QQQ -> 0
+        payload = emitted[0]["payload"]
+        assert payload["core_empty"] == ["QQQ"]
+        assert emitted[0]["severity"] == ev.SEV_ERROR
+        assert len(pushes) == 1 and "QQQ" in pushes[0][1]["title"]
+        assert rc == 0  # a hole is an alert, not a job failure
+
+    def test_all_core_present_is_quiet(self, monkeypatch):
+        from trading_agent import events as ev
+        rc, emitted, pushes = self._run_main(
+            monkeypatch, {"SPY": 100, "QQQ": 100, "IWM": 100, "AAPL": 0})
+        payload = emitted[0]["payload"]
+        assert payload["core_empty"] == []
+        assert emitted[0]["severity"] == ev.SEV_INFO
+        assert pushes == []

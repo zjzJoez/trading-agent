@@ -215,10 +215,17 @@ def build_underlying_set(override: str | None = None) -> list[str]:
     """
     if override:
         return sorted({t.strip().upper() for t in override.split(",") if t.strip()})
-    return sorted(set(CORE_UNDERLYINGS)
-                  | set(_watchlist_underlyings())
-                  | set(_open_trade_underlyings())
-                  | set(_shadow_underlyings()))
+    rest = (set(_watchlist_underlyings())
+            | set(_open_trade_underlyings())
+            | set(_shadow_underlyings())) - set(CORE_UNDERLYINGS)
+    # CORE FIRST, then the alphabetical tail. Ordering is load-bearing, not
+    # cosmetic: the 2026-07-22..24 runs wrote ~1000 rows/night across 85
+    # names while SPY alone yields ~1100 — the broker's snapshot/expiry
+    # quota drains partway through and later names come back EMPTY (no
+    # exception, so they were recorded as clean zeros). Alphabetically
+    # SPY/QQQ/IWM sit near the end, so the sleeve's own data feed was
+    # whatever the watchlist left over: QQQ got 1 day in 3 weeks.
+    return list(CORE_UNDERLYINGS) + sorted(rest)
 
 
 def _pick_expiries(expiry_rows: list[dict], today: date, *,
@@ -439,11 +446,18 @@ def main(argv: list[str] | None = None) -> int:
                 log.warning("[cache_option_chains] moomoo shutdown failed: %s", e)
 
     all_failed = bool(underlyings) and len(failures) == len(underlyings)
+    # A core underlying that returns ZERO rows without raising is the silent
+    # failure that cost three weeks of QQQ history: the broker answers with an
+    # empty expiry list / empty snapshot instead of an error, so nothing
+    # anywhere records a problem. Sleeve 1 cannot be evaluated on a feed that
+    # skips days, so this is its own loud finding.
+    core_empty = sorted(u for u in CORE_UNDERLYINGS
+                        if u in per_underlying and not per_underlying[u])
     if not args.dry_run:
         # One audit row per run. Every underlying failing means OpenD itself
         # is down/unreachable — that's a sev-2 (operator should look), a few
         # individual misses (including partially-quoted expiries) are a warn.
-        severity = (events.SEV_ERROR if all_failed
+        severity = (events.SEV_ERROR if (all_failed or core_empty)
                     else events.SEV_WARN if (failures or partial_expiries)
                     else events.SEV_INFO)
         events.emit(
@@ -457,9 +471,23 @@ def main(argv: list[str] | None = None) -> int:
                 "failures": failures,
                 "partial_expiries": partial_expiries,
                 "all_failed": all_failed,
+                "core_empty": core_empty,
             },
             severity=severity,
         )
+        if core_empty:
+            from trading_agent import notify
+            notify.send(
+                "risk",
+                title=f"chain cache: {', '.join(core_empty)} returned 0 contracts",
+                body=(f"Snapshot {today.isoformat()} has a hole in sleeve 1's "
+                      f"own chain history (core underlyings are fetched FIRST, "
+                      f"so an empty result means the broker answered empty, not "
+                      f"that quota ran out downstream). Check OpenD and the "
+                      f"expiry listing for these names."),
+                priority=4,
+                tags=["warning"],
+            )
 
     summary = {
         "ts": datetime.now(timezone.utc).isoformat(),
