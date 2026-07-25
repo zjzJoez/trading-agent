@@ -22,16 +22,34 @@ move when `data/execution_costs.json` is recalibrated.
 **Friction-truth fix, 2026-07-25.** `execution_costs.friction_r` used to proxy
 BOTH legs of a vertical by the net credit (leg-mid-sum ≈ 2 × credit), which is
 exact only at a wing ratio `r = long/short = 1/3`. Real stored quotes
-(`option_chain_snapshots`, IWM PUTS 30–37 DTE, short |delta| 0.20–0.35) measure
-`r = 0.731` on $5-wides (n=32 pairs) and `0.530` on $10-wides (n=25), i.e.
-leg-mid-sum/credit of **6.43 / 3.26 versus the assumed 2.0** — the model
+(`option_chain_snapshots`, IWM PUTS 30–37 DTE, short |delta| 0.20–0.35, each
+width from 3 distinct (day, expiry) chains) measure `r` median `0.731` / p75
+`0.734` on $5-wides (n=32 pairs) and `0.530` / p75 `0.536` on $10-wides (n=25),
+i.e. leg-mid-sum/credit of **6.43 / 3.26 versus the assumed 2.0** — the model
 understated the vertical spread bill by ~3× on $5-wides. Verticals now price
 through `friction_r` off real per-leg marks (`combo_friction_r` on the live
-combo path) or the MEASURED wing ratio, and the fallback is deliberately the
-conservative end. Consequence: `credit_put_spread_30_45`'s net breakeven moved
-from ~77% to **~87%**, i.e. ABOVE its own declared 70–80% envelope. Nothing was
-retuned to hide that — see the spec's comment and
+combo path, which also charges the leg's LIVE bid/ask when the order guard has
+it) or the MEASURED wing ratio.
+
+The blind fallback is an **upper quantile, not a median**: the modeled bill
+`cr(1+r)/(1−r)` has derivative `2cr/(1−r)² > 0`, so it is strictly increasing in
+`r` and a median understates friction for every structure above it — the exact
+opposite of fail-conservative. `DEFAULT_WING_RATIO` is therefore the largest
+measured p75, ratio selection is width-aware (`by_width` p75 at the exact width,
+else the max over narrower measured widths), and any ratio resolved from the
+calibration file is floored at the smallest ratio ever measured on a real chain.
+
+Consequence: `credit_put_spread_30_45`'s net breakeven moved from ~77% to
+**~87%**, i.e. ABOVE its own declared 70–80% envelope. Nothing was retuned to
+hide that — see the spec's comment and
 `tests/test_strategy_specs.py::test_vertical_spec_breakeven_now_exceeds_its_declared_wr_envelope`.
+
+Calibration figures are only published with **independence**: both the
+per-underlying block and each `by_width` block need at least `--min-chains`
+(default 3) distinct (day, expiry) chains plus a per-width pair floor, or they
+are recorded under `by_width_refused` and never persisted. Pairs off one chain
+share one vol surface — counting them as a sample is how a single snapshot gets
+acted on as if it described the name.
 
 ## Registry
 

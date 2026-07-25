@@ -88,8 +88,8 @@ def round_trip_friction_r(
     return (fees + spread) / risk_per_unit
 
 
-def breakeven_wr_net(min_rr: float, friction_r: float) -> float:
-    """Breakeven WR when every trade also pays ``friction_r`` R of friction.
+def breakeven_wr_net(min_rr: float, friction: float) -> float:
+    """Breakeven WR when every trade also pays ``friction`` R of friction.
 
     A win nets ``rr − f`` R, a loss nets ``−(1 + f)`` R; solving
     ``p(rr − f) = (1 − p)(1 + f)`` gives ``p = (1 + f)/(1 + rr)``.
@@ -97,10 +97,15 @@ def breakeven_wr_net(min_rr: float, friction_r: float) -> float:
     ever raises the bar. Anchor: rr 1.3 with the system's typical ~0.18R
     friction → 1.18/2.3 ≈ 51%, inside the 50–57% band the Phase-0 cost
     audit measured.
+
+    The parameter is ``friction``, NOT ``friction_r``: this module imports
+    ``execution_costs.friction_r`` at module scope (line 29) and a parameter
+    of that name would shadow the imported callable inside this body. All
+    callers pass it positionally.
     """
-    if friction_r < 0:
-        raise ValueError(f"friction_r must be >= 0, got {friction_r}")
-    return (1.0 + friction_r) / (1.0 + min_rr)
+    if friction < 0:
+        raise ValueError(f"friction must be >= 0, got {friction}")
+    return (1.0 + friction) / (1.0 + min_rr)
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +273,10 @@ def _credit_put_spread_spec() -> StrategySpec:
     # 6.43 ($5-wide) / 3.26 ($10-wide) — the guess understated the spread
     # bill ~3×. The vertical now prices through the cost model's own
     # vertical function, which resolves the two leg marks from the MEASURED
-    # wing ratio (execution_costs.DEFAULT_WING_RATIO, deliberately the
-    # conservative end) instead of a hand-typed per-leg premium.
+    # wing ratio (execution_costs.DEFAULT_WING_RATIO — the p75 of the measured
+    # per-pair ratio, since the bill is strictly increasing in r and a median
+    # would understate it for half of all structures) instead of a hand-typed
+    # per-leg premium.
     #
     # Consequence, stated plainly: at the global uncalibrated 4%-of-mark
     # half-spread this lands ~0.22R of friction and pushes breakeven_wr_net

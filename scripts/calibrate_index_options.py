@@ -35,12 +35,30 @@ the same feed that accumulates daily. It is the default when the US market is
 closed. ``--source live`` samples OpenD in-session (requires MoomooOpenD, i.e.
 EC2 next to trading-agent-opend.service).
 
+INDEPENDENCE GATE (2026-07-25)
+------------------------------
+Quote and pair counts do not measure independence: one (day, expiry) chain of
+26 strikes yields ~9 $5-wide "pairs" that all share a single snapshot and a
+single vol surface. Every published figure — the per-underlying block AND each
+``by_width`` block — must therefore come from at least ``--min-chains``
+(default 3) DISTINCT (day, expiry) chains and ``--min-pairs-per-width`` pairs.
+A block that fails is recorded under ``by_width_refused`` with the reason and
+is NOT persisted, so no consumer can reach it; ``_decision_scenarios`` applies
+the same gate at the point of use. Refuse to publish, never publish thin.
+
+The persisted ``wing_ratio`` is the p75 of the per-pair ratio, not the median:
+the modeled spread bill ``cr(1+r)/(1-r)`` is strictly increasing in r, so a
+median understates friction for every structure above it (see
+``execution_costs.DEFAULT_WING_RATIO``). The median is kept alongside it as
+``wing_ratio_median`` for provenance.
+
 REPORT ONLY — the spec/whitelist change is the operator's call.
 
 Usage:
     .venv/bin/python scripts/calibrate_index_options.py \
         --underlyings SPY,QQQ,IWM [--source auto|snapshots|live] \
-        [--since-days 120] [--min-quotes 40] [--min-pairs 10] [--dry-run]
+        [--since-days 120] [--min-quotes 40] [--min-pairs 10] \
+        [--min-chains 3] [--min-pairs-per-width N] [--dry-run]
 """
 from __future__ import annotations
 
@@ -72,6 +90,15 @@ WIDTHS: tuple[float, ...] = (5.0, 10.0)
 # per call (the EOD chain job batches 300), so one batch per expiry stays well
 # inside the futu request budget while covering the whole band.
 STRIKE_MIN_FRAC_OF_SPOT = 0.80
+# --- independence floor (2026-07-25) --------------------------------------
+# n_pairs is NOT a sample size. One (day, expiry) chain of 26 strikes yields
+# ~9 "independent" pairs that share one snapshot, one vol surface and one
+# market-maker posture; a median over them measures that single chain, not the
+# name. So both the per-underlying figures and each per-width block must come
+# from at least this many DISTINCT (day, expiry) chains before they may be
+# persisted or fed to the decision line. Refuse to publish, never publish thin.
+MIN_CHAINS_DEFAULT = 3
+MIN_PAIRS_PER_WIDTH_DEFAULT = 10
 QUOTE_BATCH = 120         # codes per get_quote call
 MAX_CODES_PER_EXPIRY = 120
 # futu OpenAPI limits get_option_chain to ~10 requests per 30 s. Cap expiries
@@ -277,6 +304,12 @@ def _median(xs: list[float]) -> float | None:
 
 
 def _p75(xs: list[float]) -> float | None:
+    """Lower-interpolating 75th percentile (index ``int(0.75·(n−1))``).
+
+    Used for the wing ratio as well as the spread, because ``execution_costs``
+    needs an UPPER quantile for any figure whose consumer's cost is increasing
+    in it: a median understates the bill for every observation above it.
+    """
     if not xs:
         return None
     s = sorted(xs)
@@ -351,6 +384,10 @@ def analyse(quotes: list[dict]) -> dict:
             "n_pairs": len(pairs),
             "n_chains": len({(p["day"], p["expiry"]) for p in pairs}),
             "wing_ratio": _median([p["wing_ratio"] for p in pairs]),
+            # UPPER quantile of the per-pair ratio — the figure a blind
+            # consumer must use, since the spread bill is strictly increasing
+            # in r (see execution_costs.DEFAULT_WING_RATIO).
+            "wing_ratio_p75": _p75([p["wing_ratio"] for p in pairs]),
             "credit_frac_median": _median([p["credit_frac"] for p in pairs]),
             "legsum_over_credit": _median(
                 [(p["short"]["mid"] + p["long"]["mid"]) / p["credit"]
@@ -361,7 +398,8 @@ def analyse(quotes: list[dict]) -> dict:
             "dte_observed": (min((p["dte"] for p in pairs), default=None),
                              max((p["dte"] for p in pairs), default=None)),
         }
-    pooled = [q["spread_pct"] for q in short_zone + wing_quotes]
+    zone_quotes = short_zone + wing_quotes
+    pooled = [q["spread_pct"] for q in zone_quotes]
     days = sorted({q["day"] for q in quotes})
     return {
         "n_raw_quotes": len(quotes),
@@ -370,6 +408,9 @@ def analyse(quotes: list[dict]) -> dict:
         "n_wing_zone": len(wing_quotes),
         "n_quotes": len(pooled),
         "n_pairs": total_pairs,
+        # INDEPENDENCE, not volume: distinct (day, expiry) chains behind the
+        # pooled zone figures. 60 quotes off one chain is one observation.
+        "n_chains": len({(q["day"], q["expiry"]) for q in zone_quotes}),
         "short_zone_spread_pct": _median([q["spread_pct"] for q in short_zone]),
         "wing_zone_spread_pct": _median([q["spread_pct"] for q in wing_quotes]),
         "median_spread_pct_mid": _median(pooled),
@@ -379,27 +420,71 @@ def analyse(quotes: list[dict]) -> dict:
     }
 
 
-def _pick_wing_ratio(stats: dict) -> float | None:
-    """One scalar wing ratio for the persisted entry.
+def width_refusal(v: dict, *, min_chains: int, min_pairs: int) -> str | None:
+    """Why this per-width block must NOT be published/used, or None.
 
-    The MAX of the per-width medians: ``legsum = cr(1+r)/(1-r)`` is
-    increasing in r, so the largest measured ratio is the conservative
-    (friction-overstating) choice for a consumer that knows only
-    (width, credit). Per-width figures are preserved under ``by_width``.
+    Counting quotes and pairs is not enough: a $5-wide block built from one
+    (day, expiry) chain describes one moment of one vol surface, and a figure
+    like ``wing_ratio`` computed from it would be acted on as if it described
+    the name. Both the pair count AND the chain count must clear their floor.
     """
-    rs = [v["wing_ratio"] for v in stats["by_width"].values()
-          if v["wing_ratio"] is not None]
+    n_pairs = int(v.get("n_pairs") or 0)
+    n_chains = int(v.get("n_chains") or 0)
+    if n_pairs < min_pairs or n_chains < min_chains:
+        return (f"{n_pairs} pairs (need {min_pairs}) from {n_chains} "
+                f"independent (day,expiry) chains (need {min_chains})")
+    return None
+
+
+def _publishable_widths(
+    by_width: dict, *, min_chains: int, min_pairs: int
+) -> tuple[dict, dict]:
+    """Split ``by_width`` into (publishable, {width_label: refusal reason})."""
+    ok: dict = {}
+    refused: dict = {}
+    for w, v in by_width.items():
+        why = width_refusal(v, min_chains=min_chains, min_pairs=min_pairs)
+        if why:
+            refused[f"{float(w):g}"] = why
+        else:
+            ok[w] = v
+    return ok, refused
+
+
+def _pick_wing_ratio(by_width: dict) -> float | None:
+    """One scalar wing ratio for the persisted entry — the UPPER quantile.
+
+    The MAX over widths of each width's p75: ``legsum = cr(1+r)/(1-r)`` is
+    strictly increasing in r, so both maximisations push the same way —
+    towards OVERSTATING friction for a consumer that knows only
+    (width, credit). A median here would understate the bill for every real
+    structure whose ratio sits above it. Per-width medians AND p75s are
+    preserved under ``by_width``; pass only PUBLISHABLE widths in.
+    """
+    rs = [v.get("wing_ratio_p75") if v.get("wing_ratio_p75") is not None
+          else v.get("wing_ratio")
+          for v in by_width.values()]
+    rs = [r for r in rs if r is not None]
     return max(rs) if rs else None
 
 
-def _pick_credit_frac(stats: dict) -> float | None:
+def _pick_wing_ratio_median(by_width: dict) -> float | None:
+    """MAX over widths of each width's MEDIAN ratio — reported alongside the
+    p75 so the persisted record shows the whole distribution, never just the
+    figure the cost model consumes."""
+    rs = [v["wing_ratio"] for v in by_width.values()
+          if v.get("wing_ratio") is not None]
+    return max(rs) if rs else None
+
+
+def _pick_credit_frac(by_width: dict) -> float | None:
     """Credit/width median at the DECISION width when measured, else the
-    smallest measured width median (the pessimistic end)."""
-    bw = stats["by_width"]
-    at_decision = bw.get(DECISION_WIDTH, {}).get("credit_frac_median")
+    smallest measured width median (the pessimistic end). Publishable widths
+    only."""
+    at_decision = by_width.get(DECISION_WIDTH, {}).get("credit_frac_median")
     if at_decision is not None:
         return at_decision
-    cs = [v["credit_frac_median"] for v in bw.values()
+    cs = [v["credit_frac_median"] for v in by_width.values()
           if v["credit_frac_median"] is not None]
     return min(cs) if cs else None
 
@@ -455,7 +540,12 @@ def _zone_inputs(entry: dict) -> tuple[float, float, float] | None:
     return float(sp), float(wp), float(r)
 
 
-def _decision_scenarios(entry: dict) -> list[dict]:
+def _decision_scenarios(
+    entry: dict,
+    *,
+    min_chains: int = MIN_CHAINS_DEFAULT,
+    min_pairs: int = MIN_PAIRS_PER_WIDTH_DEFAULT,
+) -> list[dict]:
     """Every (width, credit) the verdict is evaluated at, with ITS OWN
     measured zone spreads and wing ratio.
 
@@ -465,12 +555,17 @@ def _decision_scenarios(entry: dict) -> list[dict]:
     can clear the bar while a $5-wide fails. Each width is evaluated at the
     gate-floor credit (width/4) AND at the credit the chain actually pays.
     Falls back to the scalar entry when no per-width block exists.
+
+    A per-width block that fails :func:`width_refusal` is SKIPPED even if it
+    is present in the entry — the independence gate is enforced at the point
+    of USE as well as at the point of publication, so a by_width block written
+    by an older, ungated run can never drive a whitelist verdict.
     """
     out: list[dict] = []
     by_width = entry.get("by_width") or {}
     seen = False
     for key, v in sorted(by_width.items(), key=lambda kv: float(kv[0])):
-        if not v.get("n_pairs"):
+        if width_refusal(v, min_chains=min_chains, min_pairs=min_pairs):
             continue
         zi = _zone_inputs(v)
         if zi is None:
@@ -501,14 +596,15 @@ def _decision_scenarios(entry: dict) -> list[dict]:
              "wing_ratio": r} for label, credit in credits]
 
 
-def _print_decision_block(t: str, entry: dict) -> None:
+def _print_decision_block(t: str, entry: dict, **gate) -> None:
     """Per-underlying, per-width friction verdict with the arithmetic."""
-    scenarios = _decision_scenarios(entry)
+    scenarios = _decision_scenarios(entry, **gate)
     if not scenarios:
-        print(f"  {t}: NOT ASSESSED — zone measurement incomplete "
-              f"(wing_ratio={entry.get('wing_ratio')}, "
+        print(f"  {t}: NOT ASSESSED — zone measurement incomplete or below "
+              f"the independence floor (wing_ratio={entry.get('wing_ratio')}, "
               f"short={entry.get('short_zone_spread_pct')}, "
-              f"wing={entry.get('wing_zone_spread_pct')})")
+              f"wing={entry.get('wing_zone_spread_pct')}, refused widths "
+              f"{entry.get('by_width_refused') or {}})")
         return
     for s in scenarios:
         d = _decision_friction_r(
@@ -529,8 +625,8 @@ def _print_decision_block(t: str, entry: dict) -> None:
               f"on R ${d['risk']:.2f}")
 
 
-def _worst_friction_r(entry: dict, width: float | None = DECISION_WIDTH
-                      ) -> float | None:
+def _worst_friction_r(entry: dict, width: float | None = DECISION_WIDTH,
+                      **gate) -> float | None:
     """Worst (largest) modeled friction across the credit scenarios.
 
     ``width=None`` pools every measured width; the default restricts to the
@@ -543,13 +639,14 @@ def _worst_friction_r(entry: dict, width: float | None = DECISION_WIDTH
             wing_zone_spread_pct=s["wing_zone_spread_pct"],
             wing_ratio=s["wing_ratio"], net_credit=s["net_credit"],
             width=s["width"])["friction_r"]
-        for s in _decision_scenarios(entry or {})
+        for s in _decision_scenarios(entry or {}, **gate)
         if width is None or abs(s["width"] - width) < 1e-9
     ]
     return max(frs) if frs else None
 
 
-def _best_friction_r(entry: dict, width: float | None = None) -> float | None:
+def _best_friction_r(entry: dict, width: float | None = None,
+                     **gate) -> float | None:
     """Best (smallest) modeled friction across widths/credits — used only to
     tell the operator when SOME measured structure clears the bar even
     though the decision-width one does not."""
@@ -559,7 +656,7 @@ def _best_friction_r(entry: dict, width: float | None = None) -> float | None:
             wing_zone_spread_pct=s["wing_zone_spread_pct"],
             wing_ratio=s["wing_ratio"], net_credit=s["net_credit"],
             width=s["width"])["friction_r"]
-        for s in _decision_scenarios(entry or {})
+        for s in _decision_scenarios(entry or {}, **gate)
         if width is None or abs(s["width"] - width) < 1e-9
     ]
     return min(frs) if frs else None
@@ -605,38 +702,71 @@ def _round(v, n=5):
     return None if v is None else round(float(v), n)
 
 
-def build_entry(stats: dict, *, source: str, sample_window: str,
-                now: str) -> dict:
-    """The persisted ``per_underlying`` record for one calibrated name."""
+def build_entry(stats: dict, *, source: str, sample_window: str, now: str,
+                min_chains: int, min_pairs_per_width: int) -> dict:
+    """The persisted ``per_underlying`` record for one calibrated name.
+
+    Only per-width blocks that clear BOTH the pair floor and the independence
+    floor are persisted; the rest are recorded under ``by_width_refused`` with
+    the reason, so the refusal is auditable but the numbers are unreachable by
+    any consumer (``execution_costs`` and ``_decision_scenarios`` both read
+    ``by_width``). The scalar ``wing_ratio`` / ``credit_frac_median`` are
+    picked from the publishable blocks only.
+
+    Record convention, at BOTH the scalar and the per-width level:
+    ``wing_ratio`` is the figure consumers must use, and it is the UPPER
+    quantile (p75) — the modeled spread bill ``cr(1+r)/(1-r)`` is strictly
+    increasing in r, so a median understates friction for every structure whose
+    ratio sits above it. ``wing_ratio_p75`` repeats it explicitly and
+    ``wing_ratio_median`` records the median for provenance. Nothing consumes
+    the median.
+    """
+
+    def _consumable_ratio(v: dict) -> float | None:
+        return v["wing_ratio_p75"] if v.get("wing_ratio_p75") is not None \
+            else v.get("wing_ratio")
+
+    pub, refused = _publishable_widths(
+        stats["by_width"], min_chains=min_chains,
+        min_pairs=min_pairs_per_width)
     return {
         # Pooled short+wing median — what a zone-unaware consumer gets.
         "median_spread_pct_mid": _round(stats["median_spread_pct_mid"]),
         "spread_pct_of_mid_p75": _round(stats["spread_pct_of_mid_p75"]),
         "short_zone_spread_pct": _round(stats["short_zone_spread_pct"]),
         "wing_zone_spread_pct": _round(stats["wing_zone_spread_pct"]),
-        "wing_ratio": _round(_pick_wing_ratio(stats), 4),
-        "credit_frac_median": _round(_pick_credit_frac(stats), 4),
+        # The figure the cost model consumes: fail-conservative upper quantile.
+        "wing_ratio": _round(_pick_wing_ratio(pub), 4),
+        "wing_ratio_p75": _round(_pick_wing_ratio(pub), 4),
+        "wing_ratio_median": _round(_pick_wing_ratio_median(pub), 4),
+        "credit_frac_median": _round(_pick_credit_frac(pub), 4),
         "n_quotes": stats["n_quotes"],
         "n_pairs": stats["n_pairs"],
+        "n_chains": stats["n_chains"],
         "n_short_zone": stats["n_short_zone"],
         "n_wing_zone": stats["n_wing_zone"],
         "source": source,
         "sample_window": sample_window,
         "zone": ZONE_DESC,
         "calibrated_at": now,
+        "min_chains": min_chains,
+        "min_pairs_per_width": min_pairs_per_width,
         "by_width": {
             f"{w:g}": {
                 "n_pairs": v["n_pairs"],
                 "n_chains": v["n_chains"],
-                "wing_ratio": _round(v["wing_ratio"], 4),
+                "wing_ratio": _round(_consumable_ratio(v), 4),
+                "wing_ratio_p75": _round(v["wing_ratio_p75"], 4),
+                "wing_ratio_median": _round(v["wing_ratio"], 4),
                 "credit_frac_median": _round(v["credit_frac_median"], 4),
                 "legsum_over_credit": _round(v["legsum_over_credit"], 3),
                 "short_zone_spread_pct": _round(v["short_zone_spread_pct"]),
                 "wing_zone_spread_pct": _round(v["wing_zone_spread_pct"]),
                 "dte_observed": list(v["dte_observed"]),
             }
-            for w, v in stats["by_width"].items()
+            for w, v in pub.items()
         },
+        "by_width_refused": refused,
     }
 
 
@@ -653,24 +783,29 @@ def _resolve_source(arg: str) -> str:
     return "live" if is_us_market_open() else "snapshots"
 
 
-def _print_underlying_stats(t: str, stats: dict) -> None:
+def _print_underlying_stats(t: str, stats: dict, *, min_chains: int,
+                            min_pairs_per_width: int) -> None:
     days = stats["days"]
     span = f" [{days[0]}..{days[-1]}]" if days else ""
     nd = f" ({stats['n_no_delta']} without delta)" if stats["n_no_delta"] else ""
     print(f"  {t}: raw {stats['n_raw_quotes']} quotes{nd} over "
           f"{len(days)} day(s){span} -> short-zone {stats['n_short_zone']}, "
-          f"wing-zone {stats['n_wing_zone']}, pairs {stats['n_pairs']}")
+          f"wing-zone {stats['n_wing_zone']}, pairs {stats['n_pairs']}, "
+          f"independent chains {stats['n_chains']}")
     for w, v in stats["by_width"].items():
         if not v["n_pairs"]:
             print(f"      ${w:g}-wide: no pairs")
             continue
+        why = width_refusal(v, min_chains=min_chains,
+                            min_pairs=min_pairs_per_width)
         print(f"      ${w:g}-wide: n={v['n_pairs']} pairs / {v['n_chains']} "
               f"chains, DTE {v['dte_observed'][0]}-{v['dte_observed'][1]}, "
               f"short {v['short_zone_spread_pct']:.2%} wing "
-              f"{v['wing_zone_spread_pct']:.2%}, wing_ratio "
-              f"{v['wing_ratio']:.3f}, legsum/credit "
-              f"{v['legsum_over_credit']:.2f}, credit/width "
-              f"{v['credit_frac_median']:.3f}")
+              f"{v['wing_zone_spread_pct']:.2%}, wing_ratio med "
+              f"{v['wing_ratio']:.3f} p75 {v['wing_ratio_p75']:.3f}, "
+              f"legsum/credit {v['legsum_over_credit']:.2f}, credit/width "
+              f"{v['credit_frac_median']:.3f}"
+              + (f"  [REFUSED: {why}]" if why else ""))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -686,6 +821,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="minimum usable ZONE quotes per underlying to calibrate")
     p.add_argument("--min-pairs", type=int, default=10,
                    help="minimum vertical pairs per underlying to calibrate")
+    p.add_argument("--min-chains", type=int, default=MIN_CHAINS_DEFAULT,
+                   help="minimum DISTINCT (day, expiry) chains behind a "
+                        "figure, per underlying AND per width. Pairs off one "
+                        "chain share a vol surface, so pair counts alone can "
+                        "make one snapshot look like a sample.")
+    p.add_argument("--min-pairs-per-width", type=int, default=None,
+                   help=f"minimum pairs for a per-width block to be published "
+                        f"or used (default: --min-pairs, i.e. the same bar as "
+                        f"the underlying; module default "
+                        f"{MIN_PAIRS_PER_WIDTH_DEFAULT})")
     p.add_argument("--dry-run", action="store_true",
                    help="report medians + decision line only; no file write")
     args = p.parse_args(argv)
@@ -693,6 +838,10 @@ def main(argv: list[str] | None = None) -> int:
     if not underlyings:
         print("no underlyings given", file=sys.stderr)
         return 1
+    min_chains = max(1, int(args.min_chains))
+    min_ppw = int(args.min_pairs_per_width if args.min_pairs_per_width
+                  is not None else args.min_pairs)
+    gate = {"min_chains": min_chains, "min_pairs": min_ppw}
 
     from trading_agent.config import CONFIG
     source = _resolve_source(args.source)
@@ -736,21 +885,36 @@ def main(argv: list[str] | None = None) -> int:
     skipped: dict[str, str] = {}
     for t in underlyings:
         stats = analyse(by_name.get(t) or [])
-        _print_underlying_stats(t, stats)
-        if stats["n_quotes"] < args.min_quotes or stats["n_pairs"] < args.min_pairs:
+        _print_underlying_stats(t, stats, min_chains=min_chains,
+                                min_pairs_per_width=min_ppw)
+        if (stats["n_quotes"] < args.min_quotes
+                or stats["n_pairs"] < args.min_pairs
+                or stats["n_chains"] < min_chains):
             why = (f"INSUFFICIENT DATA — {stats['n_quotes']} zone quotes "
                    f"(need {args.min_quotes}), {stats['n_pairs']} pairs "
-                   f"(need {args.min_pairs})")
+                   f"(need {args.min_pairs}), {stats['n_chains']} independent "
+                   f"(day,expiry) chains (need {min_chains})")
             skipped[t] = why
             print(f"  {t}: {why} — NOT calibrated")
             continue
-        entry = build_entry(stats, source=source, sample_window=window, now=now)
+        entry = build_entry(stats, source=source, sample_window=window, now=now,
+                            min_chains=min_chains, min_pairs_per_width=min_ppw)
         calibrated[t] = entry
+        if entry["by_width_refused"]:
+            for wl, wwhy in sorted(entry["by_width_refused"].items()):
+                print(f"      ${wl}-wide: NOT PUBLISHED — {wwhy}")
+        if entry["wing_ratio"] is None:
+            print(f"  {t}: PARTIAL — pooled spreads published, but NO width "
+                  f"cleared the independence floor, so no wing ratio and no "
+                  f"credit fraction are published for this name. Consumers "
+                  f"fall back to the conservative measured default.")
+            continue
         print(f"  {t}: CALIBRATED  short-zone "
               f"{entry['short_zone_spread_pct']:.2%}  wing-zone "
               f"{entry['wing_zone_spread_pct']:.2%}  pooled "
-              f"{entry['median_spread_pct_mid']:.2%}  wing_ratio "
-              f"{entry['wing_ratio']:.3f}  credit/width "
+              f"{entry['median_spread_pct_mid']:.2%}  wing_ratio p75 "
+              f"{entry['wing_ratio_p75']:.3f} (median "
+              f"{entry['wing_ratio_median']:.3f})  credit/width "
               f"{entry['credit_frac_median']:.3f}")
 
     # --- friction verdict per underlying ---------------------------------
@@ -758,14 +922,18 @@ def main(argv: list[str] | None = None) -> int:
           f"{DECISION_BAR_R}R whitelist bar:")
     for t in underlyings:
         if t in calibrated:
-            _print_decision_block(t, calibrated[t])
+            _print_decision_block(t, calibrated[t], **gate)
         else:
             print(f"  {t}: NOT ASSESSED — {skipped.get(t, 'no data')}")
     if "IWM" in underlyings:
         entry = calibrated.get("IWM", {})
-        fr = _worst_friction_r(entry)          # the plan's $5-wide decision line
+        # the plan's $5-wide decision line
+        fr = _worst_friction_r(entry, **gate)
         if fr is None:
-            print("IWM NOT ASSESSED — insufficient zone data this run")
+            why = skipped.get("IWM") or (
+                f"no width cleared the independence floor (min-chains "
+                f"{min_chains}, min-pairs-per-width {min_ppw})")
+            print(f"IWM NOT ASSESSED — insufficient zone data this run: {why}")
         elif fr > DECISION_BAR_R:
             print(f"IWM EXCLUDED (friction_r {fr:.3f}R > {DECISION_BAR_R}R on "
                   f"the plan's ${DECISION_WIDTH:g}-wide decision line) — the "
@@ -774,7 +942,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"printed on 2026-07-22 came from two errors: the net_credit "
                   f"leg-mark proxy (leg-mid-sum 2x credit vs a measured 6.4x) "
                   f"and a |delta| 0.03-0.40 sample zone.")
-            best = _best_friction_r(entry)
+            best = _best_friction_r(entry, **gate)
             if best is not None and best <= DECISION_BAR_R:
                 print(f"      NOTE: some measured width/credit combination "
                       f"does clear the bar ({best:.3f}R) — see the per-width "
@@ -787,7 +955,8 @@ def main(argv: list[str] | None = None) -> int:
               "operator's call)")
 
     if not calibrated:
-        print("no underlying reached --min-quotes/--min-pairs; nothing written.")
+        print("no underlying reached --min-quotes/--min-pairs/--min-chains; "
+              "nothing written.")
         return 1
     if args.dry_run:
         print("(dry-run — data/execution_costs.json untouched)")

@@ -156,7 +156,8 @@ def test_vertical_spec_friction_comes_from_the_vertical_cost_function():
     assert p.breakeven_wr_net > breakeven_wr_net(min_rr, old)
 
 
-def test_vertical_spec_breakeven_now_exceeds_its_declared_wr_envelope():
+def test_vertical_spec_breakeven_now_exceeds_its_declared_wr_envelope(
+        tmp_path, monkeypatch):
     """HONEST CONSEQUENCE, pinned deliberately (2026-07-25).
 
     With the friction bill computed off real per-leg marks, a $5-wide
@@ -168,11 +169,35 @@ def test_vertical_spec_breakeven_now_exceeds_its_declared_wr_envelope():
     wing ratio, or retirement) is the operator's call. If the spec or the
     calibration is deliberately changed, this test SHOULD fail and be
     updated with the reasoning.
+
+    HERMETIC (fixed 2026-07-25): the pinned figure describes the UNCALIBRATED
+    fallback, so it is asserted against a spec rebuilt with an EMPTY tmp_path
+    data_dir. Reading the import-time REGISTRY instead made the pin depend on
+    whether a gitignored data/execution_costs.json happened to exist in the
+    developer's working tree — the number would silently change with a local
+    calibration run and pass or fail for reasons unrelated to the code.
     """
-    p = REGISTRY["credit_put_spread_30_45"].expectancy_profile
-    lo, hi = p.expected_wr_range
-    assert p.breakeven_wr_net > hi
-    assert p.breakeven_wr_net == pytest.approx(0.8694, abs=1e-3)
+    import dataclasses
+
+    import trading_agent.strategy_specs as ss
+    from trading_agent import config as config_mod
+    from trading_agent import execution_costs as ec
+    monkeypatch.setattr(config_mod, "CONFIG",
+                        dataclasses.replace(config_mod.CONFIG,
+                                            data_dir=tmp_path))
+    ec.reset_calibration_cache()
+    try:
+        assert not (tmp_path / "execution_costs.json").exists()
+        p = ss._credit_put_spread_spec().expectancy_profile
+        lo, hi = p.expected_wr_range
+        assert p.breakeven_wr_net > hi
+        assert p.breakeven_wr_net == pytest.approx(0.8713, abs=1e-3)
+        # the pin is arithmetic, not a magic number: R:R 0.40 and the
+        # uncalibrated $5-wide friction the cost model reports for it
+        assert p.breakeven_wr_net == pytest.approx(
+            breakeven_wr_net(0.40, ec.friction_r(None, 5.0, 5.0 * 0.4 / 1.4)))
+    finally:
+        ec.reset_calibration_cache()
 
 
 def test_index_vertical_credit_floor_is_never_auto_tuned_from_measurements(

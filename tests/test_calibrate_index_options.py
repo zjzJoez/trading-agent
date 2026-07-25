@@ -144,10 +144,15 @@ def test_wing_ratio_credit_frac_and_legsum_hand_computed():
     w10 = st["by_width"][10.0]
     assert w10["wing_ratio"] == pytest.approx((6.40 - 3.00) / 6.40)  # 0.53125
     assert w10["credit_frac_median"] == pytest.approx(3.00 / 10.0)
-    # scalar picks: wing ratio = MAX over widths (conservative — legsum grows
-    # in r), credit frac = the decision width's median.
-    assert cal._pick_wing_ratio(st) == pytest.approx(4.90 / 6.40)
-    assert cal._pick_credit_frac(st) == pytest.approx(0.30)
+    # scalar picks: wing ratio = MAX over widths of each width's p75
+    # (conservative twice over — legsum grows in r, and half of all pairs sit
+    # above a median), credit frac = the decision width's median. Both read a
+    # by_width dict so the caller can pass only PUBLISHABLE widths.
+    assert cal._pick_wing_ratio(st["by_width"]) == pytest.approx(
+        st["by_width"][5.0]["wing_ratio_p75"])
+    assert cal._pick_wing_ratio(st["by_width"]) >= cal._pick_wing_ratio_median(
+        st["by_width"]) == pytest.approx(4.90 / 6.40)
+    assert cal._pick_credit_frac(st["by_width"]) == pytest.approx(0.30)
 
 
 def test_zone_medians_are_separated_and_ignore_far_otm_junk():
@@ -285,13 +290,15 @@ def test_decision_scenarios_are_per_width_with_that_width_s_own_figures():
         "short_zone_spread_pct": 0.0424, "wing_zone_spread_pct": 0.0504,
         "wing_ratio": 0.7308, "credit_frac_median": 0.191,
         "by_width": {
-            "5": {"n_pairs": 32, "short_zone_spread_pct": 0.04242,
+            "5": {"n_pairs": 32, "n_chains": 3,
+                  "short_zone_spread_pct": 0.04242,
                   "wing_zone_spread_pct": 0.05038, "wing_ratio": 0.7308,
                   "credit_frac_median": 0.191},
-            "10": {"n_pairs": 25, "short_zone_spread_pct": 0.03742,
+            "10": {"n_pairs": 25, "n_chains": 3,
+                   "short_zone_spread_pct": 0.03742,
                    "wing_zone_spread_pct": 0.0574, "wing_ratio": 0.5305,
                    "credit_frac_median": 0.1755},
-            "20": {"n_pairs": 0},                       # no data → no scenario
+            "20": {"n_pairs": 0, "n_chains": 0},        # no data → no scenario
         },
     }
     scen = cal._decision_scenarios(entry)
@@ -315,6 +322,36 @@ def test_decision_scenarios_fall_back_to_the_scalar_entry():
     assert cal._decision_scenarios({"by_width": {"5": {"n_pairs": 3}}}) == []
 
 
+def test_thin_by_width_block_cannot_drive_a_verdict_even_if_persisted():
+    """INDEPENDENCE at the point of USE (2026-07-25).
+
+    A by_width block written by an older ungated run — or hand-edited into the
+    file — carries full zone figures off a SINGLE (day, expiry) chain. Nine
+    'pairs' from one chain share one vol surface and one market-maker posture:
+    that is one observation, not a sample, and it must not produce a whitelist
+    verdict. The gate is applied here as well as at publication.
+    """
+    thin = {"n_pairs": 9, "n_chains": 1, "short_zone_spread_pct": 0.0424,
+            "wing_zone_spread_pct": 0.0504, "wing_ratio": 0.7308,
+            "credit_frac_median": 0.191}
+    entry = {"by_width": {"5": thin}}
+    assert cal._decision_scenarios(entry) == []
+    assert cal._worst_friction_r(entry) is None
+    assert cal._best_friction_r(entry) is None
+    # enough pairs but still one chain → still refused
+    assert cal.width_refusal({**thin, "n_pairs": 400},
+                             min_chains=3, min_pairs=10)
+    # enough chains but too few pairs → still refused
+    assert cal.width_refusal({**thin, "n_chains": 9, "n_pairs": 2},
+                             min_chains=3, min_pairs=10)
+    # both floors cleared → usable
+    ok = {**thin, "n_chains": 3, "n_pairs": 32}
+    assert cal.width_refusal(ok, min_chains=3, min_pairs=10) is None
+    assert cal._decision_scenarios({"by_width": {"5": ok}})
+    # an explicit lower floor lets the operator opt in deliberately
+    assert cal._decision_scenarios(entry, min_chains=1, min_pairs=5)
+
+
 # ---------------------------------------------------------------------------
 # CLI — snapshots mode
 # ---------------------------------------------------------------------------
@@ -331,7 +368,7 @@ def test_snapshots_mode_writes_zone_entry_and_preserves_globals(
     (_hermetic / "execution_costs.json").write_text(json.dumps(existing_globals))
     rc = _run_snapshots(monkeypatch,
                         ["--underlyings", "IWM", "--min-quotes", "20",
-                         "--min-pairs", "10"],
+                         "--min-pairs", "10", "--min-chains", "2"],
                         rows=_snapshot_rows(days=(DAY, "2026-07-23")))
     assert rc == 0
     saved = json.loads((_hermetic / "execution_costs.json").read_text())
@@ -340,28 +377,92 @@ def test_snapshots_mode_writes_zone_entry_and_preserves_globals(
     e = saved["per_underlying"]["IWM"]
     assert e["short_zone_spread_pct"] == pytest.approx(0.04)
     assert e["wing_zone_spread_pct"] == pytest.approx(0.05)
-    assert e["wing_ratio"] == pytest.approx(0.7656, abs=1e-4)
+    # the CONSUMED figure is the p75 of the per-pair ratio, above the median
+    assert e["wing_ratio_median"] == pytest.approx(0.7656, abs=1e-4)
+    assert e["wing_ratio_p75"] == pytest.approx(0.7857, abs=1e-4)
+    assert e["wing_ratio"] == e["wing_ratio_p75"] > e["wing_ratio_median"]
     assert e["credit_frac_median"] == pytest.approx(0.30)
     assert e["n_pairs"] == 36                        # 9 shorts × 2 widths × 2 days
     assert e["n_short_zone"] == 18 and e["n_wing_zone"] == 28
     assert e["n_quotes"] == 46
+    assert e["n_chains"] == 2                        # 2 days × 1 expiry
+    assert e["min_chains"] == 2 and e["min_pairs_per_width"] == 10
     assert e["source"] == "snapshots"
     assert e["sample_window"].startswith("snapshots ")
     assert "SHORT zone |delta| 0.2-0.35" in e["zone"]
     assert e["calibrated_at"]
     assert set(e["by_width"]) == {"5", "10"}
+    assert e["by_width_refused"] == {}
     assert e["by_width"]["10"]["wing_zone_spread_pct"] == pytest.approx(0.05)
     assert e["by_width"]["5"]["n_chains"] == 2
     assert e["by_width"]["5"]["dte_observed"] == [DTE, DTE]
-    # the freshly written file flows into the cost model, zone-aware
+    assert (e["by_width"]["5"]["wing_ratio"]
+            == e["by_width"]["5"]["wing_ratio_p75"]
+            > e["by_width"]["5"]["wing_ratio_median"])
+    # the freshly written file flows into the cost model, zone-aware AND
+    # width-aware off the by_width block
     ec.reset_calibration_cache()
     assert ec.half_spread_cost(2.0, 1, "OPT", underlying="IWM",
                                zone="wing") == pytest.approx(2.0 * 0.025 * 100)
     assert ec.half_spread_cost(2.0, 1, "OPT", underlying="IWM",
                                zone="short") == pytest.approx(2.0 * 0.02 * 100)
+    for width in (5.0, 10.0):
+        r = e["by_width"][f"{width:g}"]["wing_ratio_p75"]
+        assert ec.friction_r("IWM", width, 1.25) == pytest.approx(
+            ec.friction_r("IWM", width, 1.25, wing_ratio=r), abs=1e-9), width
     out = capsys.readouterr().out
     assert "short-zone 4.00%" in out and "wing-zone 5.00%" in out
     assert "report only" in out
+
+
+def test_thin_widths_are_refused_not_published(_hermetic, monkeypatch, capsys):
+    """REFUSE TO PUBLISH (2026-07-25). One (day, expiry) chain yields 9 pairs
+    per width; with the default --min-chains 3 nothing about this name may be
+    persisted or assessed, and the reason must be printed rather than a figure
+    invented from a single snapshot."""
+    rc = _run_snapshots(monkeypatch,
+                        ["--underlyings", "IWM", "--min-quotes", "20",
+                         "--min-pairs", "10"])
+    assert rc == 1
+    assert not (_hermetic / "execution_costs.json").exists()
+    out = capsys.readouterr().out
+    assert "independent (day,expiry) chains (need 3)" in out
+    assert "IWM: INSUFFICIENT DATA" in out
+    assert "IWM NOT ASSESSED" in out
+    assert "nothing written" in out
+
+
+def test_underlying_passes_but_a_thin_width_is_still_refused(
+        _hermetic, monkeypatch, capsys):
+    """The two gates are independent. Three chains carry the NAME past the
+    floor, but a per-width block still needs its own pairs: at
+    --min-pairs-per-width 20 the $5 block (27 pairs) publishes and a stricter
+    bar would refuse it. What is refused is recorded, never silently dropped.
+    """
+    rows = _snapshot_rows(days=(DAY, "2026-07-23", "2026-07-24"))
+    rc = _run_snapshots(monkeypatch,
+                        ["--underlyings", "IWM", "--min-quotes", "20",
+                         "--min-pairs", "10", "--min-chains", "3",
+                         "--min-pairs-per-width", "40"], rows=rows)
+    assert rc == 0
+    e = json.loads(
+        (_hermetic / "execution_costs.json").read_text())["per_underlying"]["IWM"]
+    # every width had only 27 pairs → all refused, so NO ratio is published
+    assert e["by_width"] == {}
+    assert set(e["by_width_refused"]) == {"5", "10"}
+    assert "need 40" in e["by_width_refused"]["5"]
+    assert e["wing_ratio"] is None and e["credit_frac_median"] is None
+    # ... the pooled spreads still are (they cleared the name-level gate)
+    assert e["short_zone_spread_pct"] == pytest.approx(0.04)
+    out = capsys.readouterr().out
+    assert "NOT PUBLISHED" in out and "PARTIAL" in out
+    assert "NOT ASSESSED" in out          # no verdict off refused widths
+    # a consumer therefore gets the conservative measured default, not a
+    # figure built from thin data
+    ec.reset_calibration_cache()
+    assert ec.friction_r("IWM", 5.0, 1.25) == pytest.approx(
+        ec.friction_r("IWM", 5.0, 1.25,
+                      wing_ratio=ec.MEASURED_WING_RATIO_P75[5.0]), abs=1e-9)
 
 
 def test_snapshots_mode_reports_insufficient_data_without_writing(
@@ -390,7 +491,9 @@ def test_iwm_verdict_excluded_at_measured_spreads(_hermetic, monkeypatch, capsys
         rows.append(("IWM", DAY, EXPIRY, DTE, k, bid, ask, -_abs_delta(k)))
     rc = _run_snapshots(monkeypatch,
                         ["--underlyings", "IWM", "--min-quotes", "20",
-                         "--dry-run"], rows=rows)
+                         "--min-chains", "1",
+                             "--min-pairs-per-width", "5", "--dry-run"],
+                            rows=rows)
     assert rc == 0
     out = capsys.readouterr().out
     assert "IWM EXCLUDED (friction_r" in out
@@ -404,7 +507,9 @@ def test_iwm_verdict_excluded_at_measured_spreads(_hermetic, monkeypatch, capsys
 
 def test_dry_run_touches_nothing(_hermetic, monkeypatch, capsys):
     rc = _run_snapshots(monkeypatch, ["--underlyings", "IWM", "--min-quotes",
-                                      "20", "--dry-run"])
+                                      "20", "--min-chains", "1",
+                                      "--min-pairs-per-width", "5",
+                                      "--dry-run"])
     assert rc == 0
     assert not (_hermetic / "execution_costs.json").exists()
     assert "dry-run" in capsys.readouterr().out
@@ -416,7 +521,9 @@ def test_merge_preserves_other_per_underlying_entries(_hermetic, monkeypatch):
         "per_underlying": {"QQQ": {"median_spread_pct_mid": 0.012,
                                    "n_quotes": 50}},
     }))
-    rc = _run_snapshots(monkeypatch, ["--underlyings", "IWM", "--min-quotes", "20"])
+    rc = _run_snapshots(monkeypatch, ["--underlyings", "IWM", "--min-quotes",
+                                      "20", "--min-chains", "1",
+                                      "--min-pairs-per-width", "5"])
     assert rc == 0
     saved = json.loads((_hermetic / "execution_costs.json").read_text())
     assert saved["per_underlying"]["QQQ"]["median_spread_pct_mid"] == 0.012
@@ -426,7 +533,9 @@ def test_merge_preserves_other_per_underlying_entries(_hermetic, monkeypatch):
 
 def test_non_dict_json_refused_without_overwrite(_hermetic, monkeypatch, capsys):
     (_hermetic / "execution_costs.json").write_text("[1, 2, 3]")
-    rc = _run_snapshots(monkeypatch, ["--underlyings", "IWM", "--min-quotes", "20"])
+    rc = _run_snapshots(monkeypatch, ["--underlyings", "IWM", "--min-quotes",
+                                      "20", "--min-chains", "1",
+                                      "--min-pairs-per-width", "5"])
     assert rc == 1
     assert "refusing to overwrite non-object JSON" in capsys.readouterr().err
     assert (_hermetic / "execution_costs.json").read_text() == "[1, 2, 3]"
@@ -505,7 +614,8 @@ def test_live_mode_samples_wide_then_classifies_zones(
     """Live sampling must reach BELOW the short zone — the old runner's
     |delta| filter cut the wings off, so no pair could be formed at all."""
     rc = _run_live(monkeypatch, _mk_quote_fns(),
-                   ["--underlyings", "IWM", "--min-quotes", "20"])
+                   ["--underlyings", "IWM", "--min-quotes", "20",
+                    "--min-chains", "2", "--min-pairs-per-width", "5"])
     assert rc == 0
     saved = json.loads((_hermetic / "execution_costs.json").read_text())
     e = saved["per_underlying"]["IWM"]
@@ -532,7 +642,8 @@ def test_live_expiry_cap_limits_chain_calls(_hermetic, monkeypatch):
                          for k in STRIKES]}
 
     rc = _run_live(monkeypatch, (get_quote, list_exp, counting_chain),
-                   ["--underlyings", "IWM", "--min-quotes", "20"])
+                   ["--underlyings", "IWM", "--min-quotes", "20",
+                    "--min-chains", "2", "--min-pairs-per-width", "5"])
     assert rc == 0
     assert calls == many[:cal.MAX_EXPIRIES_PER_NAME]
 

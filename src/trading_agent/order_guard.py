@@ -1046,6 +1046,9 @@ def evaluate_combo(
         # a post-mortem can compare modeled vs realized cost); no gate keys
         # off it. None when the structure isn't a priceable credit vertical —
         # check_combo below is what rejects those.
+        # This is the CALIBRATION-priced estimate, so the early
+        # thesis-freshness return below still carries a number; it is
+        # RECOMPUTED off the real leg touches once they are fetched.
         "friction_r": combo_friction_r(combo),
     }
 
@@ -1094,6 +1097,13 @@ def evaluate_combo(
             }
         vs += check_option_liquidity(leg.option_symbol, q)
     proposed_summary["leg_quotes"] = entry_leg_quotes
+    # Re-price friction off the quotes we just fetched. This is the ONE call
+    # site that holds fresh per-leg bid/ask, so the live path must charge the
+    # ACTUAL spread it will cross rather than a percent-of-mid median measured
+    # on other days; half_spread_cost falls back to the calibration per leg,
+    # so a single missing quote does not discard the other leg's real touch.
+    proposed_summary["friction_r"] = combo_friction_r(
+        combo, leg_quotes=entry_leg_quotes)
 
     bs = blockers(vs)
     warns = tuple(f"{v.rule}: {v.message}" for v in vs if v.severity == "warn")
