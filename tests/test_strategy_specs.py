@@ -132,7 +132,8 @@ def test_breakeven_net_formula_and_monotonicity():
             > breakeven_wr_gross(2.0))
 
 
-def test_vertical_spec_friction_comes_from_the_vertical_cost_function():
+def test_vertical_spec_friction_comes_from_the_vertical_cost_function(
+        tmp_path, monkeypatch):
     """A vertical's friction must be priced from (width, credit) through
     execution_costs.friction_r — which resolves BOTH leg marks — not from
     round_trip_friction_r with a hand-typed per-leg premium.
@@ -141,12 +142,28 @@ def test_vertical_spec_friction_comes_from_the_vertical_cost_function():
     guessed $1.50 for both legs (leg-mid-sum $3.00 against a $1.43 credit,
     ratio 2.1) where real vertical quotes measure 6.43 on a $5-wide.
     """
-    from trading_agent.execution_costs import friction_r as ec_friction_r
-    spec = REGISTRY["credit_put_spread_30_45"]
+    import dataclasses
+
+    import trading_agent.strategy_specs as ss
+    from trading_agent import config as config_mod
+    from trading_agent import execution_costs as ec
+
+    # REGISTRY is built at IMPORT time, so its breakeven_wr_net is frozen
+    # against whatever calibration existed then, while ec_friction_r() reads
+    # the live module cache that sibling tests legitimately repoint. Comparing
+    # the two directly made this test order-dependent (it passed alone and
+    # failed in-suite). Build BOTH sides under one hermetic, empty data_dir so
+    # the assertion is about the derivation, not about test ordering.
+    monkeypatch.setattr(config_mod, "CONFIG",
+                        dataclasses.replace(config_mod.CONFIG,
+                                            data_dir=tmp_path))
+    ec.reset_calibration_cache()
+    spec = ss._credit_put_spread_spec()
     min_rr = spec.min_risk_reward
     width = 5.0
     credit = width * min_rr / (1.0 + min_rr)
     p = spec.expectancy_profile
+    ec_friction_r = ec.friction_r
     assert p.breakeven_wr_net == pytest.approx(
         breakeven_wr_net(min_rr, ec_friction_r(None, width, credit)))
     # The old (understated) derivation must not survive.
