@@ -246,3 +246,24 @@ def test_module_constants_are_wired_to_the_engine():
     assert dg.E is rv
     assert dg.WORST_K == (1, 5, 10)
     assert isinstance(timedelta(days=1), timedelta)
+
+
+def test_width_census_measures_the_market_not_the_gate(tmp_path):
+    # On a textbook sigma=0.25 chain the 5-wide credit/width sits BELOW the
+    # spec's 0.25 floor, which is the gate-design point: low availability is
+    # arithmetic, not a data artifact.
+    data_dir, plan, entries = _run(tmp_path, mark="close")
+    out = dg.diagnose(data_dir, plan, entries, ("SPY",), {"SPY": 0.0049})
+    wc = out["width_census"]
+    assert wc["spec_credit_floor_frac"] == pytest.approx(0.25)
+    assert wc["n_planned_entries"] == 1
+    five = wc["per_width"]["5"]
+    assert five["n"] >= 1
+    assert five["median"] < 0.25
+    assert five["n_clearing_spec_floor"] == 0
+    assert five["frac_clearing_spec_floor"] == pytest.approx(0.0)
+    assert five["n_entry_days_with_a_constructible_pair"] == 1
+    # the wider width is also measured, and its credit/width is lower
+    ten = wc["per_width"]["10"]
+    assert ten["median"] < five["median"]
+    assert ten["n_entry_days_with_a_constructible_pair"] == 1

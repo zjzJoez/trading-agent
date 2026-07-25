@@ -1550,6 +1550,40 @@
         "liquidity_lag_used": "same-day",
         "liquidity_lag_note": "this section deliberately uses the same-day count so the IV census covers the widest strike set; it is a description of the data, not a tradeable screen."
       },
+      "width_census": {
+        "what": "credit/width of every constructible vertical on an in-band liquid short candidate, per width, with no credit floor applied.",
+        "spec_credit_floor_frac": 0.25,
+        "n_planned_entries": 144,
+        "per_width": {
+          "10": {
+            "n": 359,
+            "mean": 0.179966573816156,
+            "median": 0.1789999999999999,
+            "sd": 0.040560238630727344,
+            "p10": 0.12800000000000003,
+            "p90": 0.23099999999999996,
+            "min": 0.07200000000000006,
+            "max": 0.2909999999999998,
+            "n_clearing_spec_floor": 20,
+            "frac_clearing_spec_floor": 0.055710306406685235,
+            "n_entry_days_with_a_constructible_pair": 119
+          },
+          "5": {
+            "n": 408,
+            "mean": 0.1878872549019608,
+            "median": 0.1879999999999999,
+            "sd": 0.05913958862567841,
+            "p10": 0.12200000000000001,
+            "p90": 0.25799999999999984,
+            "min": 0.009999999999999964,
+            "max": 0.43400000000000016,
+            "n_clearing_spec_floor": 48,
+            "frac_clearing_spec_floor": 0.11764705882352941,
+            "n_entry_days_with_a_constructible_pair": 119
+          }
+        },
+        "interpretation": "if the spec floor sits ABOVE the median credit/width, low availability is a gate-design consequence, not a data artifact — and widening cannot help when the wider width's median is lower."
+      },
       "payoff_attribution": {
         "n_trades": 44,
         "mean_r": 0.05612948510974885,
@@ -2635,6 +2669,40 @@
         },
         "liquidity_lag_used": "same-day",
         "liquidity_lag_note": "this section deliberately uses the same-day count so the IV census covers the widest strike set; it is a description of the data, not a tradeable screen."
+      },
+      "width_census": {
+        "what": "credit/width of every constructible vertical on an in-band liquid short candidate, per width, with no credit floor applied.",
+        "spec_credit_floor_frac": 0.25,
+        "n_planned_entries": 144,
+        "per_width": {
+          "10": {
+            "n": 359,
+            "mean": 0.179966573816156,
+            "median": 0.1789999999999999,
+            "sd": 0.040560238630727344,
+            "p10": 0.12800000000000003,
+            "p90": 0.23099999999999996,
+            "min": 0.07200000000000006,
+            "max": 0.2909999999999998,
+            "n_clearing_spec_floor": 20,
+            "frac_clearing_spec_floor": 0.055710306406685235,
+            "n_entry_days_with_a_constructible_pair": 119
+          },
+          "5": {
+            "n": 408,
+            "mean": 0.1878872549019608,
+            "median": 0.1879999999999999,
+            "sd": 0.05913958862567841,
+            "p10": 0.12200000000000001,
+            "p90": 0.25799999999999984,
+            "min": 0.009999999999999964,
+            "max": 0.43400000000000016,
+            "n_clearing_spec_floor": 48,
+            "frac_clearing_spec_floor": 0.11764705882352941,
+            "n_entry_days_with_a_constructible_pair": 119
+          }
+        },
+        "interpretation": "if the spec floor sits ABOVE the median credit/width, low availability is a gate-design consequence, not a data artifact — and widening cannot help when the wider width's median is lower."
       },
       "payoff_attribution": {
         "n_trades": 26,

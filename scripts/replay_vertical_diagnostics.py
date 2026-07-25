@@ -44,6 +44,10 @@ Sections, each keyed by the entries sample it was computed from:
   iv_by_month           Unconditional short-leg IV (every liquid invertible
                         in-band strike, DTE 30-45), with n. The conditional
                         (qualified-only) figures alongside it.
+  width_census          credit/width of every constructible vertical, per
+                        width, with no floor applied — the gate-DESIGN
+                        measurement: is the spec's credit >= width/4 above or
+                        below what the market offers?
 
 Offline: stdlib + numpy, reads only the pre-fetched aggregates.
 """
@@ -475,6 +479,84 @@ def walk_coverage(ch: Chains, qualified: list[dict]) -> dict:
     }
 
 
+def width_census(ch: Chains, batch_plan: Path) -> dict:
+    """What the market actually offers, per width, before any floor is applied.
+
+    For every planned entry day at DTE 30-45, every liquid invertible in-band
+    short candidate, and every width in WIDTHS: the credit/width actually
+    constructible. This is the gate-DESIGN measurement — it says whether the
+    spec's credit >= width/4 is above or below the market's median — and it is
+    independent of every mark-convention argument.
+    """
+    plan = E.load_batch_plan(batch_plan)
+    grouped: dict[tuple[date, str], list[date]] = defaultdict(list)
+    for row in plan:
+        key = (row["entry_date"], row["symbol"])
+        if row["expiry"] not in grouped[key]:
+            grouped[key].append(row["expiry"])
+    fracs: dict[str, list[float]] = defaultdict(list)
+    constructible_entries: dict[str, set] = defaultdict(set)
+    for (entry, symbol), expiries in sorted(grouped.items()):
+        spot = ch.closes[symbol].get(entry)
+        if spot is None:
+            continue
+        q = E.DIV_YIELD.get(symbol, 0.0)
+        for expiry in sorted(expiries):
+            dte = (expiry - entry).days
+            if not (E.DTE_RANGE[0] <= dte <= E.DTE_RANGE[1]):
+                continue
+            puts = ch.chain(symbol, expiry)
+            if not puts:
+                continue
+            t = dte / 365.0
+            have = {k for k in puts
+                    if E._entry_mark(puts[k], entry) is not None}
+            for width in E.WIDTHS:
+                if any((k - width) in have for k in have):
+                    constructible_entries[f"{width:g}"].add((entry, symbol))
+            for strike in sorted(puts):
+                mark = E._entry_mark(puts[strike], entry, E.MIN_SHORT_TRADES,
+                                     "same-day")
+                if mark is None:
+                    continue
+                iv = E.implied_vol_put(mark, spot, strike, t, E.RISK_FREE_RATE, q)
+                if iv is None:
+                    continue
+                d = abs(E.bs_put_delta(spot, strike, t, E.RISK_FREE_RATE, q, iv))
+                if not (E.DELTA_LO <= d <= E.DELTA_HI):
+                    continue
+                for width in E.WIDTHS:
+                    wing = puts.get(strike - width)
+                    long_mark = E._entry_mark(wing, entry) if wing else None
+                    if long_mark is None:
+                        continue
+                    credit = mark - long_mark
+                    if 0 < credit < width:
+                        fracs[f"{width:g}"].append(credit / width)
+    per_width = {}
+    for width, values in sorted(fracs.items()):
+        stats = _describe(values)
+        stats["n_clearing_spec_floor"] = sum(
+            1 for v in values if v >= E.CREDIT_FLOOR_FRAC)
+        stats["frac_clearing_spec_floor"] = (
+            stats["n_clearing_spec_floor"] / len(values) if values else None)
+        stats["n_entry_days_with_a_constructible_pair"] = len(
+            constructible_entries.get(width, ()))
+        per_width[width] = stats
+    return {
+        "what": ("credit/width of every constructible vertical on an in-band "
+                 "liquid short candidate, per width, with no credit floor "
+                 "applied."),
+        "spec_credit_floor_frac": E.CREDIT_FLOOR_FRAC,
+        "n_planned_entries": len(grouped),
+        "per_width": per_width,
+        "interpretation": (
+            "if the spec floor sits ABOVE the median credit/width, low "
+            "availability is a gate-design consequence, not a data artifact — "
+            "and widening cannot help when the wider width's median is lower."),
+    }
+
+
 def payoff_attribution(qualified: list[dict], iv_by_month: dict) -> dict:
     if not qualified:
         return {"n_trades": 0}
@@ -626,6 +708,7 @@ def diagnose(data_dir: Path, batch_plan: Path, entries_path: Path,
             "walk_coverage": walk_coverage(ch, qualified),
             "friction": E.friction_comparison(qualified, spread_pct),
             "iv_by_month": ivs,
+            "width_census": width_census(ch, batch_plan),
             "payoff_attribution": payoff_attribution(qualified, ivs),
         }
     finally:
