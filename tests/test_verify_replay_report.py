@@ -33,7 +33,7 @@ def test_every_committed_report_claim_matches_its_artifact_row():
 def test_main_exits_zero_on_the_committed_artifacts(capsys):
     assert vr.main(["--report-dir", str(REPORT_DIR)]) == 0
     out = capsys.readouterr().out
-    assert "ALL CLAIMS MATCH THEIR ARTIFACT ROW" in out
+    assert "ALL PINNED VALUES MATCH THEIR ARTIFACT ROW AND APPEAR IN REPORT.md" in out
 
 
 def _clone(tmp_path: Path) -> Path:
@@ -134,3 +134,66 @@ def test_every_major_section_is_actually_covered(section):
     # a verifier that quietly stops checking a section is worse than none
     c = vr.verify(REPORT_DIR)
     assert any(r["section"] == section for r in c.rows)
+
+
+# ---------------------------------------------------------------------------
+# The prose direction (added after the re-verify blocker: the script used to
+# print "verified 391 REPORT.md claims" without ever opening REPORT.md)
+# ---------------------------------------------------------------------------
+
+
+def _copy_report_dir(tmp_path):
+    import shutil
+    dst = tmp_path / "rpt"
+    shutil.copytree(REPORT_DIR, dst)
+    return dst
+
+
+def test_report_md_absent_is_disclosed_not_silently_passed(tmp_path, capsys):
+    """The predecessor's failure mode: no REPORT.md, still a green 'verified
+    391 REPORT.md claims'. Now the absence is printed."""
+    d = _copy_report_dir(tmp_path)
+    (d / "REPORT.md").unlink()
+    vr.main(["--report-dir", str(d)])
+    out = capsys.readouterr().out
+    assert "REPORT.md ABSENT" in out
+    assert "prose direction NOT checked" in out
+
+
+def test_a_value_deleted_from_the_prose_fails(tmp_path, capsys):
+    """What the prose direction DOES catch: a pinned number removed from the
+    report entirely."""
+    d = _copy_report_dir(tmp_path)
+    md = (d / "REPORT.md").read_text()
+    # $18.25 = the honest-leg-mark friction mean. Chosen because none of its
+    # other renderings (18.2527, 1825) occur in the report, so deleting the
+    # one spelling really does remove the value — a rate like 0.2185 also
+    # renders as 0.219/0.22 and would still be found.
+    assert "18.25" in md
+    (d / "REPORT.md").write_text(md.replace("18.25", "REDACTED"))
+    rc = vr.main(["--report-dir", str(d)])
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "NOT FOUND IN REPORT.md" in out
+    assert "18.25" in out           # the expected rendering is named
+
+
+def test_unicode_minus_in_the_prose_is_not_a_false_positive(tmp_path, capsys):
+    """The report renders negatives with U+2212; the pins are ASCII. Without
+    normalisation every negative pin reads as tampered (8 on the first run)."""
+    d = _copy_report_dir(tmp_path)
+    assert "−" in (d / "REPORT.md").read_text()   # U+2212 really is in there
+    assert vr.main(["--report-dir", str(d)]) == 0
+
+
+def test_artifact_only_pins_are_declared_and_counted(capsys):
+    """Pins for values the prose deliberately omits are exempt BY NAME, and
+    the count is printed so the exemption list cannot grow silently."""
+    vr.main(["--report-dir", str(REPORT_DIR)])
+    out = capsys.readouterr().out
+    assert f"{len(vr.ARTIFACT_ONLY_PINS)} artifact-only by declaration" in out
+    # every exemption is a (section, what) pair that a real pin uses
+    import json as _json
+    c = vr.verify(REPORT_DIR)
+    pins = {(r["section"], r["what"]) for r in c.rows}
+    assert vr.ARTIFACT_ONLY_PINS <= pins, "stale exemption for a pin that no longer exists"

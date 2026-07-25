@@ -43,6 +43,8 @@ SPREADS="SPY=0.0049,QQQ=0.0094"   # M1-0.3 calibration RUN, not the file
   --entries "$DIR/entries.jsonl" --label primary_smile_prior \
   --out "$DIR/diagnostics.json"
 
-# 4. Pin every quantitative claim in REPORT.md to the artifact row it came
+# 4. Cross-check the pinned values two ways: against the artifact row each
+#    names (strong, tuple-keyed) and against REPORT.md's prose (weak, global
+#    presence — see the script header for what that does and does not catch)
 #    from. Per-claim tuple match, not global value membership.
 "$PY" scripts/verify_replay_report.py --report-dir "$DIR"

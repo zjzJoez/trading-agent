@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Pin every quantitative claim in the M1-0.4 REPORT.md to its artifact row.
+"""Cross-check the M1-0.4 REPORT.md numbers against the committed artifacts.
+
+Two directions, with DIFFERENT strengths — read both before trusting a green:
+
+(a) ARTIFACT direction, strong: each pinned value is matched against the
+    artifact row it names, by tuple key, so a value that is right for a
+    different row fails. This catches artifact regeneration drift.
+(b) PROSE direction, weak: each pinned value must still appear SOMEWHERE in
+    REPORT.md. This catches a number deleted from the prose or a pin that
+    never matched it, but NOT a substitution whose value occurs elsewhere in
+    the document (verified: 1.41 -> 1.32 in section 2c still passes). 266 of
+    391 pins carry no key identifying their line, so per-claim contextual
+    matching is unavailable for most claims and is not claimed.
+
+The predecessor of this script printed "verified 391 REPORT.md claims" while
+never opening REPORT.md at all. Both directions and both their limits are
+printed on every run so that failure mode cannot recur silently.
 
 WHY THIS EXISTS (review finding 4). The first pass over this report was
 cross-checked by *global value membership*: each number printed in the prose
@@ -18,8 +34,9 @@ matches nothing is a FAILURE, not a skip; that is the whole point.
 Usage:
     python scripts/verify_replay_report.py --report-dir reports/vertical_replay_2026-07
 
-Exit status 0 = every claim matched. Non-zero = at least one mismatch, each
-printed with the claim, the artifact row and the difference.
+Exit status 0 = every pinned value matched its artifact row AND was located in
+the prose. Non-zero = at least one mismatch or one pinned value missing from
+REPORT.md, each printed with the claim, the artifact row and the difference.
 """
 from __future__ import annotations
 
@@ -29,6 +46,28 @@ from pathlib import Path
 
 TOL = 5e-4          # prose rounds to 4 decimals
 TOL_MONEY = 5e-3    # dollar figures are quoted to the cent
+
+# Pins that guard an ARTIFACT value the prose deliberately does not quote.
+# The text direction (Claims.audit_against_report) would otherwise read these
+# as tampering. Each is listed with why the prose omits it, so the exemption
+# list cannot quietly grow into a way of silencing the tamper check.
+ARTIFACT_ONLY_PINS = {
+    # §1 quotes the primary floor grid; the upper bound's 0.20 rate is in the
+    # artifact for completeness but the prose argues the floor question off the
+    # primary mark only.
+    ("1", "upper credit_floor_sensitivity[0.2]"),
+    # §2a's table quotes the four MARK conventions; liquidity-same-day is an
+    # information-set variant published alongside them, discussed in §5a in
+    # words rather than by its mean R.
+    ("2a", "sensitivity[liquidity-same-day].mean_r"),
+    # §5b states the counts (winners/losers) and lets the reader divide.
+    ("5b", "upper: profit-take to forced-exit count ratio"),
+    # §5d states the drawdown and the total gain in R, not their ratio.
+    ("5d", "upper drawdown as a fraction of total gain"),
+    # §5f quotes the upper bound's 990 pairs (45 trades); the primary's 325
+    # (26 trades) is in the artifact but the overlap argument is made once.
+    ("5f", "primary total trade pairs"),
+}
 
 
 # --------------------------------------------------------------- claim types
@@ -61,6 +100,68 @@ class Claims:
     @property
     def failures(self) -> list[dict]:
         return [r for r in self.rows if not r["ok"]]
+
+    def audit_against_report(self, report_md: str) -> list[dict]:
+        """Second direction: every pinned value must still APPEAR in REPORT.md.
+
+        Without this the script only guards one way. The pins below are a
+        transcription of the prose made at one moment in time, so
+        regenerating the artifacts is caught — but EDITING the prose (or
+        mis-transcribing it in the first place) is not. Tamper-tested:
+        changing '1.41' to '1.32' in §2c, the exact defect the previous
+        review round raised, left this script printing ALL CLAIMS MATCH.
+
+        Matching is textual — the report formats a number many ways (0.1806,
+        18.06%, 1.41, $18.25) — so all plausible renderings are tried.
+
+        KNOWN LIMIT, stated because this script's predecessor was rejected for
+        exactly this class of over-claim: presence is checked GLOBALLY, so
+        substituting a value that also appears elsewhere in the report is NOT
+        caught. Verified: rewriting §2c's `credit **1.41**` to `1.32` still
+        passes, because 1.41 occurs in other rows. What this direction does
+        catch is a value REMOVED from the prose entirely, and a pin whose
+        transcription never matched the prose in the first place. Contextual
+        (per-claim, per-line) matching would be needed to catch substitution,
+        and 266 of the 391 pins carry no key that identifies which line they
+        belong to — so that stronger check is not available for most claims
+        and is NOT claimed here.
+
+        Values that legitimately never appear as literals (intermediate keys,
+        booleans, counts embedded in sentences) are skipped rather than
+        reported, and every count — checked, skipped, artifact-only — is
+        published so the coverage of this direction is never overstated in
+        turn."""
+        missing: list[dict] = []
+        self.n_text_checked = 0
+        self.n_text_skipped = 0
+        # The prose renders negatives with U+2212 MINUS SIGN and en-dashes in
+        # ranges; normalise to ASCII so "−0.6157" matches the pin -0.6157
+        # (without this every negative pin reads as tampered — 8 false
+        # positives on the first run).
+        report_md = (report_md.replace("−", "-")
+                              .replace("–", "-")
+                              .replace("—", "-"))
+        self.n_artifact_only = 0
+        for row in self.rows:
+            exp = row["report_says"]
+            if (row["section"], row["what"]) in ARTIFACT_ONLY_PINS:
+                self.n_artifact_only += 1
+                continue
+            if isinstance(exp, bool) or exp is None or isinstance(exp, str):
+                self.n_text_skipped += 1
+                continue
+            v = float(exp)
+            # A number is "present" if any of its plausible renderings is.
+            cands = {f"{v:g}", f"{v:.2f}", f"{v:.3f}", f"{v:.4f}"}
+            if abs(v) < 1:                       # rates also render as %
+                cands |= {f"{v * 100:.1f}", f"{v * 100:.2f}"}
+            if float(v).is_integer():
+                cands.add(f"{int(v)}")
+                cands.add(f"{int(v):,}")
+            self.n_text_checked += 1
+            if not any(cand in report_md for cand in cands):
+                missing.append({**row, "renderings": sorted(cands)})
+        return missing
 
 
 def dig(obj, path: str):
@@ -654,11 +755,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{flag}] §{row['section']:3} {row['what']}: "
                   f"report={row['report_says']!r} artifact={row['artifact_says']!r}")
 
-    print(f"verified {len(c.rows)} REPORT.md claims against the artifacts "
-          f"({', '.join(f'§{k}:{v}' for k, v in sorted(by_section.items()))})")
-    if not c.failures:
-        print("ALL CLAIMS MATCH THEIR ARTIFACT ROW")
+    report_md_path = args.report_dir / "REPORT.md"
+    text_missing: list[dict] = []
+    if report_md_path.is_file():
+        text_missing = c.audit_against_report(report_md_path.read_text())
+        text_note = (f"; {c.n_text_checked} of them also located in REPORT.md's "
+                     f"prose ({c.n_text_skipped} non-numeric/boolean pins not "
+                     f"text-checkable, {c.n_artifact_only} artifact-only by "
+                     f"declaration)")
+    else:
+        text_note = "; REPORT.md ABSENT — prose direction NOT checked"
+
+    print(f"pinned {len(c.rows)} values against the artifacts "
+          f"({', '.join(f'§{k}:{v}' for k, v in sorted(by_section.items()))})"
+          f"{text_note}")
+    if text_missing:
+        print(f"\n{len(text_missing)} PINNED VALUE(S) NOT FOUND IN REPORT.md "
+              f"— the prose was edited away from its artifact, or the pin was "
+              f"mis-transcribed:")
+        for row in text_missing:
+            print(f"  §{row['section']} {row['what']}: expected one of "
+                  f"{row['renderings']}")
+    if not c.failures and not text_missing:
+        print("ALL PINNED VALUES MATCH THEIR ARTIFACT ROW AND APPEAR IN REPORT.md")
         return 0
+    if not c.failures:
+        return 1
     print(f"\n{len(c.failures)} MISMATCH(ES):")
     for row in c.failures:
         print(f"  §{row['section']} {row['what']}")
