@@ -24,7 +24,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
-from trading_agent.execution_costs import fees_per_side, half_spread_cost
+from trading_agent.execution_costs import (
+    fees_per_side,
+    friction_r,
+    half_spread_cost,
+)
 
 # ---------------------------------------------------------------------------
 # Breakeven arithmetic — functions, not constants
@@ -62,6 +66,16 @@ def round_trip_friction_r(
     calibrated spread instead of the global percent-of-mark — index chains
     (SPY/QQQ) quote far tighter than the pooled single-name median.
     Uncalibrated/None falls back to the global figure unchanged.
+
+    MULTI-LEG CAUTION (2026-07-25): ``n_option_legs`` > 1 charges every leg
+    at the SAME ``typical_premium``, which is only right if both legs quote
+    near the same mark. For a credit vertical they do not — the short leg's
+    mid is much larger than the net credit and the wing is a measured 0.53–0.73
+    of it (see ``execution_costs.friction_r``). Verticals must therefore go
+    through ``execution_costs.friction_r`` (width + credit + leg marks/wing
+    ratio), NOT through this function with a guessed per-leg premium; this
+    function stays for single-leg premium, where 1R and the mark are the
+    same number.
     """
     if typical_premium <= 0 or risk_per_unit <= 0 or n_option_legs < 1:
         raise ValueError(
@@ -186,7 +200,9 @@ _PREMIUM_STOP_FRAC = 0.50
 def _convexity_spec() -> StrategySpec:
     min_rr = 2.0
     risk_per_unit = _PREMIUM_STOP_FRAC * _TYPICAL_PREMIUM * 100.0
-    friction_r = round_trip_friction_r(
+    # local name is ``friction`` (not ``friction_r``) so it cannot shadow the
+    # imported execution_costs.friction_r used by the vertical builder below.
+    friction = round_trip_friction_r(
         typical_premium=_TYPICAL_PREMIUM,
         risk_per_unit=risk_per_unit,
         n_option_legs=1,
@@ -230,7 +246,7 @@ def _convexity_spec() -> StrategySpec:
             expected_wr_range=(0.30, 0.45),
             avg_win_to_avg_loss_target=2.5,
             breakeven_wr_gross=breakeven_wr_gross(min_rr),
-            breakeven_wr_net=breakeven_wr_net(min_rr, friction_r),
+            breakeven_wr_net=breakeven_wr_net(min_rr, friction),
         ),
         min_trades_for_eval=30,
         falsification="LB95(mean R) < 0 after 30 closed trades",
@@ -245,12 +261,25 @@ def _credit_put_spread_spec() -> StrategySpec:
     min_rr = 0.40
     width = 5.0
     credit = width * min_rr / (1.0 + min_rr)
-    risk_per_unit = (width - credit) * 100.0
-    friction_r = round_trip_friction_r(
-        typical_premium=1.50,   # average per-leg mark on a 0.25Δ vertical
-        risk_per_unit=risk_per_unit,
-        n_option_legs=2,        # two contracts per side, fees+spread on both
-    )
+    # 2026-07-25 friction-truth fix: this used to call
+    # round_trip_friction_r(typical_premium=1.50, n_option_legs=2), i.e. it
+    # guessed a $1.50 mark for BOTH legs (leg-mid-sum $3.00 on a $1.43
+    # credit → legsum/credit 2.1). Real vertical quotes measure legsum/credit
+    # 6.43 ($5-wide) / 3.26 ($10-wide) — the guess understated the spread
+    # bill ~3×. The vertical now prices through the cost model's own
+    # vertical function, which resolves the two leg marks from the MEASURED
+    # wing ratio (execution_costs.DEFAULT_WING_RATIO, deliberately the
+    # conservative end) instead of a hand-typed per-leg premium.
+    #
+    # Consequence, stated plainly: at the global uncalibrated 4%-of-mark
+    # half-spread this lands ~0.22R of friction and pushes breakeven_wr_net
+    # ABOVE the declared 0.70-0.80 WR envelope. That is the cost model
+    # telling the truth about a $5-wide vertical on single names quoting 8%
+    # full spread, not a bug to be tuned away — the wing ratio itself is
+    # measured on IWM only, so single-name legsum is still UNMEASURED and
+    # the fallback is intentionally the pessimistic one. Whether the spec
+    # survives is the operator's call (see notes on this branch).
+    friction = friction_r(None, width, credit)
     return StrategySpec(
         name="credit_put_spread_30_45",
         # ACTIVE (area A): the atomic multi-leg path landed. A defined-risk
@@ -280,7 +309,7 @@ def _credit_put_spread_spec() -> StrategySpec:
             # rare max-loss trades run past the width math, not by WR.
             avg_win_to_avg_loss_target=min_rr,
             breakeven_wr_gross=breakeven_wr_gross(min_rr),
-            breakeven_wr_net=breakeven_wr_net(min_rr, friction_r),
+            breakeven_wr_net=breakeven_wr_net(min_rr, friction),
         ),
         min_trades_for_eval=30,
         falsification=(
@@ -318,14 +347,41 @@ def _credit_vertical_index_spec() -> StrategySpec:
         structure_kind="vertical",
         entry_gates={
             # M1-1 revised gates — ALL PLACEHOLDERS pending M1-0.4 replay.
-            "underlying_whitelist": ("SPY", "QQQ"),  # IWM pending M1-0.3
-                                                     # measured combo friction
-                                                     # (> 0.06R ⇒ stays out)
+            # IWM stays OUT — M1-0.3 is now MEASURED, not pending (2026-07-25,
+            # scripts/calibrate_index_options.py --source snapshots against
+            # option_chain_snapshots): short-zone spread 4.24% of mid, wing
+            # zone 5.04%, wing ratio 0.731, credit/width 0.191 → honest
+            # friction_r 0.079R at the credit the chain actually pays and
+            # 0.109R at the gate's floor credit, both above the 0.06R bar.
+            # (The $10-wide structure measures 0.036-0.054R, i.e. under the
+            # bar — a WIDER IWM vertical is a separate spec decision, not an
+            # implicit grant.) SPY/QQQ remain UNMEASURED in this zone: the
+            # snapshot feed has 5 SPY days and 1 QQQ day, none with 30-45 DTE
+            # strikes inside the delta band, because the core-underlyings
+            # chain-cache fix only landed 2026-07-25.
+            "underlying_whitelist": ("SPY", "QQQ"),
             "dte_range": (30, 45),
             "abs_delta_range": (0.20, 0.35),   # short leg; 0.30→0.35 per plan
             # credit >= width/4 (draft's width/3 was unsatisfiable in the
             # allowed low-IV regimes — structural zero-order funnel; final
             # value set by the M1-0.4 replay).
+            #
+            # STILL A PLACEHOLDER, and now a MEASURED-AGAINST one (A3,
+            # 2026-07-25). Real stored quotes (option_chain_snapshots, IWM
+            # PUTS, 30-37 DTE, short |delta| 0.20-0.35) give credit/width
+            # MEDIAN 0.191 on $5-wides (n=32 pairs) and 0.176 on $10-wides
+            # (n=25) — i.e. 0.25 sits ABOVE the median of what the chain
+            # actually pays, so on IWM this floor is satisfied only in the
+            # richer tail. It is NOT retuned here: lowering it to make trades
+            # appear is exactly the "second better-documented zero-order
+            # funnel" the plan forbids, and raising the pass rate is not
+            # evidence of edge. The floor stays UNRESOLVED pending SPY/QQQ
+            # snapshot accumulation (as of 2026-07-25: SPY 5 snapshot days,
+            # QQQ 1, none with 30-45 DTE strikes inside the delta zone — the
+            # core-underlyings-first chain fix only landed 2026-07-25, so the
+            # feed starts accumulating usable index chains from now) plus the
+            # M1-0.4 replay. The spec stays pending_prereqs; no consumer may
+            # size it, and nothing anywhere treats 0.25 as measured.
             "min_credit_frac_of_width": 0.25,
             "max_spread_pct_mid": 0.05,
             "news_veto_required": True,        # single LLM call pre-entry

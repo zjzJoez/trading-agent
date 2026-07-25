@@ -65,6 +65,7 @@ from typing import Literal
 
 from trading_agent.config import CONFIG, ensure_dirs
 from trading_agent.db import connection
+from trading_agent.execution_costs import combo_friction_r
 from trading_agent.sizing import (
     MAX_SINGLE_RISK_PCT,
     R5E,
@@ -1039,6 +1040,13 @@ def evaluate_combo(
         "strategy_label": combo.strategy_label, "sector": combo.sector,
         "contracts": combo.contracts, "net_credit": combo.net_credit,
         "width": combo.width, "max_loss": combo.max_loss, "intent": "open",
+        # Modeled round-trip friction in R, priced off the REAL per-leg marks
+        # this combo carries — the only call site that never has to guess the
+        # wing ratio. REPORT ONLY (echoed into the decision/event payload so
+        # a post-mortem can compare modeled vs realized cost); no gate keys
+        # off it. None when the structure isn't a priceable credit vertical —
+        # check_combo below is what rejects those.
+        "friction_r": combo_friction_r(combo),
     }
 
     # One fresh thesis on the underlying covers the whole combo.
