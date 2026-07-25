@@ -76,8 +76,17 @@ def test_implied_vol_rejects_unattainable_prices():
 
 def _put(strike: float, close: float, n: int = 100,
          day: date = ENTRY) -> tuple[float, dict]:
+    """A contract with a bar on `day` AND on the prior session.
+
+    The prior-session bar carries the same trade count, because the liquidity
+    screen's default information set is the session BEFORE entry (screening on
+    the entry day's own full-day count is look-ahead). Its close is irrelevant
+    to selection — only the entry-day mark is ever read.
+    """
+    prior = day - timedelta(days=1)
     return strike, {"ticker": f"O:SPY260619P{int(strike * 1000):08d}",
-                    "bars": {day: {"c": close, "n": n}}}
+                    "bars": {prior: {"c": close, "n": n},
+                             day: {"c": close, "n": n}}}
 
 
 def _chain(*items) -> dict[float, dict]:
@@ -112,11 +121,28 @@ def test_select_vertical_width_10_fallback_when_5_wing_has_no_bar():
     assert sel["credit"] == pytest.approx(2.6, abs=1e-9)
 
 
-def test_select_vertical_no_strike_in_band():
-    chain = _chain(_put(85, 0.0414), _put(80, 0.0035))  # |delta| ~ .015/.002
+def test_band_not_fetched_is_data_when_the_grid_never_reaches_the_band():
+    # |delta| ~ .015 / .002: the fetched grid tops out far below 0.35, so the
+    # delta band was never OBSERVABLE. Calling that a gate rejection would
+    # charge a data gap against the gate (finding 7).
+    chain = _chain(_put(85, 0.0414), _put(80, 0.0035))
+    sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q)
+    assert (sel["qualified"], sel["reason"]) == (False, "band-not-fetched")
+    assert rv.REASON_CLASS[sel["reason"]] == "data"
+    assert sel["diag"]["brackets_delta_band"] is False
+    assert sel["diag"]["delta_max"] < rv.DELTA_HI
+
+
+def test_no_strike_in_band_is_a_gate_rejection_only_when_bracketed():
+    # 94 -> |delta| .1902 (below the band), 98 -> .3672 (above it), nothing in
+    # between: the grid straddles [0.20, 0.35] and the band is genuinely empty.
+    chain = _chain(_put(94, 0.8413), _put(98, 2.0402))
     sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q)
     assert (sel["qualified"], sel["reason"]) == (False, "no-strike-in-band")
     assert rv.REASON_CLASS[sel["reason"]] == "gate"
+    assert sel["diag"]["brackets_delta_band"] is True
+    assert sel["diag"]["delta_min"] == pytest.approx(0.1902, abs=5e-4)
+    assert sel["diag"]["delta_max"] == pytest.approx(0.3672, abs=5e-4)
 
 
 def test_select_vertical_short_leg_liquidity_gate_n30():
@@ -172,6 +198,26 @@ def test_select_vertical_width_policy_any_widens_for_credit():
     assert any_["qualified"] is True
     assert (any_["long_strike"], any_["width"]) == (86, 10)
     assert any_["credit"] == pytest.approx(2.6, abs=1e-9)
+
+
+def test_stale_five_wide_print_no_longer_vetoes_the_ten_wide():
+    # 96 is in band; its 5-wing 91 carries an INVERTED stale print (marks above
+    # the short leg) and is itself illiquid so it can never be a short
+    # candidate, while the 10-wing 86 is clean and clears the floor. The
+    # original engine `break`-ed on the bad pair and never reached width 10
+    # (finding 8); width freedom must actually be explored.
+    chain = _chain(_put(96, 3.0), _put(91, 4.5, n=5), _put(86, 0.4))
+    sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q, width_policy="any")
+    assert sel["qualified"] is True
+    assert (sel["long_strike"], sel["width"]) == (86, 10)
+    assert sel["diag"]["n_bad_credit"] == 1          # the stale pair is counted
+    assert sel["diag"]["best_credit_frac_by_width"] == {"10": pytest.approx(0.26)}
+
+
+def test_diag_records_constructible_counts_per_width():
+    chain = _chain(_put(96, 1.3481), _put(86, 0.20))
+    sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q)
+    assert sel["diag"]["n_constructible_by_width"] == {"5": 0, "10": 1}
 
 
 def test_select_vertical_rejects_unknown_width_policy():
@@ -264,6 +310,118 @@ def test_managed_walk_no_post_entry_bars_flat_exit():
     assert walk["exit_date"] == ENTRY
 
 
+# --------------------------------------------------- mark conventions
+
+
+def test_mark_convention_selects_the_field_and_falls_back_to_close():
+    bar = {"c": 1.50, "vw": 1.42, "h": 1.80, "l": 1.10, "n": 40}
+    prev = rv.set_mark_convention("close")
+    try:
+        assert rv._close_of(bar) == pytest.approx(1.50)
+        rv.set_mark_convention("vw")
+        assert rv._close_of(bar) == pytest.approx(1.42)
+        rv.set_mark_convention("hl2")
+        assert rv._close_of(bar) == pytest.approx(1.45)
+        # smile reads the close field; the repricing happens chain-wide
+        rv.set_mark_convention("smile")
+        assert rv._close_of(bar) == pytest.approx(1.50)
+        # a convention whose own field is missing/absurd falls back to close
+        rv.set_mark_convention("vw")
+        assert rv._close_of({"c": 1.5, "vw": 0}) == pytest.approx(1.5)
+        rv.set_mark_convention("hl2")
+        assert rv._close_of({"c": 1.5}) == pytest.approx(1.5)
+        # and an unusable close is still None, never fabricated
+        rv.set_mark_convention("close")
+        assert rv._close_of({"c": 0}) is None
+    finally:
+        rv.set_mark_convention(prev)
+
+
+def test_set_mark_convention_rejects_unknown_names():
+    with pytest.raises(ValueError):
+        rv.set_mark_convention("mid")
+
+
+def test_smile_repricing_makes_both_legs_come_off_one_curve():
+    # A chain priced at a flat sigma=0.25 except that the 92 leg carries a
+    # stale 0.75 print (BS says 0.4926). After repricing, EVERY leg is the BS
+    # price of one quadratic-in-moneyness IV curve, so the IVs recovered from
+    # the repriced grid must be exactly quadratic — third finite differences on
+    # an evenly spaced strike run vanish. That property, not the level, is what
+    # a spread mark needs: both legs share one curve.
+    strikes = [88, 90, 92, 94, 95, 96, 97, 98]
+    puts = {}
+    for k in strikes:
+        px = 0.75 if k == 92 else rv.bs_put_price(S, k, T35, R, Q, 0.25)
+        _, contract = _put(float(k), px)
+        puts[float(k)] = contract
+    prev = rv.set_mark_convention("smile")
+    try:
+        closes = {ENTRY: S, ENTRY - timedelta(days=1): S}
+        stats = rv.apply_smile_repricing(puts, EXPIRY, Q, closes)
+        assert stats["days_fitted"] == 2
+        assert stats["bars_repriced"] == 2 * len(strikes)
+        assert stats["bars_kept_raw"] == 0
+        priced = [puts[float(k)]["bars"][ENTRY]["c"] for k in strikes]
+        assert all(b > a for a, b in zip(priced, priced[1:]))   # monotone in K
+        # the stale 0.75 print is pulled back toward its arbitrage-free level
+        assert 0.45 < priced[2] < 0.75
+        ivs = [rv.implied_vol_put(puts[float(k)]["bars"][ENTRY]["c"], S, k,
+                                  T35, R, Q) for k in (94, 95, 96, 97, 98)]
+        d1 = np.diff(ivs)
+        assert np.allclose(np.diff(d1, n=2), 0.0, atol=1e-7)
+    finally:
+        rv.set_mark_convention(prev)
+
+
+def test_smile_repricing_keeps_raw_closes_when_no_curve_fits():
+    # Fewer than SMILE_MIN_POINTS usable strikes -> the day is unfittable and
+    # every bar keeps its raw close. Nothing is interpolated or invented.
+    puts = dict([_put(96, 1.3481), _put(91, 0.30)])
+    prev = rv.set_mark_convention("smile")
+    try:
+        stats = rv.apply_smile_repricing(puts, EXPIRY, Q, {ENTRY: S})
+        assert stats["days_fitted"] == 0
+        assert stats["days_unfittable"] == 2       # entry day and the prior one
+        assert stats["bars_repriced"] == 0
+        assert stats["bars_kept_raw"] == 4
+        assert puts[96.0]["bars"][ENTRY]["c"] == pytest.approx(1.3481)
+    finally:
+        rv.set_mark_convention(prev)
+
+
+# --------------------------------------- liquidity-screen information set
+
+
+def test_liquidity_screen_prior_day_vs_look_ahead_same_day():
+    # The entry day trades 100 times; the session before it traded 5. Screening
+    # on the entry day's own full-day count is look-ahead (finding 15).
+    _, contract = _put(96, 1.3481, n=100)
+    contract["bars"][ENTRY - timedelta(days=1)]["n"] = 5
+    assert rv.short_leg_is_liquid(contract, ENTRY, 30, "same-day") is True
+    assert rv.short_leg_is_liquid(contract, ENTRY, 30, "prior") is False
+    # a strike with no prior session at all fails the knowable screen
+    fresh = {"bars": {ENTRY: {"c": 1.0, "n": 500}}}
+    assert rv.short_leg_is_liquid(fresh, ENTRY, 30, "prior") is False
+    assert rv.short_leg_is_liquid(fresh, ENTRY, 30, "same-day") is True
+    with pytest.raises(ValueError):
+        rv.short_leg_is_liquid(contract, ENTRY, 30, "intraday")
+
+
+def test_select_vertical_honours_the_liquidity_lag():
+    # Both strikes traded heavily on the entry day but barely the day before.
+    # The wing needs no liquidity, so the same-day (look-ahead) run qualifies
+    # while the knowable run has no eligible short leg at all.
+    chain = _chain(_put(97, 1.6697), _put(92, 0.30))
+    for k in (97.0, 92.0):
+        chain[k]["bars"][ENTRY - timedelta(days=1)]["n"] = 3
+    assert rv.select_vertical(ENTRY, EXPIRY, S, chain, Q,
+                              liquidity_lag="same-day")["qualified"] is True
+    lagged = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q,
+                                liquidity_lag="prior")
+    assert (lagged["qualified"], lagged["reason"]) == (False, "short-leg-illiquid")
+
+
 # ------------------------------------------------------------- friction
 
 
@@ -307,6 +465,46 @@ def test_block_bootstrap_degenerate_cases():
     assert rv.block_bootstrap_lb95_mean(same, resamples=100, seed=1) == pytest.approx(0.1)
 
 
+def test_exposure_cluster_blocks_group_overlapping_holds():
+    # A and B overlap; B and C overlap but A and C do not -> transitive closure
+    # puts all three in ONE block. D is disjoint and stands alone.
+    entries = [
+        {"entry_date": "2026-04-06", "exit_date": "2026-04-10",
+         "symbol": "SPY", "result_r": 0.1},
+        {"entry_date": "2026-04-09", "exit_date": "2026-04-15",
+         "symbol": "SPY", "result_r": 0.2},
+        {"entry_date": "2026-04-14", "exit_date": "2026-04-20",
+         "symbol": "QQQ", "result_r": -0.3},
+        {"entry_date": "2026-05-04", "exit_date": "2026-05-06",
+         "symbol": "SPY", "result_r": 0.4},
+    ]
+    blocks = rv.exposure_cluster_blocks(entries)
+    assert len(blocks) == 2
+    assert sorted(len(v) for v in blocks.values()) == [1, 3]
+    # entry-week blocking splits the same overlapping trio into 2 blocks and
+    # would resample them as if they were independent draws
+    weeks = rv.entry_week_blocks(entries)
+    assert len(weeks) == 3
+    assert sorted(len(v) for v in weeks.values()) == [1, 1, 2]
+
+
+def test_bootstrap_reports_both_blocking_schemes_and_rejects_unknown():
+    entries = [
+        {"entry_date": "2026-04-06", "exit_date": "2026-04-24",
+         "symbol": "SPY", "result_r": 0.3},
+        {"entry_date": "2026-04-20", "exit_date": "2026-04-30",
+         "symbol": "QQQ", "result_r": -0.5},
+        {"entry_date": "2026-06-01", "exit_date": "2026-06-03",
+         "symbol": "SPY", "result_r": 0.2},
+    ]
+    week = rv.block_bootstrap_lb95_mean(entries, 2000, 5, "entry-week")
+    clus = rv.block_bootstrap_lb95_mean(entries, 2000, 5, "exposure-cluster")
+    assert week is not None and clus is not None
+    assert week != clus            # the schemes are genuinely different
+    with pytest.raises(ValueError):
+        rv.block_bootstrap_lb95_mean(entries, 100, 1, "monthly")
+
+
 def test_max_drawdown_r():
     entries = _mk_entries({
         date(2026, 4, 6): 0.15, date(2026, 4, 7): -1.0,
@@ -327,12 +525,82 @@ def test_parse_spread_pct():
         rv.parse_spread_pct("SPY")
 
 
+# ------------------------------------------- friction provenance (B8)
+
+
+def test_load_spread_calibration_prefers_per_underlying_and_records_source(tmp_path):
+    path = tmp_path / "execution_costs.json"
+    path.write_text(json.dumps({
+        "calibrated_at": "2026-07-22T00:00:00+00:00",
+        "spread_pct_of_mid_median": 0.07338,
+        "per_underlying": {"SPY": {"median_spread_pct_mid": 0.0049,
+                                   "n_quotes": 62, "zone": "delta 0.20-0.35"}},
+    }))
+    pct, prov = rv.load_spread_calibration(path, ("SPY", "QQQ"))
+    assert pct["SPY"] == pytest.approx(0.0049)
+    assert prov["per_symbol"]["SPY"]["source"] == "per_underlying"
+    assert prov["per_symbol"]["SPY"]["n_quotes"] == 62
+    assert prov["per_symbol"]["SPY"]["zone"] == "delta 0.20-0.35"
+    # QQQ has no per-underlying entry: it inherits the single-name GLOBAL and
+    # that inheritance must be shouted, not silently absorbed.
+    assert pct["QQQ"] == pytest.approx(0.07338)
+    assert prov["per_symbol"]["QQQ"]["source"] == "file_global"
+    assert any("QQQ" in w and "GLOBAL" in w for w in prov["warnings"])
+    assert prov["sha256"] and prov["file_present"] is True
+
+
+def test_load_spread_calibration_missing_file_degrades_loudly(tmp_path):
+    pct, prov = rv.load_spread_calibration(tmp_path / "nope.json", ("SPY",))
+    assert pct["SPY"] == pytest.approx(rv.DEFAULT_SPREAD_PCT["SPY"])
+    assert prov["file_present"] is False
+    assert prov["per_symbol"]["SPY"]["source"] == "compiled_default"
+    assert any("absent" in w for w in prov["warnings"])
+    assert any("assumption" in w for w in prov["warnings"])
+
+
+def test_load_spread_calibration_derives_full_spread_from_a_half_spread(tmp_path):
+    path = tmp_path / "execution_costs.json"
+    path.write_text(json.dumps({"opt_half_spread_pct_of_mark": 0.03669}))
+    pct, prov = rv.load_spread_calibration(path, ("SPY",))
+    assert pct["SPY"] == pytest.approx(2 * 0.03669)
+    assert prov["per_symbol"]["SPY"]["key"].startswith("2 x ")
+
+
+def test_friction_comparison_exposes_the_leg_mark_proxy_error():
+    # short 3.00, long 2.00 -> credit 1.00, wing ratio 0.667, leg-mid-sum 5.00.
+    # The deployed model charges the spread on 2 x credit = 2.00 of notional;
+    # the honest model charges it on 5.00 -> 2.5x understatement.
+    trade = {"symbol": "SPY", "credit": 1.0, "short_mark": 3.0,
+             "long_mark": 2.0, "risk_dollars": 400.0, "friction": 12.0,
+             "short_exit_mark": 1.5, "long_exit_mark": 1.0}
+    fc = rv.friction_comparison([trade], {"SPY": 0.01})
+    assert fc["wing_ratio_long_over_short"]["mean"] == pytest.approx(2 / 3)
+    assert fc["leg_mid_sum_over_net_credit"]["mean"] == pytest.approx(5.0)
+    assert fc["production_deployed_friction_dollars"]["mean"] == pytest.approx(
+        2 * 0.01 * 1.0 * 100 + 4.0)                        # 6.0
+    assert fc["production_honest_leg_mark_friction_dollars"]["mean"] == (
+        pytest.approx(0.01 * 5.0 * 100 + 4.0))             # 9.0
+    assert fc["ratio_honest_over_deployed"]["mean"] == pytest.approx(1.5)
+    assert fc["replay_friction_r"]["mean"] == pytest.approx(12.0 / 400.0)
+    # recompute_replay re-derives the replay column from the booked marks
+    recomputed = rv.friction_comparison([trade], {"SPY": 0.01},
+                                        recompute_replay=True)
+    expected = rv.friction_dollars(0.01, 3.0, 2.0, 1.5, 1.0)
+    assert recomputed["replay_friction_dollars"]["mean"] == pytest.approx(expected)
+
+
+PRIOR = ENTRY - timedelta(days=1)
+
+
 def _write_e2e_data(data_dir):
-    days = [ENTRY, date(2026, 5, 18)]
+    days = [PRIOR, ENTRY, date(2026, 5, 18)]
     (data_dir / "underlying_SPY.json").write_text(json.dumps(
         {"results": [{"t": d.isoformat(), "c": 100.0} for d in days]}))
 
     def bars(closes):
+        # Every contract also prints on the session BEFORE entry, because the
+        # liquidity screen's knowable information set is that prior session.
+        closes = {PRIOR: closes[ENTRY], **closes}
         return [{"t": d.isoformat(), "o": c, "h": c, "l": c, "c": c,
                  "vw": c, "v": 500, "n": 100} for d, c in closes.items()]
 
@@ -368,8 +636,11 @@ def test_end_to_end_replay(tmp_path):
     data_dir.mkdir()
     _write_e2e_data(data_dir)
 
+    # Pinned on mark="close": the arithmetic below is hand-checked against the
+    # raw prints. The primary convention (smile) reprices every leg off a
+    # fitted curve, so it is exercised separately below.
     summary = rv.run(data_dir, data_dir / "batch_plan.json", out_dir,
-                     {"SPY": 0.0049}, resamples=500, seed=42)
+                     {"SPY": 0.0049}, resamples=500, seed=42, mark="close")
 
     entries = [json.loads(line)
                for line in (out_dir / "entries.jsonl").read_text().splitlines()]
@@ -416,6 +687,73 @@ def test_end_to_end_replay(tmp_path):
         "profit_take": 1, "dte_21": 0, "data_end": 0}
     # The European-BS approximation must be disclosed in the report.
     assert any("EUROPEAN" in note for note in summary["approximation_notes"])
+    # BOTH denominators, each with its own verdict (finding 5).
+    assert overall["availability_rate_planned"] == pytest.approx(0.5)
+    assert overall["passes_floor_on_data_adequate"] is True
+    assert overall["passes_floor_on_planned"] is False
+    # and the acceptance block must say the plan's criterion was NOT evaluated
+    verdict = summary["verdict"]
+    assert verdict["evaluated_as_specified"] is False
+    assert verdict["regime_labels_present"] is False
+    assert "60%" in verdict["criterion_text"] or "≥60%" in verdict["criterion_text"]
+    assert verdict["denominators"]["planned"]["n"] == 2
+    assert verdict["denominators"]["data_adequate"]["n"] == 1
+    assert rv.PLAN_CRITERION_SOURCE in verdict["criterion_source"]
+    # both blocking schemes are reported side by side (finding 9)
+    assert set(mp["lb95_mean_r_by_blocking"]) == {"entry-week", "exposure-cluster"}
+    assert mp["n_blocks"] == {"entry-week": 1, "exposure-cluster": 1}
+    # friction provenance is recorded, not assumed
+    prov = summary["config"]["spread_pct_provenance"]
+    assert prov["warnings"]          # caller-supplied spreads are flagged
+
+
+def test_end_to_end_sensitivity_table_covers_every_convention(tmp_path):
+    data_dir = tmp_path / "data"
+    out_dir = tmp_path / "out"
+    data_dir.mkdir()
+    _write_e2e_data(data_dir)
+
+    summary = rv.run(data_dir, data_dir / "batch_plan.json", out_dir,
+                     {"SPY": 0.0049}, resamples=200, seed=42,
+                     mark="smile", sensitivity=True)
+
+    rows = summary["sensitivity"]["rows"]
+    for m in rv.MARK_CONVENTIONS:
+        assert f"mark-{m}" in rows
+    assert "liquidity-same-day" in rows       # the look-ahead variant
+    assert "width-any" in rows
+    assert summary["sensitivity"]["primary"]["mark"] == "smile"
+    assert rows["mark-close"]["mark"] == "close"
+    assert "UPPER BOUND" in rows["mark-close"]["note"]
+    assert "PRIMARY" in rows["mark-smile"]["note"]
+    assert rows["liquidity-same-day"]["liquidity_lag"] == "same-day"
+    assert "LOOK-AHEAD" in rows["liquidity-same-day"]["note"]
+    # every row ships the entries file it was computed from
+    for tag, row in rows.items():
+        assert (out_dir / row["entries_file"]).exists()
+        assert row["n_entries"] == 2
+    # the smile run repriced bars off a fitted curve, and says how many
+    assert summary["mark_diagnostics"]["convention"] == "smile"
+    assert summary["mark_diagnostics"]["smile"]["days_fitted"] >= 1
+
+
+def test_records_persist_diagnostics_even_when_unqualified(tmp_path):
+    # finding 11: a rejection must be re-auditable from entries.jsonl alone.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_e2e_data(data_dir)
+    records, _, _ = rv.replay_records(
+        data_dir, data_dir / "batch_plan.json", {"SPY": 0.0049}, mark="close",
+        credit_floor_frac=0.9)                       # nothing can qualify
+    rec = next(r for r in records if r["entry_date"] == ENTRY.isoformat())
+    assert rec["qualified"] is False
+    assert rec["reason"] == "credit-below-floor"
+    assert rec["diag"] is not None
+    assert rec["diag"]["n_in_band"] >= 1
+    assert rec["diag"]["brackets_delta_band"] is not None
+    assert rec["diag"]["mark_convention"] == "close"
+    assert rec["reason_expiry"] == EXPIRY.isoformat()
+    assert EXPIRY.isoformat() in rec["diag_by_expiry"]
 
 
 # ------------------------------------------------- real-data edge cases

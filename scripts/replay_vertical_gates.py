@@ -57,6 +57,7 @@ MODELING APPROXIMATIONS (also recorded in summary.json):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -72,6 +73,49 @@ RISK_FREE_RATE = 0.043
 DIV_YIELD = {"SPY": 0.012, "QQQ": 0.006}
 DEFAULT_SPREAD_PCT = {"SPY": 0.0049, "QQQ": 0.0094}  # M1-0.3 measured, frac of mid
 FEE_PER_LEG_PER_DIRECTION = 1.0                       # $1 x 4 per round trip
+
+# --- daily mark conventions (B1) -----------------------------------------
+# A daily aggregate offers several equally defensible "the price that day"
+# proxies. They are NOT interchangeable for a 5-wide vertical: the spread mark
+# is a DIFFERENCE of two legs, so any leg-vs-leg timing inconsistency lands
+# directly on the credit. The four supported conventions:
+#   close  last trade of the day, per leg   (the original engine rule)
+#   vw     the bar's volume-weighted average price, per leg
+#   hl2    (high + low) / 2, per leg
+#   smile  reprice BOTH legs off ONE same-day IV curve fitted to that day's
+#          liquid closes  -> cross-leg consistent by construction
+# `smile` is the PRIMARY convention because it is the only one that is
+# cross-leg consistent; `close` is retained and reported as a disclosed UPPER
+# BOUND (it is the convention that produced the original, rejected numbers).
+MARK_CONVENTIONS = ("smile", "close", "vw", "hl2")
+PRIMARY_MARK = "smile"
+UPPER_BOUND_MARK = "close"
+SMILE_MIN_POINTS = 5        # strikes needed to fit a same-day curve
+SMILE_MIN_TRADES = 10       # per-strike trade count to enter the fit
+SMILE_IV_BOUNDS = (0.03, 2.0)
+
+# --- liquidity-screen timing (B7) ----------------------------------------
+# The n >= 30 trade-count screen on a DAILY bar is the FULL-DAY count. At the
+# moment of entry that number does not exist yet, so screening on it is
+# look-ahead. "prior" screens on the most recent session strictly before
+# entry (knowable); "same-day" is the original look-ahead rule, kept only so
+# the historical numbers stay reproducible as a disclosed sensitivity.
+LIQUIDITY_LAGS = ("prior", "same-day")
+PRIMARY_LIQUIDITY_LAG = "prior"
+
+# --- the acceptance criterion this replay was commissioned to test --------
+PLAN_CRITERION_SOURCE = "docs/REVIVAL_PLAN_2026-07-20.md line 81 (M1-0.4)"
+PLAN_CRITERION_TEXT = (
+    "验收:**允许交易的 regime 内合格 vertical 存在于 ≥60% 快照日** — "
+    "i.e. a qualifying vertical must exist on >=60% of snapshot days "
+    "WITHIN THE REGIMES THE SLEEVE IS ALLOWED TO TRADE."
+)
+CRITERION_NOT_EVALUATED_REASON = (
+    "NOT EVALUATED AS SPECIFIED: this replay carries no regime labels, so "
+    "availability was measured UNCONDITIONALLY over all planned entry days. "
+    "The criterion is conditional on the allowed regimes; an unconditional "
+    "rate is neither the criterion nor a bound on it."
+)
 
 DELTA_LO, DELTA_HI = 0.20, 0.35
 TARGET_DELTA = 0.5 * (DELTA_LO + DELTA_HI)            # deterministic tie-break
@@ -196,15 +240,61 @@ def _find_file(data_dir: Path, stem_candidates: list[str]) -> Path | None:
     return None
 
 
-def _close_of(bar: dict) -> float | None:
+_MARK_CONVENTION = PRIMARY_MARK
+
+
+def set_mark_convention(name: str) -> str:
+    """Select the active daily mark convention; returns the previous one."""
+    global _MARK_CONVENTION
+    if name not in MARK_CONVENTIONS:
+        raise ValueError(f"unknown mark convention {name!r}; "
+                         f"expected one of {MARK_CONVENTIONS}")
+    prev, _MARK_CONVENTION = _MARK_CONVENTION, name
+    return prev
+
+
+def mark_convention() -> str:
+    return _MARK_CONVENTION
+
+
+def _positive(value) -> float | None:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v <= 0:
+        return None
+    return v
+
+
+def _raw_close(bar: dict) -> float | None:
     """Positive float close, or None for a missing/unusable print."""
     try:
-        close = float(bar["c"])
-    except (KeyError, TypeError, ValueError):
+        return _positive(bar["c"])
+    except (KeyError, TypeError):
         return None
-    if not math.isfinite(close) or close <= 0:
-        return None
-    return close
+
+
+def _close_of(bar: dict) -> float | None:
+    """The bar's mark under the active convention, or None if unusable.
+
+    "smile" reads the same field as "close" — the cross-leg-consistent
+    repricing happens once per chain in apply_smile_repricing(), which
+    OVERWRITES each bar's close with the curve-implied price. A convention
+    whose own field is missing/unusable falls back to the raw close and the
+    fallback is visible in the per-run mark diagnostics.
+    """
+    conv = _MARK_CONVENTION
+    if conv in ("close", "smile"):
+        return _raw_close(bar)
+    if conv == "vw":
+        v = _positive(bar.get("vw"))
+    else:  # hl2
+        try:
+            v = _positive((float(bar["h"]) + float(bar["l"])) / 2.0)
+        except (KeyError, TypeError, ValueError):
+            v = None
+    return v if v is not None else _raw_close(bar)
 
 
 def load_underlying_closes(data_dir: Path, symbol: str) -> dict[date, float]:
@@ -329,6 +419,89 @@ def load_put_contracts(data_dir: Path, symbol: str,
     return puts, diag
 
 
+# ------------------------------------------- cross-leg-consistent marks
+
+
+def fit_iv_curve(puts: dict[float, dict], day: date, spot: float,
+                 t_years: float, q: float,
+                 min_points: int = SMILE_MIN_POINTS,
+                 min_trades: int = SMILE_MIN_TRADES) -> np.ndarray | None:
+    """Weighted quadratic-in-moneyness IV curve for ONE day of ONE chain.
+
+    Fits sigma(K/S) = a + b*m + c*m^2 to every strike whose bar has at least
+    `min_trades` trades and inverts to a sane IV, weighting by sqrt(trades).
+    None when fewer than `min_points` usable strikes exist — the day then
+    keeps its raw closes and is counted, never fabricated.
+    """
+    if spot is None or t_years <= 0.005:
+        return None
+    lo, hi = SMILE_IV_BOUNDS
+    xs, ys, ws = [], [], []
+    for strike, contract in puts.items():
+        bar = contract["bars"].get(day)
+        if bar is None:
+            continue
+        px = _close_of(bar)
+        if px is None or _trade_count(bar) < min_trades:
+            continue
+        iv = implied_vol_put(px, spot, strike, t_years, RISK_FREE_RATE, q)
+        if iv is None or not (lo < iv < hi):
+            continue
+        xs.append(strike / spot)
+        ys.append(iv)
+        ws.append(math.sqrt(_trade_count(bar)))
+    if len(xs) < min_points:
+        return None
+    x = np.asarray(xs)
+    w = np.asarray(ws)
+    design = np.vstack([np.ones_like(x), x, x * x]).T * w[:, None]
+    coef, *_ = np.linalg.lstsq(design, np.asarray(ys) * w, rcond=None)
+    return coef
+
+
+def apply_smile_repricing(puts: dict[float, dict], expiry: date, q: float,
+                          closes: dict[date, float]) -> dict:
+    """Overwrite every bar's close with a same-day-curve-consistent price.
+
+    Both legs of any vertical then come off ONE IV curve, so the credit no
+    longer inherits the leg-vs-leg last-trade timing gap. Days with no
+    fittable curve, and strikes the curve extrapolates to an insane IV, keep
+    their raw close and are counted in the returned stats.
+    """
+    stats = {"days_fitted": 0, "days_unfittable": 0,
+             "bars_repriced": 0, "bars_kept_raw": 0}
+    lo, hi = SMILE_IV_BOUNDS
+    days: set[date] = set()
+    for contract in puts.values():
+        days |= set(contract["bars"])
+    for day in sorted(days):
+        spot = closes.get(day)
+        t_years = (expiry - day).days / 365.0
+        coef = fit_iv_curve(puts, day, spot, t_years, q)
+        if coef is None:
+            stats["days_unfittable"] += 1
+            stats["bars_kept_raw"] += sum(1 for c in puts.values()
+                                          if day in c["bars"])
+            continue
+        stats["days_fitted"] += 1
+        for strike, contract in puts.items():
+            bar = contract["bars"].get(day)
+            if bar is None:
+                continue
+            m = strike / spot
+            iv = float(coef[0] + coef[1] * m + coef[2] * m * m)
+            px = (bs_put_price(spot, strike, t_years, RISK_FREE_RATE, q, iv)
+                  if lo < iv < hi else None)
+            if px is None or px <= 0:
+                stats["bars_kept_raw"] += 1
+                continue
+            repriced = dict(bar)
+            repriced["c"] = px
+            contract["bars"][day] = repriced
+            stats["bars_repriced"] += 1
+    return stats
+
+
 def load_batch_plan(path: Path) -> list[dict]:
     """Normalize the batch plan to [{entry_date, symbol, expiry}, ...]."""
     payload = json.loads(path.read_text())
@@ -355,40 +528,75 @@ def load_batch_plan(path: Path) -> list[dict]:
 # ------------------------------------------------- vertical selection
 
 
-def _entry_mark(contract: dict | None, entry_date: date,
-                min_trades: int | None = None) -> float | None:
-    """Entry-day close for a contract, or None when there is no usable print.
+def _trade_count(bar: dict) -> float:
+    """The bar's trade count n, 0.0 when absent or unparsable."""
+    try:
+        return float(bar.get("n", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
-    min_trades applies the short-leg liquidity screen (bar trade count n).
+
+def _prior_bar_day(contract: dict, entry_date: date) -> date | None:
+    """Latest session with a usable bar STRICTLY BEFORE entry_date."""
+    earlier = [d for d in contract["bars"] if d < entry_date]
+    return max(earlier) if earlier else None
+
+
+def short_leg_is_liquid(contract: dict, entry_date: date, min_trades: int,
+                        lag: str = PRIMARY_LIQUIDITY_LAG) -> bool:
+    """The n >= min_trades liquidity screen, with an explicit information set.
+
+    lag="prior"     screen the most recent session strictly BEFORE entry. Only
+                    this version is knowable at the moment of entry.
+    lag="same-day"  screen the entry day's own FULL-DAY trade count. This is
+                    LOOK-AHEAD (the count does not exist until the close) and
+                    is retained only as a disclosed sensitivity.
+    A contract with no prior session at all fails the "prior" screen: an
+    untraded/newly-listed strike is exactly what the screen exists to reject.
+    """
+    if lag not in LIQUIDITY_LAGS:
+        raise ValueError(f"unknown liquidity lag {lag!r}; expected {LIQUIDITY_LAGS}")
+    if lag == "same-day":
+        bar = contract["bars"].get(entry_date)
+        return bar is not None and _trade_count(bar) >= min_trades
+    day = _prior_bar_day(contract, entry_date)
+    return day is not None and _trade_count(contract["bars"][day]) >= min_trades
+
+
+def _entry_mark(contract: dict | None, entry_date: date,
+                min_trades: int | None = None,
+                liquidity_lag: str = PRIMARY_LIQUIDITY_LAG) -> float | None:
+    """Entry-day mark for a contract, or None when there is no usable print.
+
+    min_trades applies the short-leg liquidity screen; see
+    short_leg_is_liquid() for what information set the screen may use.
     """
     if contract is None:
         return None
     bar = contract["bars"].get(entry_date)
     if bar is None:
         return None
-    if min_trades is not None:
-        try:
-            n_trades = float(bar.get("n", 0) or 0)
-        except (TypeError, ValueError):
-            n_trades = 0.0
-        if n_trades < min_trades:
-            return None
+    if min_trades is not None and not short_leg_is_liquid(
+            contract, entry_date, min_trades, liquidity_lag):
+        return None
     return _close_of(bar)
 
 
-def count_constructible(entry_date: date, puts: dict[float, dict]) -> int:
-    """How many strikes have an entry-day print AND a 5- or 10-wide wing with
-    one. Zero means the fetched strike set cannot form ANY vertical, i.e. the
-    entry is data-limited rather than gate-rejected."""
+def count_constructible(entry_date: date, puts: dict[float, dict],
+                        widths: tuple[float, ...] = WIDTHS) -> int:
+    """How many strikes have an entry-day print AND a wing of one of `widths`
+    with one. Zero means the fetched strike set cannot form ANY vertical, i.e.
+    the entry is data-limited rather than gate-rejected."""
     have = {s for s in puts if _entry_mark(puts[s], entry_date) is not None}
-    return sum(1 for s in have if any((s - w) in have for w in WIDTHS))
+    return sum(1 for s in have if any((s - w) in have for w in widths))
 
 
 def select_vertical(entry_date: date, expiry: date, spot: float,
                     puts: dict[float, dict], q: float,
                     r: float = RISK_FREE_RATE,
                     width_policy: str = "five-first",
-                    credit_floor_frac: float = CREDIT_FLOOR_FRAC) -> dict:
+                    credit_floor_frac: float = CREDIT_FLOOR_FRAC,
+                    liquidity_lag: str = PRIMARY_LIQUIDITY_LAG) -> dict:
     """Replay the gate stack on one (entry_date, symbol, expiry).
 
     width_policy controls how the $5-10 width freedom in the sleeve spec is
@@ -405,7 +613,12 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
       no-entry-day-mark (data)   -> no strike had a usable entry-day print
       short-leg-illiquid (gate)  -> prints exist but all fail n >= 30
       no-invertible-mark (data)  -> liquid prints exist, none invert to an IV
-      no-strike-in-band (gate)   -> no |delta| in [0.20, 0.35]
+      band-not-fetched (data)    -> the fetched strike grid does not BRACKET
+                                    [0.20, 0.35]: min|delta| > 0.20 or
+                                    max|delta| < 0.35, so the band was never
+                                    observable. A data gap, not a rejection.
+      no-strike-in-band (gate)   -> the grid DOES bracket the band and still no
+                                    strike lands inside it (a real rejection)
       wing-missing (data-limited)-> in-band short, but no wing print fetched
       inverted-credit-mark (data)-> wing priced above the short (stale print)
       credit-below-floor (gate)  -> vertical exists, credit < width/4
@@ -415,16 +628,25 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
     t_years = (expiry - entry_date).days / 365.0
     diag = {"n_contracts": len(puts), "n_entry_mark": 0, "n_liquid": 0,
             "n_iv_ok": 0, "n_in_band": 0, "n_constructible": 0,
-            "wing_unfetched": 0, "wing_no_bar": 0, "n_bad_credit": 0,
-            "width_policy": width_policy, "best_credit_frac": None}
+            "n_constructible_by_width": {}, "wing_unfetched": 0,
+            "wing_no_bar": 0, "n_bad_credit": 0, "width_policy": width_policy,
+            "liquidity_lag": liquidity_lag, "credit_floor_frac": credit_floor_frac,
+            "mark_convention": _MARK_CONVENTION, "best_credit_frac": None,
+            "best_credit_frac_by_width": {}, "delta_min": None,
+            "delta_max": None, "brackets_delta_band": None}
     diag["n_constructible"] = count_constructible(entry_date, puts)
+    diag["n_constructible_by_width"] = {
+        f"{w:g}": count_constructible(entry_date, puts, widths=(w,))
+        for w in WIDTHS}
     in_band: list[dict] = []
+    deltas: list[float] = []
     for strike in sorted(puts):
         mark = _entry_mark(puts[strike], entry_date)
         if mark is None:
             continue
         diag["n_entry_mark"] += 1
-        if _entry_mark(puts[strike], entry_date, MIN_SHORT_TRADES) is None:
+        if _entry_mark(puts[strike], entry_date, MIN_SHORT_TRADES,
+                       liquidity_lag) is None:
             continue
         diag["n_liquid"] += 1
         iv = implied_vol_put(mark, spot, strike, t_years, r, q)
@@ -432,10 +654,20 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
             continue
         diag["n_iv_ok"] += 1
         delta = bs_put_delta(spot, strike, t_years, r, q, iv)
+        deltas.append(abs(delta))
         if DELTA_LO <= abs(delta) <= DELTA_HI:
             diag["n_in_band"] += 1
             in_band.append({"strike": strike, "mark": mark, "iv": iv,
                             "delta": delta})
+    if deltas:
+        diag["delta_min"] = min(deltas)
+        diag["delta_max"] = max(deltas)
+        # The band is OBSERVABLE only if the fetched, liquid, invertible grid
+        # straddles it. Otherwise "no strike in band" says nothing about the
+        # gate — it says the strikes that would answer the question were
+        # never fetched.
+        diag["brackets_delta_band"] = (diag["delta_min"] <= DELTA_LO
+                                       and diag["delta_max"] >= DELTA_HI)
     if diag["n_entry_mark"] == 0:
         return {"qualified": False, "reason": "no-entry-day-mark", "diag": diag}
     if diag["n_liquid"] == 0:
@@ -443,7 +675,9 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
     if diag["n_iv_ok"] == 0:
         return {"qualified": False, "reason": "no-invertible-mark", "diag": diag}
     if not in_band:
-        return {"qualified": False, "reason": "no-strike-in-band", "diag": diag}
+        reason = ("no-strike-in-band" if diag["brackets_delta_band"]
+                  else "band-not-fetched")
+        return {"qualified": False, "reason": reason, "diag": diag}
 
     # Deterministic preference: |delta| closest to the band midpoint,
     # higher strike breaking ties.
@@ -452,7 +686,7 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
     any_sane_credit = False
     for cand in in_band:
         short_strike = cand["strike"]
-        for width in WIDTHS:  # 5 preferred, 10 only if the 5-wing has no bar
+        for width in WIDTHS:  # 5 preferred, 10 explored per width_policy
             long_strike = short_strike - width
             wing = puts.get(long_strike)
             if wing is None:
@@ -466,13 +700,20 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
             credit = cand["mark"] - long_mark
             if credit <= 0 or credit >= width:
                 # Inverted / impossible mark pair: a stale print, not a
-                # tradeable rejection. Skip this candidate, never repair it.
+                # tradeable rejection. Skip THIS WIDTH and keep exploring —
+                # a stale $5 wing print must not silently veto the $10 wing
+                # (the original engine `break`-ed here, which is one of the
+                # two reasons the 10-wide branch never fired).
                 diag["n_bad_credit"] += 1
-                break
+                continue
             any_sane_credit = True
             frac = credit / width
             if diag["best_credit_frac"] is None or frac > diag["best_credit_frac"]:
                 diag["best_credit_frac"] = frac
+            key = f"{width:g}"
+            prev = diag["best_credit_frac_by_width"].get(key)
+            if prev is None or frac > prev:
+                diag["best_credit_frac_by_width"][key] = frac
             if credit >= width * credit_floor_frac:
                 return {
                     "qualified": True, "reason": None, "diag": diag,
@@ -484,7 +725,9 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
                     "long_ticker": puts[long_strike]["ticker"],
                 }
             if width_policy == "five-first":
-                break  # a wing with a bar existed; do not widen for credit
+                # A priced wing existed at the narrowest width; the spec's
+                # default reading does not widen merely to reach the floor.
+                break
     if not any_wing:
         reason = "wing-missing"
     elif not any_sane_credit:
@@ -565,10 +808,11 @@ REASON_INFO: dict[str, tuple[int, str]] = {
     "no-entry-day-mark": (5, "data"),
     "short-leg-illiquid": (6, "gate"),
     "no-invertible-mark": (7, "data"),
-    "no-strike-in-band": (8, "gate"),
-    "wing-missing": (9, "data"),
-    "inverted-credit-mark": (10, "data"),
-    "credit-below-floor": (11, "gate"),
+    "band-not-fetched": (8, "data"),
+    "no-strike-in-band": (9, "gate"),
+    "wing-missing": (10, "data"),
+    "inverted-credit-mark": (11, "data"),
+    "credit-below-floor": (12, "gate"),
 }
 _REASON_RANK = {k: v[0] for k, v in REASON_INFO.items()}
 REASON_CLASS = {k: v[1] for k, v in REASON_INFO.items()}
@@ -579,15 +823,24 @@ def replay_entry(entry_date: date, symbol: str, expiries: list[date],
                  puts_by_expiry: dict[date, dict | None],
                  spread_pct: float, q: float,
                  width_policy: str = "five-first",
-                 credit_floor_frac: float = CREDIT_FLOOR_FRAC) -> dict:
+                 credit_floor_frac: float = CREDIT_FLOOR_FRAC,
+                 liquidity_lag: str = PRIMARY_LIQUIDITY_LAG) -> dict:
     """One record per (entry_date, symbol): try candidate expiries in
     ascending DTE order, keep the first qualifying vertical; otherwise
-    report the most-progressed failure reason plus the data funnel flags."""
+    report the most-progressed failure reason plus the data funnel flags.
+
+    The per-expiry selection diagnostics are persisted on EVERY record,
+    qualified or not (diag = the diag of the expiry the record's reason came
+    from, diag_by_expiry = all of them), so a rejection can be re-audited
+    from entries.jsonl alone.
+    """
     rec = {"entry_date": entry_date.isoformat(), "symbol": symbol,
            "qualified": False, "reason": "no-data",
            "marks_present": False, "data_adequate": False,
            "n_entry_marks": 0, "n_constructible": 0,
-           "best_credit_frac": None}
+           "best_credit_frac": None, "brackets_delta_band": None,
+           "diag": None, "diag_by_expiry": {},
+           "mark_convention": _MARK_CONVENTION, "liquidity_lag": liquidity_lag}
     spot = closes.get(entry_date)
     if spot is None:
         rec["reason"] = "no-underlying-bar"
@@ -607,13 +860,20 @@ def replay_entry(entry_date: date, symbol: str, expiries: list[date],
         else:
             sel = select_vertical(entry_date, expiry, spot, puts, q,
                                   width_policy=width_policy,
-                                  credit_floor_frac=credit_floor_frac)
+                                  credit_floor_frac=credit_floor_frac,
+                                  liquidity_lag=liquidity_lag)
             diag = sel["diag"]
+            rec["diag_by_expiry"][expiry.isoformat()] = {
+                **diag, "dte": dte, "reason": sel["reason"],
+                "qualified": sel["qualified"]}
             rec["n_entry_marks"] = max(rec["n_entry_marks"], diag["n_entry_mark"])
             rec["n_constructible"] = max(rec["n_constructible"],
                                          diag["n_constructible"])
             rec["marks_present"] = rec["marks_present"] or diag["n_entry_mark"] > 0
             rec["data_adequate"] = rec["data_adequate"] or diag["n_constructible"] > 0
+            if diag["brackets_delta_band"] is not None:
+                rec["brackets_delta_band"] = bool(
+                    rec["brackets_delta_band"]) or diag["brackets_delta_band"]
             if diag["best_credit_frac"] is not None:
                 rec["best_credit_frac"] = max(
                     rec["best_credit_frac"] or 0.0, diag["best_credit_frac"])
@@ -639,6 +899,8 @@ def replay_entry(entry_date: date, symbol: str, expiries: list[date],
                     "exit_date": walk["exit_date"].isoformat(),
                     "exit_reason": walk["exit_reason"],
                     "exit_debit": walk["exit_debit"],
+                    "short_exit_mark": walk["short_exit_mark"],
+                    "long_exit_mark": walk["long_exit_mark"],
                     "data_end": walk["data_end"],
                     "walk_days": walk["walk_days"],
                     "skipped_days": walk["skipped_days"],
@@ -652,34 +914,98 @@ def replay_entry(entry_date: date, symbol: str, expiries: list[date],
             best_reason = reason
     rec["reason"] = best_reason
     rec["reason_class"] = REASON_CLASS[best_reason]
+    # Persist the diag of the expiry the reported reason came from, so an
+    # unqualified record is auditable from entries.jsonl alone (finding 11).
+    for exp_iso, d in rec["diag_by_expiry"].items():
+        if d["reason"] == best_reason:
+            rec["diag"] = d
+            rec["reason_expiry"] = exp_iso
+            break
     return rec
 
 
 # ------------------------------------------------------------- statistics
 
 
-def block_bootstrap_lb95_mean(entries: list[dict],
-                              resamples: int = BOOTSTRAP_RESAMPLES,
-                              seed: int = BOOTSTRAP_SEED) -> float | None:
-    """LB95 of mean(result_r) with entry-ISO-weeks as bootstrap blocks.
-
-    Resampled mean = sum(week sums)/sum(week counts) over weeks drawn with
-    replacement; the 5th percentile of the resampled means is the one-sided
-    95% lower bound. Deterministic for a fixed seed.
-    """
-    by_week: dict[str, list[float]] = defaultdict(list)
+def entry_week_blocks(entries: list[dict]) -> dict[str, list[float]]:
+    """Blocks = entry ISO week. Cheap, but a 1-week block cannot contain an
+    18-day exposure, so simultaneously-open trades can land in DIFFERENT
+    blocks and be resampled as if independent (finding 9)."""
+    blocks: dict[str, list[float]] = defaultdict(list)
     for e in entries:
         iso = date.fromisoformat(e["entry_date"]).isocalendar()
-        by_week[f"{iso[0]}-W{iso[1]:02d}"].append(e["result_r"])
-    weeks = sorted(by_week)
-    if not weeks:
+        blocks[f"{iso[0]}-W{iso[1]:02d}"].append(e["result_r"])
+    return dict(blocks)
+
+
+def exposure_cluster_blocks(entries: list[dict]) -> dict[str, list[float]]:
+    """Blocks = connected components of overlapping [entry, exit] intervals.
+
+    Two trades that are open at the same moment share the same market shock,
+    so they must never be drawn independently. Transitive closure of the
+    overlap relation gives the coarsest honest block: every trade inside a
+    component is resampled with the whole component.
+    """
+    items = sorted(entries, key=lambda e: (e["entry_date"], e["symbol"]))
+    n = len(items)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+
+    spans = [(date.fromisoformat(e["entry_date"]),
+              date.fromisoformat(e.get("exit_date") or e["entry_date"]))
+             for e in items]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if spans[i][0] <= spans[j][1] and spans[j][0] <= spans[i][1]:
+                union(i, j)
+    blocks: dict[str, list[float]] = defaultdict(list)
+    for i, e in enumerate(items):
+        root = find(i)
+        blocks[f"cluster-{root:03d}@{items[root]['entry_date']}"].append(
+            e["result_r"])
+    return dict(blocks)
+
+
+def _bootstrap_lb95(blocks: dict[str, list[float]], resamples: int,
+                    seed: int) -> float | None:
+    """5th percentile of the block-resampled mean; deterministic per seed."""
+    keys = sorted(blocks)
+    if not keys:
         return None
-    sums = np.array([sum(by_week[w]) for w in weeks])
-    counts = np.array([len(by_week[w]) for w in weeks], dtype=float)
+    sums = np.array([sum(blocks[k]) for k in keys], dtype=float)
+    counts = np.array([len(blocks[k]) for k in keys], dtype=float)
     rng = np.random.default_rng(seed)
-    idx = rng.integers(0, len(weeks), size=(resamples, len(weeks)))
+    idx = rng.integers(0, len(keys), size=(resamples, len(keys)))
     means = sums[idx].sum(axis=1) / counts[idx].sum(axis=1)
     return float(np.percentile(means, 5.0))
+
+
+def block_bootstrap_lb95_mean(entries: list[dict],
+                              resamples: int = BOOTSTRAP_RESAMPLES,
+                              seed: int = BOOTSTRAP_SEED,
+                              blocking: str = "entry-week") -> float | None:
+    """LB95 of mean(result_r) under the named blocking scheme.
+
+    blocking="entry-week"       entry ISO week (original)
+    blocking="exposure-cluster" connected components of overlapping holds
+    """
+    if blocking == "entry-week":
+        blocks = entry_week_blocks(entries)
+    elif blocking == "exposure-cluster":
+        blocks = exposure_cluster_blocks(entries)
+    else:
+        raise ValueError(f"unknown blocking {blocking!r}")
+    return _bootstrap_lb95(blocks, resamples, seed)
 
 
 def max_drawdown_r(entries: list[dict]) -> float:
@@ -711,16 +1037,29 @@ def _availability(records: list[dict]) -> dict:
     n = len(records)
     marks = sum(1 for r in records if r.get("marks_present"))
     adeq = sum(1 for r in records if r.get("data_adequate"))
+    brack = sum(1 for r in records
+                if r.get("data_adequate") and r.get("brackets_delta_band"))
     q = sum(1 for r in records if r["qualified"])
+    floor = AVAILABILITY_FLOOR
+    rate_adeq = (q / adeq) if adeq else None
+    rate_plan = (q / n) if n else None
     return {
         "n_entries": n,
         "n_marks_present": marks,
         "n_data_adequate": adeq,
+        "n_band_bracketed": brack,
         "n_qualified": q,
         "data_coverage_rate": (adeq / n) if n else None,
-        "availability_rate": (q / adeq) if adeq else None,
+        # BOTH denominators, side by side, each with its own verdict (finding 5).
+        "availability_rate": rate_adeq,          # q / data-adequate
+        "availability_rate_planned": rate_plan,  # q / all planned entry days
         "availability_rate_strict": (q / marks) if marks else None,
-        "rate": (q / adeq) if adeq else None,  # back-compat alias
+        "availability_rate_band_bracketed": (q / brack) if brack else None,
+        "passes_floor_on_data_adequate": (None if rate_adeq is None
+                                          else rate_adeq >= floor),
+        "passes_floor_on_planned": (None if rate_plan is None
+                                    else rate_plan >= floor),
+        "rate": rate_adeq,  # back-compat alias
     }
 
 
@@ -752,10 +1091,186 @@ def credit_floor_sensitivity(records: list[dict],
     return out
 
 
+# ------------------------------------------- friction provenance (B8)
+
+# Candidate key names for "full quoted spread as a fraction of mid". Lane A is
+# rewriting data/execution_costs.json, so read whatever is there rather than
+# hardcoding one schema; an unrecognized file degrades to the compiled-in
+# DEFAULT_SPREAD_PCT and says so loudly.
+_SPREAD_KEYS_FULL = ("median_spread_pct_mid", "spread_pct_of_mid_median",
+                     "full_spread_pct_of_mid", "median_full_spread_pct_mid",
+                     "spread_pct_of_mid", "spread_pct")
+_SPREAD_KEYS_HALF = ("opt_half_spread_pct_of_mark", "half_spread_pct_of_mark",
+                     "median_half_spread_pct_mark")
+
+
+def _first_fraction(blob: dict, keys: tuple[str, ...]) -> tuple[float, str] | None:
+    for k in keys:
+        v = blob.get(k)
+        if isinstance(v, (int, float)) and 0 < float(v) < 1:
+            return float(v), k
+    return None
+
+
+def load_spread_calibration(path: Path | None,
+                            symbols: tuple[str, ...]) -> tuple[dict, dict]:
+    """(spread_pct per symbol, provenance) from data/execution_costs.json.
+
+    Per-underlying entry wins; then the file's global figure; then the
+    compiled-in DEFAULT_SPREAD_PCT. Every fallback is recorded in provenance
+    with a warning, so summary.json never presents an inherited default as a
+    measurement (finding 14).
+    """
+    prov: dict = {"path": str(path) if path else None, "file_present": False,
+                  "sha256": None, "calibrated_at": None, "file_globals": {},
+                  "per_symbol": {}, "warnings": []}
+    raw: dict = {}
+    if path is not None and path.exists():
+        try:
+            text = path.read_text()
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                raw = loaded
+                prov["file_present"] = True
+                prov["sha256"] = hashlib.sha256(text.encode()).hexdigest()
+                prov["calibrated_at"] = raw.get("calibrated_at")
+                prov["file_globals"] = {
+                    k: v for k, v in raw.items()
+                    if isinstance(v, (int, float, str))}
+            else:
+                prov["warnings"].append(
+                    f"{path} is not a JSON object; ignored")
+        except (OSError, json.JSONDecodeError) as exc:
+            prov["warnings"].append(f"could not read {path}: {exc}")
+    else:
+        prov["warnings"].append(
+            f"calibration file {path} absent — every spread below is a "
+            "compiled-in DEFAULT_SPREAD_PCT, NOT a measurement")
+    per_und = raw.get("per_underlying") if isinstance(
+        raw.get("per_underlying"), dict) else {}
+    global_full = _first_fraction(raw, _SPREAD_KEYS_FULL)
+    if global_full is None:
+        half = _first_fraction(raw, _SPREAD_KEYS_HALF)
+        if half is not None:
+            global_full = (2.0 * half[0], f"2 x {half[1]}")
+    out: dict[str, float] = {}
+    for sym in symbols:
+        entry = per_und.get(sym)
+        if not isinstance(entry, dict):
+            entry = per_und.get(f"US.{sym}") if isinstance(
+                per_und.get(f"US.{sym}"), dict) else None
+        hit = _first_fraction(entry, _SPREAD_KEYS_FULL) if entry else None
+        if hit is not None:
+            out[sym] = hit[0]
+            prov["per_symbol"][sym] = {
+                "spread_pct_of_mid": hit[0], "source": "per_underlying",
+                "key": hit[1],
+                "n_quotes": entry.get("n_quotes", entry.get("n_samples")),
+                "zone": entry.get("zone", entry.get("delta_zone")),
+                "calibrated_at": entry.get("calibrated_at"),
+            }
+            continue
+        if global_full is not None:
+            out[sym] = global_full[0]
+            prov["per_symbol"][sym] = {
+                "spread_pct_of_mid": global_full[0],
+                "source": "file_global", "key": global_full[1],
+                "n_quotes": raw.get("n_samples"), "zone": None,
+                "calibrated_at": raw.get("calibrated_at"),
+            }
+            prov["warnings"].append(
+                f"{sym}: no per-underlying calibration — using the file's "
+                f"GLOBAL {global_full[1]}={global_full[0]:.4f}, which was "
+                "calibrated on a single-name watchlist, not this index chain")
+            continue
+        out[sym] = DEFAULT_SPREAD_PCT.get(sym, 0.02)
+        prov["per_symbol"][sym] = {
+            "spread_pct_of_mid": out[sym], "source": "compiled_default",
+            "key": "DEFAULT_SPREAD_PCT", "n_quotes": None,
+            "zone": None, "calibrated_at": None}
+        prov["warnings"].append(
+            f"{sym}: NO calibration of any kind found — falling back to the "
+            f"compiled-in DEFAULT_SPREAD_PCT {out[sym]:.4f}. Treat every "
+            f"{sym} friction figure in this report as an assumption.")
+    return out, prov
+
+
+def friction_comparison(qualified: list[dict],
+                        spread_pct: dict[str, float],
+                        recompute_replay: bool = False) -> dict:
+    """Replay friction vs the two production leg-mark models, in R.
+
+    replay              spread charged on all FOUR realized leg marks
+                        (entry short+long, exit short+long) — the most
+                        informed of the three, and what this replay booked.
+    production_deployed execution_costs.friction_r as deployed: 4 x
+                        half_spread(net_credit), i.e. leg-mid-sum proxied by
+                        2 x net_credit. Exact only at wing ratio r = 1/3.
+    production_honest   the same 2-legs x 2-directions stack charged on the
+                        ACTUAL entry leg marks (short + long).
+    Also reports the measured wing ratio long_mark/short_mark, which is what
+    decides whether the deployed proxy is conservative or optimistic.
+    """
+    if not qualified:
+        return {"n_trades": 0}
+    rows = []
+    for r in qualified:
+        pct = spread_pct[r["symbol"]]
+        risk = r["risk_dollars"]
+        cr, s, l = r["credit"], r["short_mark"], r["long_mark"]
+        fees = 4.0 * FEE_PER_LEG_PER_DIRECTION
+        deployed = 2.0 * pct * cr * 100.0 + fees
+        honest = pct * (s + l) * 100.0 + fees
+        if recompute_replay:
+            sx = r.get("short_exit_mark")
+            lx = r.get("long_exit_mark")
+            replay = friction_dollars(pct, s, l,
+                                      s if sx is None else sx,
+                                      l if lx is None else lx)
+        else:
+            replay = r["friction"]
+        rows.append((replay / risk, deployed / risk, honest / risk,
+                     replay, deployed, honest, l / s, (s + l) / cr))
+    a = np.array(rows)
+
+    def st(col: int) -> dict:
+        return {"mean": float(a[:, col].mean()),
+                "median": float(np.median(a[:, col]))}
+
+    return {
+        "n_trades": len(rows),
+        "replay_friction_r": st(0),
+        "production_deployed_friction_r": st(1),
+        "production_honest_leg_mark_friction_r": st(2),
+        "replay_friction_dollars": st(3),
+        "production_deployed_friction_dollars": st(4),
+        "production_honest_leg_mark_friction_dollars": st(5),
+        "ratio_replay_over_deployed": {
+            "mean": float((a[:, 0] / a[:, 1]).mean()),
+            "min": float((a[:, 0] / a[:, 1]).min()),
+            "max": float((a[:, 0] / a[:, 1]).max())},
+        "ratio_honest_over_deployed": {
+            "mean": float((a[:, 2] / a[:, 1]).mean()),
+            "median": float(np.median(a[:, 2] / a[:, 1]))},
+        "wing_ratio_long_over_short": st(6),
+        "leg_mid_sum_over_net_credit": st(7),
+        "deployed_model_assumes_leg_mid_sum_over_credit": 2.0,
+        "deployed_model_exact_at_wing_ratio": 1.0 / 3.0,
+        "note": (
+            "execution_costs.friction_r proxies each leg's mark by net_credit "
+            "(leg-mid-sum = 2 x net_credit), exact only at wing ratio 1/3. "
+            "The measured wing ratio here is ~0.85, so the deployed model "
+            "UNDERSTATES the spread leg of friction by "
+            "leg_mid_sum_over_net_credit / 2."),
+    }
+
+
 def summarize(records: list[dict], resamples: int, seed: int,
               spread_pct: dict[str, float],
               width_policy: str = "five-first",
-              credit_floor_frac: float = CREDIT_FLOOR_FRAC) -> dict:
+              credit_floor_frac: float = CREDIT_FLOOR_FRAC,
+              liquidity_lag: str = PRIMARY_LIQUIDITY_LAG,
+              mark: str = PRIMARY_MARK) -> dict:
     qualified = [r for r in records if r["qualified"]]
     by_symbol = defaultdict(list)
     by_month = defaultdict(list)
@@ -784,6 +1299,7 @@ def summarize(records: list[dict], resamples: int, seed: int,
                 "net_pnl_dollars": float(sum(r["pnl_net"] for r in sub))}
 
     n_q = len(qualified)
+    overall = _availability(records)
     summary = {
         "config": {
             "risk_free_rate": RISK_FREE_RATE, "div_yield": DIV_YIELD,
@@ -796,15 +1312,60 @@ def summarize(records: list[dict], resamples: int, seed: int,
             "fees_per_round_trip": 4.0 * FEE_PER_LEG_PER_DIRECTION,
             "availability_floor": AVAILABILITY_FLOOR,
             "width_policy": width_policy,
+            "mark_convention": mark,
+            "liquidity_lag": liquidity_lag,
+            "liquidity_screen_is_look_ahead": liquidity_lag == "same-day",
         },
         "approximation_notes": APPROXIMATION_NOTES,
+        "verdict": {
+            "criterion_source": PLAN_CRITERION_SOURCE,
+            "criterion_text": PLAN_CRITERION_TEXT,
+            "evaluated_as_specified": False,
+            "why_not": CRITERION_NOT_EVALUATED_REASON,
+            "regime_labels_present": False,
+            "what_was_measured": (
+                "UNCONDITIONAL availability of a qualifying vertical over the "
+                "planned entry days, under one mark convention at a time."),
+            "denominators": {
+                "data_adequate": {
+                    "definition": "planned entries whose FETCHED strikes could "
+                                  "construct at least one vertical",
+                    "n": overall["n_data_adequate"],
+                    "n_qualified": overall["n_qualified"],
+                    "rate": overall["availability_rate"],
+                    "floor": AVAILABILITY_FLOOR,
+                    "passes": overall["passes_floor_on_data_adequate"],
+                },
+                "planned": {
+                    "definition": "every planned (entry_date, symbol) pair, "
+                                  "data gaps charged against availability",
+                    "n": overall["n_entries"],
+                    "n_qualified": overall["n_qualified"],
+                    "rate": overall["availability_rate_planned"],
+                    "floor": AVAILABILITY_FLOOR,
+                    "passes": overall["passes_floor_on_planned"],
+                },
+            },
+            "overall_verdict": (
+                "CRITERION NOT EVALUATED AS SPECIFIED (no regime labels). "
+                "The unconditional rate FAILS the "
+                f"{AVAILABILITY_FLOOR:.0%} floor on both denominators."
+                if not (overall["passes_floor_on_data_adequate"]
+                        or overall["passes_floor_on_planned"])
+                else "CRITERION NOT EVALUATED AS SPECIFIED (no regime "
+                     "labels); the unconditional rate clears the floor on at "
+                     "least one denominator, which is NOT the criterion."),
+        },
+        "friction_comparison": friction_comparison(qualified, spread_pct),
         "availability": {
             "acceptance_criterion":
                 f">={AVAILABILITY_FLOOR:.0%} of DATA-ADEQUATE entry days must "
                 "have a qualifying vertical (revival plan M1-0.4). Entries "
                 "whose option data was never fetched are excluded from the "
-                "denominator and reported as data_coverage_rate instead.",
-            "overall": _availability(records),
+                "denominator and reported as data_coverage_rate instead. "
+                "NOTE: the plan's own criterion is CONDITIONAL on the allowed "
+                "regimes and is NOT what this number measures — see .verdict.",
+            "overall": overall,
             "per_symbol": {s: _availability(v) for s, v in sorted(by_symbol.items())},
             "per_month": {m: _availability(v) for m, v in sorted(by_month.items())},
             "unqualified_reasons": dict(sorted(reason_counts.items())),
@@ -822,7 +1383,18 @@ def summarize(records: list[dict], resamples: int, seed: int,
             "std_r": float(rs.std(ddof=1)) if n_q > 1 else None,
             "sum_r": float(rs.sum()) if n_q else 0.0,
             "net_pnl_dollars": float(sum(r["pnl_net"] for r in qualified)),
-            "lb95_mean_r": block_bootstrap_lb95_mean(qualified, resamples, seed),
+            "lb95_mean_r": block_bootstrap_lb95_mean(
+                qualified, resamples, seed, "entry-week"),
+            "lb95_mean_r_by_blocking": {
+                "entry-week": block_bootstrap_lb95_mean(
+                    qualified, resamples, seed, "entry-week"),
+                "exposure-cluster": block_bootstrap_lb95_mean(
+                    qualified, resamples, seed, "exposure-cluster"),
+            },
+            "n_blocks": {
+                "entry-week": len(entry_week_blocks(qualified)),
+                "exposure-cluster": len(exposure_cluster_blocks(qualified)),
+            },
             "max_drawdown_r": max_drawdown_r(qualified),
             "per_symbol": {s: _payoff([r for r in v if r["qualified"]])
                            for s, v in sorted(by_symbol.items())},
@@ -863,45 +1435,201 @@ def parse_spread_pct(text: str) -> dict[str, float]:
     return out
 
 
+def replay_records(data_dir: Path, batch_plan: Path,
+                   spread_pct: dict[str, float],
+                   width_policy: str = "five-first",
+                   credit_floor_frac: float = CREDIT_FLOOR_FRAC,
+                   liquidity_lag: str = PRIMARY_LIQUIDITY_LAG,
+                   mark: str = PRIMARY_MARK) -> tuple[list[dict], dict, dict]:
+    """(records, file diagnostics, mark diagnostics) for ONE configuration.
+
+    Chains are re-loaded per configuration because the "smile" convention
+    REWRITES bar closes in place; sharing a cache across conventions would
+    silently contaminate them.
+    """
+    prev_mark = set_mark_convention(mark)
+    try:
+        plan = load_batch_plan(batch_plan)
+        grouped: dict[tuple[date, str], list[date]] = defaultdict(list)
+        for row in plan:
+            key = (row["entry_date"], row["symbol"])
+            if row["expiry"] not in grouped[key]:
+                grouped[key].append(row["expiry"])
+
+        closes_cache: dict[str, dict[date, float]] = {}
+        puts_cache: dict[tuple[str, date], dict | None] = {}
+        file_diags: dict[str, dict] = {}
+        mark_diag = {"convention": mark, "smile": {
+            "days_fitted": 0, "days_unfittable": 0,
+            "bars_repriced": 0, "bars_kept_raw": 0}}
+        records: list[dict] = []
+        for (entry_date, symbol), expiries in sorted(grouped.items()):
+            if symbol not in closes_cache:
+                closes_cache[symbol] = load_underlying_closes(data_dir, symbol)
+            for expiry in expiries:
+                if (symbol, expiry) not in puts_cache:
+                    puts, diag = load_put_contracts(data_dir, symbol, expiry)
+                    if puts and mark == "smile":
+                        stats = apply_smile_repricing(
+                            puts, expiry, DIV_YIELD.get(symbol, 0.0),
+                            closes_cache[symbol])
+                        for k, v in stats.items():
+                            mark_diag["smile"][k] += v
+                    puts_cache[(symbol, expiry)] = puts
+                    file_diags[f"{symbol}_{expiry.isoformat()}"] = diag
+            if symbol not in spread_pct:
+                raise ValueError(f"no spread_pct entry for {symbol}")
+            records.append(replay_entry(
+                entry_date, symbol, expiries, closes_cache[symbol],
+                {e: puts_cache[(symbol, e)] for e in expiries},
+                spread_pct[symbol], DIV_YIELD.get(symbol, 0.0), width_policy,
+                credit_floor_frac, liquidity_lag))
+        return records, file_diags, mark_diag
+    finally:
+        set_mark_convention(prev_mark)
+
+
+def _headline(records: list[dict], resamples: int, seed: int,
+              spread_pct: dict[str, float]) -> dict:
+    """The few numbers a sensitivity row needs, computed the same way as the
+    primary summary so rows are directly comparable."""
+    av = _availability(records)
+    q = [r for r in records if r["qualified"]]
+    rs = np.array([r["result_r"] for r in q])
+    exits = Counter(r["exit_reason"] for r in q)
+    fc = friction_comparison(q, spread_pct)
+    return {
+        "n_data_adequate": av["n_data_adequate"],
+        "n_entries": av["n_entries"],
+        "n_qualified": av["n_qualified"],
+        "availability_rate_data_adequate": av["availability_rate"],
+        "availability_rate_planned": av["availability_rate_planned"],
+        "passes_floor_on_data_adequate": av["passes_floor_on_data_adequate"],
+        "passes_floor_on_planned": av["passes_floor_on_planned"],
+        "n_trades": int(rs.size),
+        "win_rate": float(np.mean(rs > 0)) if rs.size else None,
+        "mean_r": float(rs.mean()) if rs.size else None,
+        "median_r": float(np.median(rs)) if rs.size else None,
+        "lb95_mean_r_entry_week": block_bootstrap_lb95_mean(
+            q, resamples, seed, "entry-week"),
+        "lb95_mean_r_exposure_cluster": block_bootstrap_lb95_mean(
+            q, resamples, seed, "exposure-cluster"),
+        "max_drawdown_r": max_drawdown_r(q),
+        "exit_profit_take": exits.get("profit_take", 0),
+        "exit_dte_21": exits.get("dte_21", 0),
+        "exit_data_end": exits.get("data_end", 0),
+        "replay_friction_r_mean": (fc.get("replay_friction_r") or {}).get("mean"),
+        "unqualified_reasons": dict(sorted(Counter(
+            r["reason"] for r in records if not r["qualified"]).items())),
+    }
+
+
+def _sensitivity_table(data_dir: Path, batch_plan: Path, out_dir: Path,
+                       spread_pct: dict[str, float], resamples: int, seed: int,
+                       width_policy: str, credit_floor_frac: float,
+                       liquidity_lag: str, mark: str) -> dict:
+    """Headline numbers for every mark convention, both liquidity-screen
+    information sets, and both width policies — one row per configuration,
+    each row's entries.jsonl written next to the primary artifact.
+
+    This is the artifact's central honesty device: the reader can see that
+    the choice of daily mark moves the headline by more than the entire
+    claimed edge, without having to rerun anything.
+    """
+    sens_dir = out_dir / "sensitivity"
+    sens_dir.mkdir(parents=True, exist_ok=True)
+    rows: dict[str, dict] = {}
+
+    def add(tag: str, *, m: str, lag: str, wp: str, note: str) -> None:
+        recs, _, mdiag = replay_records(data_dir, batch_plan, spread_pct, wp,
+                                       credit_floor_frac, lag, m)
+        with (sens_dir / f"entries_{tag}.jsonl").open("w") as fh:
+            for rec in recs:
+                fh.write(json.dumps(rec) + "\n")
+        rows[tag] = {"mark": m, "liquidity_lag": lag, "width_policy": wp,
+                     "note": note, "entries_file": f"sensitivity/entries_{tag}.jsonl",
+                     "smile_diagnostics": mdiag["smile"] if m == "smile" else None,
+                     **_headline(recs, resamples, seed, spread_pct)}
+
+    for m in MARK_CONVENTIONS:
+        note = {
+            "smile": "PRIMARY — cross-leg consistent: both legs off ONE "
+                     "same-day IV curve",
+            "close": "DISCLOSED UPPER BOUND — last trade per leg; the credit "
+                     "inherits the full leg-vs-leg timing gap",
+            "vw": "volume-weighted average price per leg",
+            "hl2": "(high + low) / 2 per leg",
+        }[m]
+        add(f"mark-{m}", m=m, lag=liquidity_lag, wp=width_policy, note=note)
+    for lag in LIQUIDITY_LAGS:
+        if lag == liquidity_lag:
+            continue
+        add(f"liquidity-{lag}", m=mark, lag=lag, wp=width_policy,
+            note=("LOOK-AHEAD: screens on the entry day's own full-day trade "
+                  "count, which does not exist until the close"
+                  if lag == "same-day" else
+                  "screens the last session before entry (knowable at entry)"))
+    for wp in ("five-first", "any"):
+        if wp == width_policy:
+            continue
+        add(f"width-{wp}", m=mark, lag=liquidity_lag, wp=wp,
+            note=("'any' takes the narrowest width in WIDTHS whose credit "
+                  "clears the floor — the literal reading of the spec's "
+                  "'width $5-10'"))
+    return {
+        "primary": {"mark": mark, "liquidity_lag": liquidity_lag,
+                    "width_policy": width_policy,
+                    "credit_floor_frac": credit_floor_frac},
+        "how_to_read": (
+            "Each row is a full independent replay of the same data under one "
+            "defensible convention change. Compare mean_r across the mark-* "
+            "rows: the spread of that column IS the identification limit of "
+            "daily trade-print aggregates."),
+        "rows": rows,
+    }
+
+
 def run(data_dir: Path, batch_plan: Path, out_dir: Path,
         spread_pct: dict[str, float], resamples: int = BOOTSTRAP_RESAMPLES,
         seed: int = BOOTSTRAP_SEED, width_policy: str = "five-first",
-        credit_floor_frac: float = CREDIT_FLOOR_FRAC) -> dict:
-    plan = load_batch_plan(batch_plan)
-
-    # group candidate expiries per (entry_date, symbol)
-    grouped: dict[tuple[date, str], list[date]] = defaultdict(list)
-    for row in plan:
-        key = (row["entry_date"], row["symbol"])
-        if row["expiry"] not in grouped[key]:
-            grouped[key].append(row["expiry"])
-
-    closes_cache: dict[str, dict[date, float]] = {}
-    puts_cache: dict[tuple[str, date], dict | None] = {}
-    file_diags: dict[str, dict] = {}
-    records: list[dict] = []
-    for (entry_date, symbol), expiries in sorted(grouped.items()):
-        if symbol not in closes_cache:
-            closes_cache[symbol] = load_underlying_closes(data_dir, symbol)
-        for expiry in expiries:
-            if (symbol, expiry) not in puts_cache:
-                puts, diag = load_put_contracts(data_dir, symbol, expiry)
-                puts_cache[(symbol, expiry)] = puts
-                file_diags[f"{symbol}_{expiry.isoformat()}"] = diag
-        if symbol not in spread_pct:
-            raise ValueError(f"no --spread-pct entry for {symbol}")
-        records.append(replay_entry(
-            entry_date, symbol, expiries, closes_cache[symbol],
-            {e: puts_cache[(symbol, e)] for e in expiries},
-            spread_pct[symbol], DIV_YIELD.get(symbol, 0.0), width_policy,
-            credit_floor_frac))
+        credit_floor_frac: float = CREDIT_FLOOR_FRAC,
+        liquidity_lag: str = PRIMARY_LIQUIDITY_LAG,
+        mark: str = PRIMARY_MARK,
+        sensitivity: bool = False,
+        calibration: dict | None = None) -> dict:
+    records, file_diags, mark_diag = replay_records(
+        data_dir, batch_plan, spread_pct, width_policy, credit_floor_frac,
+        liquidity_lag, mark)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "entries.jsonl").open("w") as fh:
         for rec in records:
             fh.write(json.dumps(rec) + "\n")
     summary = summarize(records, resamples, seed, spread_pct, width_policy,
-                        credit_floor_frac)
+                        credit_floor_frac, liquidity_lag, mark)
+    summary["config"]["spread_pct_provenance"] = calibration or {
+        "path": None, "file_present": False, "per_symbol": {},
+        "warnings": ["no calibration provenance was passed to run(); the "
+                     "spread_pct values above are caller-supplied"]}
+    summary["mark_diagnostics"] = mark_diag
+    # What the DEPLOYED cost model would actually charge, if it were asked
+    # today, from whatever is in data/execution_costs.json (finding 14).
+    file_pct = {s: e["spread_pct_of_mid"]
+                for s, e in (calibration or {}).get("per_symbol", {}).items()
+                if e.get("source") in ("per_underlying", "file_global")}
+    qualified = [r for r in records if r["qualified"]]
+    if file_pct and all(r["symbol"] in file_pct for r in qualified):
+        summary["friction_under_calibration_file"] = {
+            "spread_pct": file_pct,
+            "note": ("recomputed from the SAME booked marks using only what "
+                     "the calibration file actually contains — this is what "
+                     "production would charge today"),
+            **friction_comparison(qualified, file_pct, recompute_replay=True),
+        }
+    if sensitivity:
+        summary["sensitivity"] = _sensitivity_table(
+            data_dir, batch_plan, out_dir, spread_pct, resamples, seed,
+            width_policy, credit_floor_frac, liquidity_lag, mark)
     summary["data_inventory"] = {
         "batches_planned": len(file_diags),
         "batches_missing_file": sum(1 for d in file_diags.values()
@@ -928,8 +1656,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data-dir", required=True, type=Path)
     ap.add_argument("--batch-plan", required=True, type=Path)
     ap.add_argument("--out-dir", required=True, type=Path)
-    ap.add_argument("--spread-pct", default="SPY=0.0049,QQQ=0.0094",
-                    help="comma list SYM=frac_of_mid (measured full spread)")
+    ap.add_argument("--spread-pct", default=None,
+                    help="comma list SYM=frac_of_mid (measured full spread); "
+                         "omit to read data/execution_costs.json instead")
+    ap.add_argument("--calibration", type=Path, default=None,
+                    help="path to execution_costs.json (default: "
+                         "<repo>/data/execution_costs.json)")
     ap.add_argument("--resamples", type=int, default=BOOTSTRAP_RESAMPLES)
     ap.add_argument("--seed", type=int, default=BOOTSTRAP_SEED)
     ap.add_argument("--width-policy", choices=("five-first", "any"),
@@ -939,11 +1671,49 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--credit-floor-frac", type=float, default=CREDIT_FLOOR_FRAC,
                     help="min credit as a fraction of width (spec: 0.25); "
                          "lower values are RETUNE SCENARIOS, not the spec")
+    ap.add_argument("--mark", choices=MARK_CONVENTIONS, default=PRIMARY_MARK,
+                    help="daily mark convention (default smile = the only "
+                         "cross-leg-consistent one; close is an upper bound)")
+    ap.add_argument("--liquidity-lag", choices=LIQUIDITY_LAGS,
+                    default=PRIMARY_LIQUIDITY_LAG,
+                    help="information set for the n>=30 screen (default prior "
+                         "= knowable at entry; same-day is LOOK-AHEAD)")
+    ap.add_argument("--symbols", default="SPY,QQQ",
+                    help="symbols to resolve calibrated spreads for")
+    ap.add_argument("--no-sensitivity", action="store_true",
+                    help="skip the per-convention sensitivity re-runs")
     args = ap.parse_args(argv)
 
+    symbols = tuple(s.strip().upper() for s in args.symbols.split(",") if s.strip())
+    calib_path = args.calibration or (
+        Path(__file__).resolve().parent.parent / "data" / "execution_costs.json")
+    spread_pct, calib = load_spread_calibration(calib_path, symbols)
+    calib["resolved_from_file"] = dict(spread_pct)
+    if args.spread_pct:
+        # An explicit override still records what the FILE said, and shouts
+        # when the two disagree — a hardcoded number that silently disagrees
+        # with the deployed calibration is exactly finding 14.
+        override = parse_spread_pct(args.spread_pct)
+        for sym, val in override.items():
+            was = spread_pct.get(sym)
+            spread_pct[sym] = val
+            entry = calib["per_symbol"].setdefault(sym, {})
+            entry.update({"spread_pct_of_mid": val, "source": "cli_override",
+                          "overrides_file_value": was})
+            if was is not None and abs(was - val) > 1e-12:
+                calib["warnings"].append(
+                    f"{sym}: --spread-pct override {val:.4f} DISAGREES with "
+                    f"the calibration file's {was:.4f}; the file is what "
+                    f"production charges, the override is what this replay "
+                    f"charged")
+    for w in calib["warnings"]:
+        print(f"WARNING (friction provenance): {w}")
+
     summary = run(args.data_dir, args.batch_plan, args.out_dir,
-                  parse_spread_pct(args.spread_pct), args.resamples, args.seed,
-                  args.width_policy, args.credit_floor_frac)
+                  spread_pct, args.resamples, args.seed,
+                  args.width_policy, args.credit_floor_frac,
+                  args.liquidity_lag, args.mark,
+                  sensitivity=not args.no_sensitivity, calibration=calib)
     av = summary["availability"]["overall"]
     mp = summary["managed_payoff"]
     inv = summary["data_inventory"]
@@ -951,15 +1721,36 @@ def main(argv: list[str] | None = None) -> int:
     def _r(x):
         return None if x is None else round(x, 4)
 
+    print(f"VERDICT: {summary['verdict']['overall_verdict']}")
+    print(f"mark={args.mark} liquidity_lag={args.liquidity_lag} "
+          f"width_policy={args.width_policy} floor={args.credit_floor_frac}")
     print(f"entries={av['n_entries']} marks_present={av['n_marks_present']} "
           f"data_adequate={av['n_data_adequate']} qualified={av['n_qualified']}")
     print(f"data_coverage_rate={_r(av['data_coverage_rate'])} "
-          f"availability_rate={_r(av['availability_rate'])} "
+          f"availability(data-adequate)={_r(av['availability_rate'])} "
+          f"availability(planned)={_r(av['availability_rate_planned'])} "
           f"(strict={_r(av['availability_rate_strict'])})")
     print(f"trades={mp['n_trades']} WR={_r(mp['win_rate'])} "
           f"mean_r={_r(mp['mean_r'])} median_r={_r(mp['median_r'])} "
-          f"lb95_mean_r={_r(mp['lb95_mean_r'])} maxDD_r={_r(mp['max_drawdown_r'])}")
+          f"lb95_week={_r(mp['lb95_mean_r_by_blocking']['entry-week'])} "
+          f"lb95_exposure={_r(mp['lb95_mean_r_by_blocking']['exposure-cluster'])} "
+          f"maxDD_r={_r(mp['max_drawdown_r'])}")
     print(f"unqualified reasons: {summary['availability']['unqualified_reasons']}")
+    if "sensitivity" in summary:
+        print("sensitivity (tag: avail_adequate/avail_planned n meanR lb95wk):")
+        for tag, row in summary["sensitivity"]["rows"].items():
+            print(f"  {tag:22} {_r(row['availability_rate_data_adequate'])}"
+                  f"/{_r(row['availability_rate_planned'])} "
+                  f"n={row['n_trades']:3d} meanR={_r(row['mean_r'])} "
+                  f"lb95={_r(row['lb95_mean_r_entry_week'])}")
+    fc = summary["friction_comparison"]
+    if fc.get("n_trades"):
+        print(f"friction R: replay {_r(fc['replay_friction_r']['mean'])} vs "
+              f"deployed-model {_r(fc['production_deployed_friction_r']['mean'])} "
+              f"vs honest-leg-mark "
+              f"{_r(fc['production_honest_leg_mark_friction_r']['mean'])} "
+              f"(wing ratio median "
+              f"{_r(fc['wing_ratio_long_over_short']['median'])})")
     print("credit-floor sensitivity (availability): "
           + ", ".join(f"{k}->{_r(v['availability_rate'])}" for k, v in
                       summary["availability"]["credit_floor_sensitivity"].items()))
