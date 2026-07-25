@@ -1,0 +1,2748 @@
+{
+  "data_dir": "/private/tmp/claude-501/-Users-joez-Desktop-trading-agent--claude-worktrees-great-lehmann-18cf01/a53d296b-c285-4b43-8bc0-9ddddfac776b/scratchpad/replay_data",
+  "batch_plan": "/private/tmp/claude-501/-Users-joez-Desktop-trading-agent--claude-worktrees-great-lehmann-18cf01/a53d296b-c285-4b43-8bc0-9ddddfac776b/scratchpad/replay_data/batch_plan.json",
+  "spread_pct": {
+    "SPY": 0.0049,
+    "QQQ": 0.0094
+  },
+  "samples": {
+    "as_reported_close_sameday": {
+      "entries_file": "entries.jsonl",
+      "n_records": 144,
+      "n_qualified": 44,
+      "mark_convention_of_entries": "close",
+      "liquidity_lag_of_entries": "same-day",
+      "null_study": {
+        "what": "curve_spread minus raw close-difference, over every liquid 5-wide adjacent put pair on every day of every fetched chain. No gate applied.",
+        "ungated": {
+          "n": 11842,
+          "mean": 0.0013761833429361487,
+          "median": 0.0005068569411301738,
+          "sd": 0.25941997610940276,
+          "p10": -0.13607206546172507,
+          "p90": 0.1335105275558779,
+          "min": -3.7438155943243743,
+          "max": 4.594877606898589
+        },
+        "ungated_in_dte_and_delta_band": {
+          "n": 1864,
+          "mean": 0.004674104671222817,
+          "median": 0.002821838158769463,
+          "sd": 0.24337295864634473,
+          "p10": -0.20552359734036169,
+          "p90": 0.20763991094386916,
+          "min": -2.365044245558183,
+          "max": 2.727228456198562
+        },
+        "estimator_is_unbiased": true,
+        "credit_noise_sd_as_pct_of_5_wide_width": 5.188399522188055
+      },
+      "selection_bias": {
+        "what": "the null statistic evaluated on the GATE-SELECTED entries. Negative = the booked credit is HIGHER than a same-day cross-leg-consistent estimate, i.e. the floor selected days whose raw print pair happened to be wide.",
+        "selected": {
+          "n": 44,
+          "mean": -0.29464777070562453,
+          "median": -0.283493908178611,
+          "sd": 0.2410867685385896,
+          "p10": -0.5194205931192425,
+          "p90": -0.05024937368493718,
+          "min": -1.1171688010211982,
+          "max": 0.09483369783180962
+        },
+        "shift_vs_in_band_null_dollars": -0.29932187537684735,
+        "shift_as_pct_of_5_wide_width": -5.986437507536946,
+        "shift_in_in_band_null_sd": -1.229889618968738,
+        "shift_in_ungated_null_sd": -1.15381197649412,
+        "implied_measurement_bias_in_credit_r": 0.08417969601828551
+      },
+      "exit_trigger_audit": {
+        "what": "for every booked exit, the raw close-difference mark that triggered it vs the same-day cross-leg-consistent spread.",
+        "n_profit_takes_testable": 34,
+        "n_profit_takes_the_curve_says_never_triggered": 9,
+        "spurious_profit_take_fraction": 0.2647058823529412,
+        "curve_minus_raw_on_profit_take_days": {
+          "n": 34,
+          "mean": 0.10991194320435818,
+          "median": 0.011405551332727804,
+          "sd": 0.30548513970299573,
+          "p10": -0.0503384992852459,
+          "p90": 0.3571472332917733,
+          "min": -0.1051272451957681,
+          "max": 1.5616273465983195
+        },
+        "curve_minus_raw_on_21_dte_days": {
+          "n": 10,
+          "mean": 0.12642697684641516,
+          "median": 0.030428773402322307,
+          "sd": 0.4941543852940307,
+          "p10": -0.21559411623334324,
+          "p90": 0.5636014450189363,
+          "min": -0.4468647945837194,
+          "max": 1.3604171874145798
+        },
+        "most_extreme_spurious": [
+          {
+            "entry_date": "2026-03-23",
+            "symbol": "QQQ",
+            "short_strike": 570.0,
+            "long_strike": 565.0,
+            "credit": 1.3200000000000003,
+            "exit_date": "2026-03-26",
+            "exit_reason": "profit_take",
+            "result_r": 0.10925570652173917,
+            "raw_exit_mark": 0.009999999999999787,
+            "curve_exit_mark": 1.5716273465983193,
+            "pt_level": 0.6600000000000001,
+            "spot_entry": 588.0,
+            "spot_exit": 573.79,
+            "underlying_move_pct": -2.416666666666678,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-10-13",
+            "symbol": "QQQ",
+            "short_strike": 590.0,
+            "long_strike": 585.0,
+            "credit": 1.4100000000000001,
+            "exit_date": "2025-10-15",
+            "exit_reason": "profit_take",
+            "result_r": 0.13712395543175487,
+            "raw_exit_mark": 0.620000000000001,
+            "curve_exit_mark": 1.3293673463305424,
+            "pt_level": 0.7050000000000001,
+            "spot_entry": 602.01,
+            "spot_exit": 602.22,
+            "underlying_move_pct": 0.034883141476060864,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-12-04",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.4600000000000009,
+            "exit_date": "2025-12-11",
+            "exit_reason": "profit_take",
+            "result_r": 0.15605395480226006,
+            "raw_exit_mark": 0.71,
+            "curve_exit_mark": 1.08798243223805,
+            "pt_level": 0.7300000000000004,
+            "spot_entry": 622.94,
+            "spot_exit": 625.58,
+            "underlying_move_pct": 0.42379683436606364,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-12-08",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.549999999999999,
+            "exit_date": "2025-12-11",
+            "exit_reason": "profit_take",
+            "result_r": 0.1760973913043476,
+            "raw_exit_mark": 0.71,
+            "curve_exit_mark": 1.08798243223805,
+            "pt_level": 0.7749999999999995,
+            "spot_entry": 624.28,
+            "spot_exit": 625.58,
+            "underlying_move_pct": 0.20823989235601026,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-02",
+            "symbol": "QQQ",
+            "short_strike": 585.0,
+            "long_strike": 580.0,
+            "credit": 1.2899999999999991,
+            "exit_date": "2026-03-04",
+            "exit_reason": "profit_take",
+            "result_r": 0.12419326145552545,
+            "raw_exit_mark": 0.5999999999999996,
+            "curve_exit_mark": 0.908531769083794,
+            "pt_level": 0.6449999999999996,
+            "spot_entry": 608.09,
+            "spot_exit": 610.75,
+            "underlying_move_pct": 0.4374352480718269,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-26",
+            "symbol": "QQQ",
+            "short_strike": 530.0,
+            "long_strike": 525.0,
+            "credit": 1.63,
+            "exit_date": "2026-03-30",
+            "exit_reason": "profit_take",
+            "result_r": 0.18589910979228486,
+            "raw_exit_mark": 0.8100000000000005,
+            "curve_exit_mark": 0.9746612782820705,
+            "pt_level": 0.815,
+            "spot_entry": 573.79,
+            "spot_exit": 558.28,
+            "underlying_move_pct": -2.703079523867613,
+            "curve_above_pt_level": true
+          }
+        ],
+        "spurious_on_the_flattest_underlying_days": [
+          {
+            "entry_date": "2025-10-13",
+            "symbol": "QQQ",
+            "short_strike": 590.0,
+            "long_strike": 585.0,
+            "credit": 1.4100000000000001,
+            "exit_date": "2025-10-15",
+            "exit_reason": "profit_take",
+            "result_r": 0.13712395543175487,
+            "raw_exit_mark": 0.620000000000001,
+            "curve_exit_mark": 1.3293673463305424,
+            "pt_level": 0.7050000000000001,
+            "spot_entry": 602.01,
+            "spot_exit": 602.22,
+            "underlying_move_pct": 0.034883141476060864,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-12-08",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.549999999999999,
+            "exit_date": "2025-12-11",
+            "exit_reason": "profit_take",
+            "result_r": 0.1760973913043476,
+            "raw_exit_mark": 0.71,
+            "curve_exit_mark": 1.08798243223805,
+            "pt_level": 0.7749999999999995,
+            "spot_entry": 624.28,
+            "spot_exit": 625.58,
+            "underlying_move_pct": 0.20823989235601026,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-12-04",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.4600000000000009,
+            "exit_date": "2025-12-11",
+            "exit_reason": "profit_take",
+            "result_r": 0.15605395480226006,
+            "raw_exit_mark": 0.71,
+            "curve_exit_mark": 1.08798243223805,
+            "pt_level": 0.7300000000000004,
+            "spot_entry": 622.94,
+            "spot_exit": 625.58,
+            "underlying_move_pct": 0.42379683436606364,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-02",
+            "symbol": "QQQ",
+            "short_strike": 585.0,
+            "long_strike": 580.0,
+            "credit": 1.2899999999999991,
+            "exit_date": "2026-03-04",
+            "exit_reason": "profit_take",
+            "result_r": 0.12419326145552545,
+            "raw_exit_mark": 0.5999999999999996,
+            "curve_exit_mark": 0.908531769083794,
+            "pt_level": 0.6449999999999996,
+            "spot_entry": 608.09,
+            "spot_exit": 610.75,
+            "underlying_move_pct": 0.4374352480718269,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-01-20",
+            "symbol": "SPY",
+            "short_strike": 665.0,
+            "long_strike": 660.0,
+            "credit": 1.5899999999999999,
+            "exit_date": "2026-01-21",
+            "exit_reason": "profit_take",
+            "result_r": 0.20049281524926685,
+            "raw_exit_mark": 0.6799999999999997,
+            "curve_exit_mark": 0.8322285050378468,
+            "pt_level": 0.7949999999999999,
+            "spot_entry": 677.58,
+            "spot_exit": 685.4,
+            "underlying_move_pct": 1.15410726408689,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-04-30",
+            "symbol": "QQQ",
+            "short_strike": 650.0,
+            "long_strike": 645.0,
+            "credit": 1.3200000000000003,
+            "exit_date": "2026-05-05",
+            "exit_reason": "profit_take",
+            "result_r": 0.1304951086956522,
+            "raw_exit_mark": 0.6600000000000001,
+            "curve_exit_mark": 0.7671605860367379,
+            "pt_level": 0.6600000000000001,
+            "spot_entry": 667.74,
+            "spot_exit": 681.61,
+            "underlying_move_pct": 2.077155779195494,
+            "curve_above_pt_level": true
+          }
+        ],
+        "spurious_with_underlying_falling": [
+          {
+            "entry_date": "2026-03-26",
+            "symbol": "QQQ",
+            "short_strike": 530.0,
+            "long_strike": 525.0,
+            "credit": 1.63,
+            "exit_date": "2026-03-30",
+            "exit_reason": "profit_take",
+            "result_r": 0.18589910979228486,
+            "raw_exit_mark": 0.8100000000000005,
+            "curve_exit_mark": 0.9746612782820705,
+            "pt_level": 0.815,
+            "spot_entry": 573.79,
+            "spot_exit": 558.28,
+            "underlying_move_pct": -2.703079523867613,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-23",
+            "symbol": "QQQ",
+            "short_strike": 570.0,
+            "long_strike": 565.0,
+            "credit": 1.3200000000000003,
+            "exit_date": "2026-03-26",
+            "exit_reason": "profit_take",
+            "result_r": 0.10925570652173917,
+            "raw_exit_mark": 0.009999999999999787,
+            "curve_exit_mark": 1.5716273465983193,
+            "pt_level": 0.6600000000000001,
+            "spot_entry": 588.0,
+            "spot_exit": 573.79,
+            "underlying_move_pct": -2.416666666666678,
+            "curve_above_pt_level": true
+          }
+        ],
+        "all_rows": [
+          {
+            "entry_date": "2025-10-13",
+            "symbol": "QQQ",
+            "short_strike": 590.0,
+            "long_strike": 585.0,
+            "credit": 1.4100000000000001,
+            "exit_date": "2025-10-15",
+            "exit_reason": "profit_take",
+            "result_r": 0.13712395543175487,
+            "raw_exit_mark": 0.620000000000001,
+            "curve_exit_mark": 1.3293673463305424,
+            "pt_level": 0.7050000000000001,
+            "spot_entry": 602.01,
+            "spot_exit": 602.22,
+            "underlying_move_pct": 0.034883141476060864,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-10-16",
+            "symbol": "QQQ",
+            "short_strike": 575.0,
+            "long_strike": 570.0,
+            "credit": 1.4400000000000013,
+            "exit_date": "2025-10-20",
+            "exit_reason": "profit_take",
+            "result_r": 0.15327921348314627,
+            "raw_exit_mark": 0.6399999999999997,
+            "curve_exit_mark": 0.5884915340758425,
+            "pt_level": 0.7200000000000006,
+            "spot_entry": 599.99,
+            "spot_exit": 611.54,
+            "underlying_move_pct": 1.9250320838680501,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-10-16",
+            "symbol": "SPY",
+            "short_strike": 640.0,
+            "long_strike": 635.0,
+            "credit": 1.3499999999999996,
+            "exit_date": "2025-10-20",
+            "exit_reason": "profit_take",
+            "result_r": 0.15656753424657527,
+            "raw_exit_mark": 0.5,
+            "curve_exit_mark": 0.5012484927662797,
+            "pt_level": 0.6749999999999998,
+            "spot_entry": 660.64,
+            "spot_exit": 671.3,
+            "underlying_move_pct": 1.613586824897073,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-10-20",
+            "symbol": "QQQ",
+            "short_strike": 600.0,
+            "long_strike": 595.0,
+            "credit": 1.25,
+            "exit_date": "2025-10-28",
+            "exit_reason": "profit_take",
+            "result_r": 0.12638373333333333,
+            "raw_exit_mark": 0.56,
+            "curve_exit_mark": 0.5449872951585775,
+            "pt_level": 0.625,
+            "spot_entry": 611.54,
+            "spot_exit": 632.92,
+            "underlying_move_pct": 3.4960918337312297,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-10-23",
+            "symbol": "SPY",
+            "short_strike": 660.0,
+            "long_strike": 655.0,
+            "credit": 1.2999999999999998,
+            "exit_date": "2025-10-27",
+            "exit_reason": "profit_take",
+            "result_r": 0.15197918918918915,
+            "raw_exit_mark": 0.6200000000000001,
+            "curve_exit_mark": 0.5514557986444686,
+            "pt_level": 0.6499999999999999,
+            "spot_entry": 671.76,
+            "spot_exit": 685.24,
+            "underlying_move_pct": 2.006669048469689,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-10-30",
+            "symbol": "SPY",
+            "short_strike": 665.0,
+            "long_strike": 660.0,
+            "credit": 1.3099999999999996,
+            "exit_date": "2025-11-14",
+            "exit_reason": "dte_21",
+            "result_r": -0.07672411924119256,
+            "raw_exit_mark": 1.4900000000000002,
+            "curve_exit_mark": 1.3230475260349408,
+            "pt_level": 0.6549999999999998,
+            "spot_entry": 679.83,
+            "spot_exit": 671.93,
+            "underlying_move_pct": -1.1620552196872858,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-11-03",
+            "symbol": "QQQ",
+            "short_strike": 620.0,
+            "long_strike": 615.0,
+            "credit": 1.5500000000000007,
+            "exit_date": "2025-11-14",
+            "exit_reason": "dte_21",
+            "result_r": -0.2624959420289858,
+            "raw_exit_mark": 2.1800000000000015,
+            "curve_exit_mark": 2.6550663625305333,
+            "pt_level": 0.7750000000000004,
+            "spot_entry": 632.08,
+            "spot_exit": 608.86,
+            "underlying_move_pct": -3.673585622073161,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-11-06",
+            "symbol": "SPY",
+            "short_strike": 650.0,
+            "long_strike": 645.0,
+            "credit": 1.4000000000000004,
+            "exit_date": "2025-11-10",
+            "exit_reason": "profit_take",
+            "result_r": 0.1701169444444445,
+            "raw_exit_mark": 0.54,
+            "curve_exit_mark": 0.5255682836204016,
+            "pt_level": 0.7000000000000002,
+            "spot_entry": 670.31,
+            "spot_exit": 681.44,
+            "underlying_move_pct": 1.660425773149754,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-11-10",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.2700000000000014,
+            "exit_date": "2025-11-21",
+            "exit_reason": "dte_21",
+            "result_r": -0.12018123324396754,
+            "raw_exit_mark": 1.4100000000000001,
+            "curve_exit_mark": 2.77041718741458,
+            "pt_level": 0.6350000000000007,
+            "spot_entry": 623.23,
+            "spot_exit": 590.07,
+            "underlying_move_pct": -5.320668132150241,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-11-13",
+            "symbol": "QQQ",
+            "short_strike": 585.0,
+            "long_strike": 580.0,
+            "credit": 1.8100000000000005,
+            "exit_date": "2025-11-25",
+            "exit_reason": "profit_take",
+            "result_r": 0.2290808777429468,
+            "raw_exit_mark": 0.8899999999999997,
+            "curve_exit_mark": 0.859163880917805,
+            "pt_level": 0.9050000000000002,
+            "spot_entry": 608.4,
+            "spot_exit": 608.89,
+            "underlying_move_pct": 0.08053911900065547,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-11-13",
+            "symbol": "SPY",
+            "short_strike": 655.0,
+            "long_strike": 650.0,
+            "credit": 1.33,
+            "exit_date": "2025-11-26",
+            "exit_reason": "profit_take",
+            "result_r": 0.15588678474114442,
+            "raw_exit_mark": 0.5800000000000001,
+            "curve_exit_mark": 0.601562609899176,
+            "pt_level": 0.665,
+            "spot_entry": 672.04,
+            "spot_exit": 679.68,
+            "underlying_move_pct": 1.1368370930301852,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-11-20",
+            "symbol": "QQQ",
+            "short_strike": 555.0,
+            "long_strike": 550.0,
+            "credit": 1.5099999999999998,
+            "exit_date": "2025-11-24",
+            "exit_reason": "profit_take",
+            "result_r": 0.16825415472779365,
+            "raw_exit_mark": 0.41999999999999993,
+            "curve_exit_mark": 0.45067516698540544,
+            "pt_level": 0.7549999999999999,
+            "spot_entry": 585.67,
+            "spot_exit": 605.16,
+            "underlying_move_pct": 3.32781259070809,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-11-24",
+            "symbol": "QQQ",
+            "short_strike": 590.0,
+            "long_strike": 585.0,
+            "credit": 1.3099999999999987,
+            "exit_date": "2025-12-02",
+            "exit_reason": "profit_take",
+            "result_r": 0.1350149051490513,
+            "raw_exit_mark": 0.54,
+            "curve_exit_mark": 0.5865205302465171,
+            "pt_level": 0.6549999999999994,
+            "spot_entry": 605.16,
+            "spot_exit": 622.0,
+            "underlying_move_pct": 2.7827351444246196,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-11-28",
+            "symbol": "QQQ",
+            "short_strike": 595.0,
+            "long_strike": 590.0,
+            "credit": 1.3499999999999996,
+            "exit_date": "2025-12-05",
+            "exit_reason": "profit_take",
+            "result_r": 0.14972575342465747,
+            "raw_exit_mark": 0.6200000000000001,
+            "curve_exit_mark": 0.5858094356995878,
+            "pt_level": 0.6749999999999998,
+            "spot_entry": 619.25,
+            "spot_exit": 625.48,
+            "underlying_move_pct": 1.0060557125555203,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-12-04",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.4600000000000009,
+            "exit_date": "2025-12-11",
+            "exit_reason": "profit_take",
+            "result_r": 0.15605395480226006,
+            "raw_exit_mark": 0.71,
+            "curve_exit_mark": 1.08798243223805,
+            "pt_level": 0.7300000000000004,
+            "spot_entry": 622.94,
+            "spot_exit": 625.58,
+            "underlying_move_pct": 0.42379683436606364,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-12-08",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.549999999999999,
+            "exit_date": "2025-12-11",
+            "exit_reason": "profit_take",
+            "result_r": 0.1760973913043476,
+            "raw_exit_mark": 0.71,
+            "curve_exit_mark": 1.08798243223805,
+            "pt_level": 0.7749999999999995,
+            "spot_entry": 624.28,
+            "spot_exit": 625.58,
+            "underlying_move_pct": 0.20823989235601026,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-01-20",
+            "symbol": "SPY",
+            "short_strike": 665.0,
+            "long_strike": 660.0,
+            "credit": 1.5899999999999999,
+            "exit_date": "2026-01-21",
+            "exit_reason": "profit_take",
+            "result_r": 0.20049281524926685,
+            "raw_exit_mark": 0.6799999999999997,
+            "curve_exit_mark": 0.8322285050378468,
+            "pt_level": 0.7949999999999999,
+            "spot_entry": 677.58,
+            "spot_exit": 685.4,
+            "underlying_move_pct": 1.15410726408689,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-02-05",
+            "symbol": "QQQ",
+            "short_strike": 570.0,
+            "long_strike": 565.0,
+            "credit": 1.5900000000000016,
+            "exit_date": "2026-02-09",
+            "exit_reason": "profit_take",
+            "result_r": 0.1842211143695018,
+            "raw_exit_mark": 0.5900000000000003,
+            "curve_exit_mark": 0.542391422872214,
+            "pt_level": 0.7950000000000008,
+            "spot_entry": 597.03,
+            "spot_exit": 614.32,
+            "underlying_move_pct": 2.8960018759526474,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-02-05",
+            "symbol": "SPY",
+            "short_strike": 660.0,
+            "long_strike": 655.0,
+            "credit": 1.7799999999999994,
+            "exit_date": "2026-02-09",
+            "exit_reason": "profit_take",
+            "result_r": 0.24504472049689427,
+            "raw_exit_mark": 0.48,
+            "curve_exit_mark": 0.505868950769937,
+            "pt_level": 0.8899999999999997,
+            "spot_entry": 677.62,
+            "spot_exit": 693.95,
+            "underlying_move_pct": 2.4099052566335155,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-02-19",
+            "symbol": "QQQ",
+            "short_strike": 575.0,
+            "long_strike": 570.0,
+            "credit": 1.3399999999999999,
+            "exit_date": "2026-02-25",
+            "exit_reason": "profit_take",
+            "result_r": 0.14124726775956284,
+            "raw_exit_mark": 0.5500000000000003,
+            "curve_exit_mark": 0.5113247558666103,
+            "pt_level": 0.6699999999999999,
+            "spot_entry": 603.47,
+            "spot_exit": 616.68,
+            "underlying_move_pct": 2.189006910036939,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-02-19",
+            "symbol": "SPY",
+            "short_strike": 670.0,
+            "long_strike": 665.0,
+            "credit": 1.3000000000000007,
+            "exit_date": "2026-03-06",
+            "exit_reason": "dte_21",
+            "result_r": -0.20659202702702642,
+            "raw_exit_mark": 1.9099999999999984,
+            "curve_exit_mark": 1.463135205416279,
+            "pt_level": 0.6500000000000004,
+            "spot_entry": 684.48,
+            "spot_exit": 672.38,
+            "underlying_move_pct": -1.7677653108929436,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-02-23",
+            "symbol": "QQQ",
+            "short_strike": 575.0,
+            "long_strike": 570.0,
+            "credit": 1.3500000000000005,
+            "exit_date": "2026-02-25",
+            "exit_reason": "profit_take",
+            "result_r": 0.14273369863013707,
+            "raw_exit_mark": 0.5500000000000003,
+            "curve_exit_mark": 0.5113247558666103,
+            "pt_level": 0.6750000000000003,
+            "spot_entry": 601.41,
+            "spot_exit": 616.68,
+            "underlying_move_pct": 2.539033271811242,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-02-23",
+            "symbol": "SPY",
+            "short_strike": 660.0,
+            "long_strike": 655.0,
+            "credit": 1.379999999999999,
+            "exit_date": "2026-02-25",
+            "exit_reason": "profit_take",
+            "result_r": 0.16406616022099427,
+            "raw_exit_mark": 0.5499999999999998,
+            "curve_exit_mark": 0.5199596987581856,
+            "pt_level": 0.6899999999999995,
+            "spot_entry": 682.39,
+            "spot_exit": 693.15,
+            "underlying_move_pct": 1.5768109145796405,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-03-02",
+            "symbol": "QQQ",
+            "short_strike": 585.0,
+            "long_strike": 580.0,
+            "credit": 1.2899999999999991,
+            "exit_date": "2026-03-04",
+            "exit_reason": "profit_take",
+            "result_r": 0.12419326145552545,
+            "raw_exit_mark": 0.5999999999999996,
+            "curve_exit_mark": 0.908531769083794,
+            "pt_level": 0.6449999999999996,
+            "spot_entry": 608.09,
+            "spot_exit": 610.75,
+            "underlying_move_pct": 0.4374352480718269,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-09",
+            "symbol": "QQQ",
+            "short_strike": 590.0,
+            "long_strike": 585.0,
+            "credit": 1.459999999999999,
+            "exit_date": "2026-03-20",
+            "exit_reason": "dte_21",
+            "result_r": -0.45197853107344693,
+            "raw_exit_mark": 2.7600000000000016,
+            "curve_exit_mark": 2.570102625805589,
+            "pt_level": 0.7299999999999995,
+            "spot_entry": 607.76,
+            "spot_exit": 582.06,
+            "underlying_move_pct": -4.228642885349487,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-12",
+            "symbol": "QQQ",
+            "short_strike": 575.0,
+            "long_strike": 570.0,
+            "credit": 1.2899999999999991,
+            "exit_date": "2026-03-27",
+            "exit_reason": "dte_21",
+            "result_r": -0.41814474393531004,
+            "raw_exit_mark": 2.5,
+            "curve_exit_mark": 2.6031931177351453,
+            "pt_level": 0.6449999999999996,
+            "spot_entry": 597.26,
+            "spot_exit": 562.58,
+            "underlying_move_pct": -5.8065164250075245,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-12",
+            "symbol": "SPY",
+            "short_strike": 650.0,
+            "long_strike": 645.0,
+            "credit": 1.33,
+            "exit_date": "2026-03-27",
+            "exit_reason": "dte_21",
+            "result_r": -0.42560367847411434,
+            "raw_exit_mark": 2.6799999999999997,
+            "curve_exit_mark": 2.7475216747653235,
+            "pt_level": 0.665,
+            "spot_entry": 666.06,
+            "spot_exit": 634.09,
+            "underlying_move_pct": -4.799867879770581,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-16",
+            "symbol": "QQQ",
+            "short_strike": 585.0,
+            "long_strike": 580.0,
+            "credit": 1.549999999999999,
+            "exit_date": "2026-03-27",
+            "exit_reason": "dte_21",
+            "result_r": -0.5693959420289852,
+            "raw_exit_mark": 3.129999999999999,
+            "curve_exit_mark": 3.1750724747655568,
+            "pt_level": 0.7749999999999995,
+            "spot_entry": 600.38,
+            "spot_exit": 562.58,
+            "underlying_move_pct": -6.296012525400574,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-16",
+            "symbol": "SPY",
+            "short_strike": 655.0,
+            "long_strike": 650.0,
+            "credit": 1.3200000000000003,
+            "exit_date": "2026-03-27",
+            "exit_reason": "dte_21",
+            "result_r": -0.5122957880434788,
+            "raw_exit_mark": 2.990000000000002,
+            "curve_exit_mark": 3.005785072039089,
+            "pt_level": 0.6600000000000001,
+            "spot_entry": 669.03,
+            "spot_exit": 634.09,
+            "underlying_move_pct": -5.222486286115712,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-23",
+            "symbol": "QQQ",
+            "short_strike": 570.0,
+            "long_strike": 565.0,
+            "credit": 1.3200000000000003,
+            "exit_date": "2026-03-26",
+            "exit_reason": "profit_take",
+            "result_r": 0.10925570652173917,
+            "raw_exit_mark": 0.009999999999999787,
+            "curve_exit_mark": 1.5716273465983193,
+            "pt_level": 0.6600000000000001,
+            "spot_entry": 588.0,
+            "spot_exit": 573.79,
+            "underlying_move_pct": -2.416666666666678,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-26",
+            "symbol": "QQQ",
+            "short_strike": 530.0,
+            "long_strike": 525.0,
+            "credit": 1.63,
+            "exit_date": "2026-03-30",
+            "exit_reason": "profit_take",
+            "result_r": 0.18589910979228486,
+            "raw_exit_mark": 0.8100000000000005,
+            "curve_exit_mark": 0.9746612782820705,
+            "pt_level": 0.815,
+            "spot_entry": 573.79,
+            "spot_exit": 558.28,
+            "underlying_move_pct": -2.703079523867613,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-26",
+            "symbol": "SPY",
+            "short_strike": 620.0,
+            "long_strike": 615.0,
+            "credit": 2.0,
+            "exit_date": "2026-03-31",
+            "exit_reason": "profit_take",
+            "result_r": 0.29447100000000004,
+            "raw_exit_mark": 0.7400000000000002,
+            "curve_exit_mark": 0.8857730968927058,
+            "pt_level": 1.0,
+            "spot_entry": 645.09,
+            "spot_exit": 650.34,
+            "underlying_move_pct": 0.8138399293121878,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-03-30",
+            "symbol": "QQQ",
+            "short_strike": 535.0,
+            "long_strike": 530.0,
+            "credit": 1.25,
+            "exit_date": "2026-04-01",
+            "exit_reason": "profit_take",
+            "result_r": 0.1197912,
+            "raw_exit_mark": 0.54,
+            "curve_exit_mark": 0.49697840232578017,
+            "pt_level": 0.625,
+            "spot_entry": 558.28,
+            "spot_exit": 584.31,
+            "underlying_move_pct": 4.662534928709605,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-03-30",
+            "symbol": "SPY",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.6899999999999995,
+            "exit_date": "2026-03-31",
+            "exit_reason": "profit_take",
+            "result_r": 0.22012356495468266,
+            "raw_exit_mark": 0.79,
+            "curve_exit_mark": 0.6848727548042319,
+            "pt_level": 0.8449999999999998,
+            "spot_entry": 631.97,
+            "spot_exit": 650.34,
+            "underlying_move_pct": 2.9067835498520544,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-04-02",
+            "symbol": "QQQ",
+            "short_strike": 565.0,
+            "long_strike": 560.0,
+            "credit": 1.8200000000000003,
+            "exit_date": "2026-04-08",
+            "exit_reason": "profit_take",
+            "result_r": 0.2297921383647799,
+            "raw_exit_mark": 0.6100000000000003,
+            "curve_exit_mark": 0.6070695507005581,
+            "pt_level": 0.9100000000000001,
+            "spot_entry": 584.98,
+            "spot_exit": 606.09,
+            "underlying_move_pct": 3.6086703818934085,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-04-06",
+            "symbol": "SPY",
+            "short_strike": 645.0,
+            "long_strike": 640.0,
+            "credit": 1.2899999999999991,
+            "exit_date": "2026-04-09",
+            "exit_reason": "profit_take",
+            "result_r": 0.14523598382749311,
+            "raw_exit_mark": 0.52,
+            "curve_exit_mark": 0.5012203846381595,
+            "pt_level": 0.6449999999999996,
+            "spot_entry": 658.93,
+            "spot_exit": 679.91,
+            "underlying_move_pct": 3.183949736694336,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-04-13",
+            "symbol": "QQQ",
+            "short_strike": 605.0,
+            "long_strike": 600.0,
+            "credit": 1.3399999999999999,
+            "exit_date": "2026-04-15",
+            "exit_reason": "profit_take",
+            "result_r": 0.13789562841530054,
+            "raw_exit_mark": 0.6600000000000001,
+            "curve_exit_mark": 0.7307311799928016,
+            "pt_level": 0.6699999999999999,
+            "spot_entry": 617.39,
+            "spot_exit": 637.4,
+            "underlying_move_pct": 3.2410631853447613,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-04-23",
+            "symbol": "QQQ",
+            "short_strike": 630.0,
+            "long_strike": 625.0,
+            "credit": 1.2600000000000007,
+            "exit_date": "2026-04-30",
+            "exit_reason": "profit_take",
+            "result_r": 0.12677673796791455,
+            "raw_exit_mark": 0.5300000000000002,
+            "curve_exit_mark": 0.5978400178600651,
+            "pt_level": 0.6300000000000003,
+            "spot_entry": 651.42,
+            "spot_exit": 667.74,
+            "underlying_move_pct": 2.505296122317402,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-04-27",
+            "symbol": "QQQ",
+            "short_strike": 645.0,
+            "long_strike": 640.0,
+            "credit": 1.2599999999999998,
+            "exit_date": "2026-05-05",
+            "exit_reason": "profit_take",
+            "result_r": 0.12727941176470584,
+            "raw_exit_mark": 0.6099999999999999,
+            "curve_exit_mark": 0.6074121111178385,
+            "pt_level": 0.6299999999999999,
+            "spot_entry": 664.23,
+            "spot_exit": 681.61,
+            "underlying_move_pct": 2.6165635397377374,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-04-30",
+            "symbol": "QQQ",
+            "short_strike": 650.0,
+            "long_strike": 645.0,
+            "credit": 1.3200000000000003,
+            "exit_date": "2026-05-05",
+            "exit_reason": "profit_take",
+            "result_r": 0.1304951086956522,
+            "raw_exit_mark": 0.6600000000000001,
+            "curve_exit_mark": 0.7671605860367379,
+            "pt_level": 0.6600000000000001,
+            "spot_entry": 667.74,
+            "spot_exit": 681.61,
+            "underlying_move_pct": 2.077155779195494,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-05-21",
+            "symbol": "QQQ",
+            "short_strike": 695.0,
+            "long_strike": 690.0,
+            "credit": 1.3499999999999996,
+            "exit_date": "2026-05-29",
+            "exit_reason": "profit_take",
+            "result_r": 0.13727397260273966,
+            "raw_exit_mark": 0.5499999999999998,
+            "curve_exit_mark": 0.5865913128556883,
+            "pt_level": 0.6749999999999998,
+            "spot_entry": 714.51,
+            "spot_exit": 738.31,
+            "underlying_move_pct": 3.3309540804187465,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-06-04",
+            "symbol": "SPY",
+            "short_strike": 740.0,
+            "long_strike": 735.0,
+            "credit": 1.29,
+            "exit_date": "2026-06-22",
+            "exit_reason": "dte_21",
+            "result_r": -0.05955687331536391,
+            "raw_exit_mark": 1.4100000000000001,
+            "curve_exit_mark": 1.4109285219571177,
+            "pt_level": 0.645,
+            "spot_entry": 757.09,
+            "spot_exit": 744.39,
+            "underlying_move_pct": -1.6774755973530286,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-06-08",
+            "symbol": "QQQ",
+            "short_strike": 695.0,
+            "long_strike": 690.0,
+            "credit": 1.6099999999999994,
+            "exit_date": "2026-06-15",
+            "exit_reason": "profit_take",
+            "result_r": 0.18156135693215328,
+            "raw_exit_mark": 0.39999999999999947,
+            "curve_exit_mark": 0.5729622650553807,
+            "pt_level": 0.8049999999999997,
+            "spot_entry": 716.07,
+            "spot_exit": 744.0,
+            "underlying_move_pct": 3.90045665926515,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-06-11",
+            "symbol": "QQQ",
+            "short_strike": 690.0,
+            "long_strike": 685.0,
+            "credit": 1.5299999999999994,
+            "exit_date": "2026-06-15",
+            "exit_reason": "profit_take",
+            "result_r": 0.15925187319884718,
+            "raw_exit_mark": 0.71,
+            "curve_exit_mark": 0.6096606847119403,
+            "pt_level": 0.7649999999999997,
+            "spot_entry": 717.12,
+            "spot_exit": 744.0,
+            "underlying_move_pct": 3.748326639892907,
+            "curve_above_pt_level": false
+          }
+        ]
+      },
+      "survivorship": {
+        "what": "realized vol of the entries EXCLUDED from the availability denominator vs those kept. If dropping is vol-correlated, the surviving sample is not a random subsample and the availability rate is biased.",
+        "groups": {
+          "dropped_not_data_adequate": {
+            "trailing_rv20": {
+              "n": 25,
+              "mean": 0.12625574540083473,
+              "median": 0.13223177160327537,
+              "sd": 0.03182929167680204,
+              "p10": 0.08660232122199601,
+              "p90": 0.1651136526106076,
+              "min": 0.08246385412880225,
+              "max": 0.18315717515513297
+            },
+            "forward_rv10": {
+              "n": 25,
+              "mean": 0.1493845192098804,
+              "median": 0.13591768292821382,
+              "sd": 0.08202410553978658,
+              "p10": 0.07481784334436935,
+              "p90": 0.2555601918158783,
+              "min": 0.07088750389374612,
+              "max": 0.3869224824502395
+            }
+          },
+          "kept_data_adequate": {
+            "trailing_rv20": {
+              "n": 105,
+              "mean": 0.1593579888781331,
+              "median": 0.15383087086136324,
+              "sd": 0.03958495965219281,
+              "p10": 0.10964299100910395,
+              "p90": 0.21635583591125435,
+              "min": 0.08541690664186367,
+              "max": 0.2680095286297353
+            },
+            "forward_rv10": {
+              "n": 105,
+              "mean": 0.15954465628373923,
+              "median": 0.1549821696405836,
+              "sd": 0.05904009572360372,
+              "p10": 0.09495636882485724,
+              "p90": 0.21777812284690587,
+              "min": 0.06623861687329587,
+              "max": 0.4226279942282155
+            }
+          },
+          "kept_and_qualified": {
+            "trailing_rv20": {
+              "n": 39,
+              "mean": 0.172795543907608,
+              "median": 0.1742821149054181,
+              "sd": 0.03975965623875657,
+              "p10": 0.12148174796038695,
+              "p90": 0.2259681543421845,
+              "min": 0.08898512319358154,
+              "max": 0.2680095286297353
+            },
+            "forward_rv10": {
+              "n": 39,
+              "mean": 0.1795294144778215,
+              "median": 0.16846393007233068,
+              "sd": 0.05831306087871565,
+              "p10": 0.1215759147590976,
+              "p90": 0.2530350132466338,
+              "min": 0.07028779118716466,
+              "max": 0.3685958953334811
+            }
+          },
+          "kept_and_gate_rejected": {
+            "trailing_rv20": {
+              "n": 66,
+              "mean": 0.15141761545162521,
+              "median": 0.14230544840921444,
+              "sd": 0.03755812165308718,
+              "p10": 0.10632342829934624,
+              "p90": 0.20441571312428128,
+              "min": 0.08541690664186367,
+              "max": 0.24328738119374896
+            },
+            "forward_rv10": {
+              "n": 66,
+              "mean": 0.14773548098723607,
+              "median": 0.14705140395076294,
+              "sd": 0.05663923028223466,
+              "p10": 0.09102879428232903,
+              "p90": 0.20960235026043172,
+              "min": 0.06623861687329587,
+              "max": 0.4226279942282155
+            }
+          }
+        },
+        "welch_t_trailing_dropped_minus_kept": -4.445450617351149,
+        "interpretation": "|t| > 2 means the drop is vol-correlated; dropped days being LOWER vol biases availability UP, because low-IV days are the days a credit floor is hardest to clear."
+      },
+      "denominator_hygiene": {
+        "reason_breakdown": [
+          {
+            "reason": "band-not-fetched",
+            "class": "data",
+            "data_adequate": false,
+            "n": 4
+          },
+          {
+            "reason": "band-not-fetched",
+            "class": "data",
+            "data_adequate": true,
+            "n": 3
+          },
+          {
+            "reason": "credit-below-floor",
+            "class": "gate",
+            "data_adequate": true,
+            "n": 71
+          },
+          {
+            "reason": "no-contract-bars",
+            "class": "data",
+            "data_adequate": false,
+            "n": 10
+          },
+          {
+            "reason": "no-contract-file",
+            "class": "data",
+            "data_adequate": false,
+            "n": 11
+          },
+          {
+            "reason": "short-leg-illiquid",
+            "class": "gate",
+            "data_adequate": true,
+            "n": 1
+          }
+        ],
+        "n_qualified": 44,
+        "denominators": {
+          "planned": 144,
+          "marks_present": 123,
+          "data_adequate": 119,
+          "data_adequate_and_band_bracketed": 63
+        },
+        "availability_by_denominator": {
+          "planned": 0.3055555555555556,
+          "marks_present": 0.35772357723577236,
+          "data_adequate": 0.3697478991596639,
+          "data_adequate_and_band_bracketed": 0.6984126984126984
+        },
+        "passes_60pct_by_denominator": {
+          "planned": false,
+          "marks_present": false,
+          "data_adequate": false,
+          "data_adequate_and_band_bracketed": true
+        },
+        "gate_classified_entries_excluded_from_data_adequate": 0
+      },
+      "band_bracket_audit": {
+        "what": "every band-related rejection with the fetched grid's |delta| range. brackets_delta_band=False means the strikes that would have answered the question were never fetched.",
+        "delta_band": [
+          0.2,
+          0.35
+        ],
+        "n_rows": 7,
+        "n_data_gaps_band_not_fetched": 7,
+        "n_true_gate_rejections": 0,
+        "rows": [
+          {
+            "entry_date": "2025-12-26",
+            "symbol": "QQQ",
+            "spot": 623.89,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-01-30",
+            "n_liquid_invertible": 1,
+            "delta_min": 0.1653767042570233,
+            "delta_max": 0.1653767042570233,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2025-12-26",
+            "symbol": "SPY",
+            "spot": 690.31,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-01-30",
+            "n_liquid_invertible": 1,
+            "delta_min": 0.18666986189697848,
+            "delta_max": 0.18666986189697848,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2025-12-29",
+            "symbol": "QQQ",
+            "spot": 620.87,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-01-30",
+            "n_liquid_invertible": 1,
+            "delta_min": 0.1759504881885997,
+            "delta_max": 0.1759504881885997,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2025-12-29",
+            "symbol": "SPY",
+            "spot": 687.85,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-01-30",
+            "n_liquid_invertible": 1,
+            "delta_min": 0.19686198862130472,
+            "delta_max": 0.19686198862130472,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2026-01-20",
+            "symbol": "QQQ",
+            "spot": 608.06,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-02-27",
+            "n_liquid_invertible": 4,
+            "delta_min": 0.06457115300734512,
+            "delta_max": 0.11455449453674776,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2026-01-26",
+            "symbol": "QQQ",
+            "spot": 625.46,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-02-27",
+            "n_liquid_invertible": 1,
+            "delta_min": 0.031499056671253585,
+            "delta_max": 0.031499056671253585,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2026-05-11",
+            "symbol": "QQQ",
+            "spot": 713.29,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-06-12",
+            "n_liquid_invertible": 3,
+            "delta_min": 0.1474489039770319,
+            "delta_max": 0.1871977232755328,
+            "brackets_delta_band": false
+          }
+        ]
+      },
+      "blocking": {
+        "n_trades": 44,
+        "entry_week": {
+          "n_blocks": 25,
+          "block_sizes": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        "exposure_cluster": {
+          "n_blocks": 12,
+          "block_sizes": [
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            3,
+            3,
+            4,
+            5,
+            10,
+            11
+          ]
+        },
+        "pairs_open_simultaneously_in_different_entry_weeks": 51,
+        "total_pairs": 946,
+        "holding_period_days": {
+          "n": 44,
+          "mean": 6.795454545454546,
+          "median": 5.5,
+          "sd": 4.526816970190728,
+          "p10": 2.0,
+          "p90": 14.400000000000006,
+          "min": 1.0,
+          "max": 18.0
+        },
+        "why_it_matters": "entry-week blocks cannot contain a holding period longer than a week, so simultaneously-open trades are resampled as independent draws and the LB95 is too tight."
+      },
+      "walk_coverage": {
+        "what": "trading days inside a held window where at least one leg has no bar, so the day was never marked.",
+        "unwalkable_days_total": 0,
+        "reported_skipped_days_total": 0,
+        "trades_with_unwalkable_days": []
+      },
+      "friction": {
+        "n_trades": 44,
+        "replay_friction_r": {
+          "mean": 0.048632205280639655,
+          "median": 0.04726650045662101
+        },
+        "production_deployed_friction_r": {
+          "mean": 0.017622809519635657,
+          "median": 0.01761304347826087
+        },
+        "production_honest_leg_mark_friction_r": {
+          "mean": 0.0513605435441292,
+          "median": 0.053112805241215005
+        },
+        "replay_friction_dollars": {
+          "mean": 17.30755227272727,
+          "median": 16.7135
+        },
+        "production_deployed_friction_dollars": {
+          "mean": 6.254327272727273,
+          "median": 6.443999999999998
+        },
+        "production_honest_leg_mark_friction_dollars": {
+          "mean": 18.2527,
+          "median": 19.4818
+        },
+        "ratio_replay_over_deployed": {
+          "mean": 2.7365251533994783,
+          "min": 1.6302866716306776,
+          "max": 5.559965287821813
+        },
+        "ratio_honest_over_deployed": {
+          "mean": 2.879783945884483,
+          "median": 3.018861970760029
+        },
+        "wing_ratio_long_over_short": {
+          "mean": 0.8485999535205422,
+          "median": 0.8536364109542187
+        },
+        "leg_mid_sum_over_net_credit": {
+          "mean": 12.641093240217407,
+          "median": 12.664699757028814
+        },
+        "deployed_model_assumes_leg_mid_sum_over_credit": 2.0,
+        "deployed_model_exact_at_wing_ratio": 0.3333333333333333,
+        "note": "execution_costs.friction_r proxies each leg's mark by net_credit (leg-mid-sum = 2 x net_credit), exact only at wing ratio 1/3. Compare wing_ratio_long_over_short against 1/3: the deployed model's spread leg is off by exactly leg_mid_sum_over_net_credit / 2 (>1 = understated)."
+      },
+      "iv_by_month": {
+        "what": "UNCONDITIONAL IV is measured over every in-band liquid strike on every planned entry day. The CONDITIONAL figures are the qualified trades only and are selected on credit, hence on IV — they cannot be read as the month's vol level.",
+        "unconditional": {
+          "2025-10": {
+            "n_strikes": 62,
+            "n_entry_days": 16,
+            "median_iv": 0.20725236090864058,
+            "mean_iv": 0.20737753281579355,
+            "is_highest_iv_month": false
+          },
+          "2025-11": {
+            "n_strikes": 61,
+            "n_entry_days": 15,
+            "median_iv": 0.23211672581871967,
+            "mean_iv": 0.2330980296437873,
+            "is_highest_iv_month": false
+          },
+          "2025-12": {
+            "n_strikes": 37,
+            "n_entry_days": 13,
+            "median_iv": 0.17364784348411483,
+            "mean_iv": 0.18039550027324996,
+            "is_highest_iv_month": false
+          },
+          "2026-01": {
+            "n_strikes": 42,
+            "n_entry_days": 12,
+            "median_iv": 0.19540250302217899,
+            "mean_iv": 0.18915971455339872,
+            "is_highest_iv_month": false
+          },
+          "2026-02": {
+            "n_strikes": 56,
+            "n_entry_days": 16,
+            "median_iv": 0.22706642748601738,
+            "mean_iv": 0.23404887359879215,
+            "is_highest_iv_month": false
+          },
+          "2026-03": {
+            "n_strikes": 71,
+            "n_entry_days": 16,
+            "median_iv": 0.27547138324817655,
+            "mean_iv": 0.2749916971138586,
+            "is_highest_iv_month": true
+          },
+          "2026-04": {
+            "n_strikes": 71,
+            "n_entry_days": 16,
+            "median_iv": 0.22931115404879676,
+            "mean_iv": 0.22421976632356228,
+            "is_highest_iv_month": false
+          },
+          "2026-05": {
+            "n_strikes": 23,
+            "n_entry_days": 6,
+            "median_iv": 0.19037501232316717,
+            "mean_iv": 0.20401820741460625,
+            "is_highest_iv_month": false
+          },
+          "2026-06": {
+            "n_strikes": 20,
+            "n_entry_days": 5,
+            "median_iv": 0.26496623280420906,
+            "mean_iv": 0.2423513040609751,
+            "is_highest_iv_month": false
+          }
+        },
+        "conditional_qualified_only": {
+          "2025-10": {
+            "n_trades": 6,
+            "median_iv": 0.21424900300391017
+          },
+          "2025-11": {
+            "n_trades": 8,
+            "median_iv": 0.22177849763790147
+          },
+          "2025-12": {
+            "n_trades": 2,
+            "median_iv": 0.20793582392185928
+          },
+          "2026-01": {
+            "n_trades": 1,
+            "median_iv": 0.18546150857089083
+          },
+          "2026-02": {
+            "n_trades": 6,
+            "median_iv": 0.25143145282994955
+          },
+          "2026-03": {
+            "n_trades": 11,
+            "median_iv": 0.27547138324817655
+          },
+          "2026-04": {
+            "n_trades": 6,
+            "median_iv": 0.22550830475902184
+          },
+          "2026-05": {
+            "n_trades": 1,
+            "median_iv": 0.22515961524778982
+          },
+          "2026-06": {
+            "n_trades": 3,
+            "median_iv": 0.26460113837393007
+          }
+        },
+        "liquidity_lag_used": "same-day",
+        "liquidity_lag_note": "this section deliberately uses the same-day count so the IV census covers the widest strike set; it is a description of the data, not a tradeable screen."
+      },
+      "payoff_attribution": {
+        "n_trades": 44,
+        "mean_r": 0.05612948510974885,
+        "median_r": 0.14199048319484997,
+        "min_r": -0.5693959420289852,
+        "max_r": 0.29447100000000004,
+        "n_losers": 10,
+        "mean_r_of_losers": -0.31029688784118714,
+        "mean_r_excluding_k_worst": {
+          "1": {
+            "n_remaining": 43,
+            "mean_r": 0.07067658806646358,
+            "dropped_r": [
+              -0.5694
+            ]
+          },
+          "5": {
+            "n_remaining": 39,
+            "mean_r": 0.12428502636882777,
+            "dropped_r": [
+              -0.5694,
+              -0.5123,
+              -0.452,
+              -0.4256,
+              -0.4181
+            ]
+          },
+          "10": {
+            "n_remaining": 34,
+            "mean_r": 0.16390194774237704,
+            "dropped_r": [
+              -0.5694,
+              -0.5123,
+              -0.452,
+              -0.4256,
+              -0.4181,
+              -0.2625,
+              -0.2066,
+              -0.1202,
+              -0.0767,
+              -0.0596
+            ]
+          }
+        },
+        "mean_r_excluding_each_month": {
+          "2025-10": {
+            "n_in_month": 6,
+            "mean_r_in_month": 0.1081015844071344,
+            "n_remaining": 38,
+            "mean_r_excluding_month": 0.04792336416805637,
+            "unconditional_median_iv": 0.20725236090864058,
+            "is_highest_iv_month": false
+          },
+          "2025-11": {
+            "n_in_month": 8,
+            "mean_r_in_month": 0.0781752806196356,
+            "n_remaining": 36,
+            "mean_r_excluding_month": 0.051230419440885105,
+            "unconditional_median_iv": 0.23211672581871967,
+            "is_highest_iv_month": false
+          },
+          "2025-12": {
+            "n_in_month": 2,
+            "mean_r_in_month": 0.16607567305330384,
+            "n_remaining": 42,
+            "mean_r_excluding_month": 0.05089395235053193,
+            "unconditional_median_iv": 0.17364784348411483,
+            "is_highest_iv_month": false
+          },
+          "2026-01": {
+            "n_in_month": 1,
+            "mean_r_in_month": 0.20049281524926685,
+            "n_remaining": 43,
+            "mean_r_excluding_month": 0.05277219836231819,
+            "unconditional_median_iv": 0.19540250302217899,
+            "is_highest_iv_month": false
+          },
+          "2026-02": {
+            "n_in_month": 6,
+            "mean_r_in_month": 0.11178682240834398,
+            "n_remaining": 38,
+            "mean_r_excluding_month": 0.04734148448365487,
+            "unconditional_median_iv": 0.22706642748601738,
+            "is_highest_iv_month": false
+          },
+          "2026-03": {
+            "n_in_month": 11,
+            "mean_r_in_month": -0.12033498553010026,
+            "n_remaining": 33,
+            "mean_r_excluding_month": 0.11495097532303186,
+            "unconditional_median_iv": 0.27547138324817655,
+            "is_highest_iv_month": true
+          },
+          "2026-04": {
+            "n_in_month": 6,
+            "mean_r_in_month": 0.14957916817264102,
+            "n_remaining": 38,
+            "mean_r_excluding_month": 0.04137427199455533,
+            "unconditional_median_iv": 0.22931115404879676,
+            "is_highest_iv_month": false
+          },
+          "2026-05": {
+            "n_in_month": 1,
+            "mean_r_in_month": 0.13727397260273966,
+            "n_remaining": 43,
+            "mean_r_excluding_month": 0.05424240400526068,
+            "unconditional_median_iv": 0.19037501232316717,
+            "is_highest_iv_month": false
+          },
+          "2026-06": {
+            "n_in_month": 3,
+            "mean_r_in_month": 0.09375211893854551,
+            "n_remaining": 41,
+            "mean_r_excluding_month": 0.05337660946373933,
+            "unconditional_median_iv": 0.26496623280420906,
+            "is_highest_iv_month": false
+          }
+        },
+        "worst_r_observed": -0.5693959420289852,
+        "full_loss_r": -1.0,
+        "tail_note": "the -1R tail is UNSAMPLED, not absent: a full -1R needs the short strike still breached at the forced 21-DTE exit, which never happened in this window. Its absence is a property of the window, not of the strategy.",
+        "attribution_warning": "deleting a month is not a neutral operation — check unconditional_median_iv on the month being deleted before reading any 'excluding X' figure as the strategy's expectancy."
+      }
+    },
+    "primary_smile_prior": {
+      "entries_file": "entries.jsonl",
+      "n_records": 144,
+      "n_qualified": 26,
+      "mark_convention_of_entries": "smile",
+      "liquidity_lag_of_entries": "prior",
+      "null_study": {
+        "what": "curve_spread minus raw close-difference, over every liquid 5-wide adjacent put pair on every day of every fetched chain. No gate applied.",
+        "ungated": {
+          "n": 11842,
+          "mean": 0.0013761833429361487,
+          "median": 0.0005068569411301738,
+          "sd": 0.25941997610940276,
+          "p10": -0.13607206546172507,
+          "p90": 0.1335105275558779,
+          "min": -3.7438155943243743,
+          "max": 4.594877606898589
+        },
+        "ungated_in_dte_and_delta_band": {
+          "n": 1864,
+          "mean": 0.004674104671222817,
+          "median": 0.002821838158769463,
+          "sd": 0.24337295864634473,
+          "p10": -0.20552359734036169,
+          "p90": 0.20763991094386916,
+          "min": -2.365044245558183,
+          "max": 2.727228456198562
+        },
+        "estimator_is_unbiased": true,
+        "credit_noise_sd_as_pct_of_5_wide_width": 5.188399522188055
+      },
+      "selection_bias": {
+        "what": "the null statistic evaluated on the GATE-SELECTED entries. Negative = the booked credit is HIGHER than a same-day cross-leg-consistent estimate, i.e. the floor selected days whose raw print pair happened to be wide.",
+        "selected": {
+          "n": 26,
+          "mean": 0.0,
+          "median": 0.0,
+          "sd": 0.0,
+          "p10": 0.0,
+          "p90": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "shift_vs_in_band_null_dollars": -0.004674104671222817,
+        "shift_as_pct_of_5_wide_width": -0.09348209342445633,
+        "shift_in_in_band_null_sd": -0.01920552183455579,
+        "shift_in_ungated_null_sd": -0.018017520243898452,
+        "implied_measurement_bias_in_credit_r": 0.0012663169300601259
+      },
+      "exit_trigger_audit": {
+        "what": "for every booked exit, the raw close-difference mark that triggered it vs the same-day cross-leg-consistent spread.",
+        "n_profit_takes_testable": 12,
+        "n_profit_takes_the_curve_says_never_triggered": 0,
+        "spurious_profit_take_fraction": 0.0,
+        "curve_minus_raw_on_profit_take_days": {
+          "n": 12,
+          "mean": 0.01292538838677415,
+          "median": 0.04606388698449804,
+          "sd": 0.11919734178826705,
+          "p10": -0.09281247548402924,
+          "p90": 0.1168390020647369,
+          "min": -0.29315292136921167,
+          "max": 0.17296226505538126
+        },
+        "curve_minus_raw_on_21_dte_days": {
+          "n": 14,
+          "mean": 0.14296169353066215,
+          "median": 0.05629707476544077,
+          "sd": 0.3993820912198761,
+          "p10": -0.1337449419157274,
+          "p90": 0.38773192266187617,
+          "min": -0.38178811257841794,
+          "max": 1.3604171874145798
+        },
+        "most_extreme_spurious": [],
+        "spurious_on_the_flattest_underlying_days": [],
+        "spurious_with_underlying_falling": [],
+        "all_rows": [
+          {
+            "entry_date": "2025-11-03",
+            "symbol": "QQQ",
+            "short_strike": 620.0,
+            "long_strike": 615.0,
+            "credit": 1.3874918740214355,
+            "exit_date": "2025-11-14",
+            "exit_reason": "dte_21",
+            "result_r": -0.4280228854726756,
+            "raw_exit_mark": 2.1800000000000015,
+            "curve_exit_mark": 2.6550663625305333,
+            "pt_level": 0.6937459370107177,
+            "spot_entry": 632.08,
+            "spot_exit": 608.86,
+            "underlying_move_pct": -3.673585622073161,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-11-10",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.2880894605524418,
+            "exit_date": "2025-11-21",
+            "exit_reason": "dte_21",
+            "result_r": -0.48754134864631576,
+            "raw_exit_mark": 1.4100000000000001,
+            "curve_exit_mark": 2.77041718741458,
+            "pt_level": 0.6440447302762209,
+            "spot_entry": 623.23,
+            "spot_exit": 590.07,
+            "underlying_move_pct": -5.320668132150241,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-11-13",
+            "symbol": "QQQ",
+            "short_strike": 590.0,
+            "long_strike": 585.0,
+            "credit": 1.3299626854699795,
+            "exit_date": "2025-11-28",
+            "exit_reason": "profit_take",
+            "result_r": 0.13675868611414088,
+            "raw_exit_mark": 0.6000000000000001,
+            "curve_exit_mark": 0.6186742705837673,
+            "pt_level": 0.6649813427349898,
+            "spot_entry": 608.4,
+            "spot_exit": 619.25,
+            "underlying_move_pct": 1.7833662064431266,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-11-24",
+            "symbol": "QQQ",
+            "short_strike": 590.0,
+            "long_strike": 585.0,
+            "credit": 1.2629213013092624,
+            "exit_date": "2025-12-02",
+            "exit_reason": "profit_take",
+            "result_r": 0.12681859922696545,
+            "raw_exit_mark": 0.54,
+            "curve_exit_mark": 0.5865205302465171,
+            "pt_level": 0.6314606506546312,
+            "spot_entry": 605.16,
+            "spot_exit": 622.0,
+            "underlying_move_pct": 2.7827351444246196,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2025-12-04",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.5548336978318105,
+            "exit_date": "2025-12-19",
+            "exit_reason": "dte_21",
+            "result_r": 0.0340141372994237,
+            "raw_exit_mark": 1.0799999999999992,
+            "curve_exit_mark": 1.2639515629683444,
+            "pt_level": 0.7774168489159052,
+            "spot_entry": 622.94,
+            "spot_exit": 617.05,
+            "underlying_move_pct": -0.945516422127346,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-12-08",
+            "symbol": "QQQ",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.262226435272737,
+            "exit_date": "2025-12-19",
+            "exit_reason": "dte_21",
+            "result_r": -0.04480323286561496,
+            "raw_exit_mark": 1.0799999999999992,
+            "curve_exit_mark": 1.2639515629683444,
+            "pt_level": 0.6311132176363685,
+            "spot_entry": 624.28,
+            "spot_exit": 617.05,
+            "underlying_move_pct": -1.1581341705644954,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2025-12-11",
+            "symbol": "QQQ",
+            "short_strike": 615.0,
+            "long_strike": 610.0,
+            "credit": 1.3268565435649293,
+            "exit_date": "2025-12-26",
+            "exit_reason": "dte_21",
+            "result_r": 0.018360324999421817,
+            "raw_exit_mark": 1.0900000000000003,
+            "curve_exit_mark": 1.1006013352531454,
+            "pt_level": 0.6634282717824647,
+            "spot_entry": 625.58,
+            "spot_exit": 623.89,
+            "underlying_move_pct": -0.27014930144826366,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-01-02",
+            "symbol": "QQQ",
+            "short_strike": 600.0,
+            "long_strike": 595.0,
+            "credit": 1.2641911604664244,
+            "exit_date": "2026-01-16",
+            "exit_reason": "dte_21",
+            "result_r": 0.0853595600609854,
+            "raw_exit_mark": 0.9700000000000002,
+            "curve_exit_mark": 0.7960476131562899,
+            "pt_level": 0.6320955802332122,
+            "spot_entry": 613.12,
+            "spot_exit": 621.26,
+            "underlying_move_pct": 1.327635699373686,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-02-05",
+            "symbol": "QQQ",
+            "short_strike": 580.0,
+            "long_strike": 575.0,
+            "credit": 1.3073958533241523,
+            "exit_date": "2026-02-20",
+            "exit_reason": "dte_21",
+            "result_r": 0.10458015336948837,
+            "raw_exit_mark": 0.7199999999999998,
+            "curve_exit_mark": 0.7278036188643,
+            "pt_level": 0.6536979266620762,
+            "spot_entry": 597.03,
+            "spot_exit": 608.81,
+            "underlying_move_pct": 1.9731001792204772,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-02-05",
+            "symbol": "SPY",
+            "short_strike": 660.0,
+            "long_strike": 655.0,
+            "credit": 1.3018507143353588,
+            "exit_date": "2026-02-06",
+            "exit_reason": "profit_take",
+            "result_r": 0.14740846176328282,
+            "raw_exit_mark": 0.9200000000000004,
+            "curve_exit_mark": 0.6268470786307887,
+            "pt_level": 0.6509253571676794,
+            "spot_entry": 677.62,
+            "spot_exit": 690.62,
+            "underlying_move_pct": 1.9184793837254022,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-03-12",
+            "symbol": "QQQ",
+            "short_strike": 580.0,
+            "long_strike": 575.0,
+            "credit": 1.300071584744643,
+            "exit_date": "2026-03-27",
+            "exit_reason": "dte_21",
+            "result_r": -0.5317991423327304,
+            "raw_exit_mark": 2.75,
+            "curve_exit_mark": 2.889104349659533,
+            "pt_level": 0.6500357923723215,
+            "spot_entry": 597.26,
+            "spot_exit": 562.58,
+            "underlying_move_pct": -5.8065164250075245,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-12",
+            "symbol": "SPY",
+            "short_strike": 650.0,
+            "long_strike": 645.0,
+            "credit": 1.28175433403959,
+            "exit_date": "2026-03-27",
+            "exit_reason": "dte_21",
+            "result_r": -0.45119307893151445,
+            "raw_exit_mark": 2.6799999999999997,
+            "curve_exit_mark": 2.7475216747653235,
+            "pt_level": 0.640877167019795,
+            "spot_entry": 666.06,
+            "spot_exit": 634.09,
+            "underlying_move_pct": -4.799867879770581,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-16",
+            "symbol": "QQQ",
+            "short_strike": 585.0,
+            "long_strike": 580.0,
+            "credit": 1.2537063863490516,
+            "exit_date": "2026-03-27",
+            "exit_reason": "dte_21",
+            "result_r": -0.6156847932949332,
+            "raw_exit_mark": 3.129999999999999,
+            "curve_exit_mark": 3.1750724747655568,
+            "pt_level": 0.6268531931745258,
+            "spot_entry": 600.38,
+            "spot_exit": 562.58,
+            "underlying_move_pct": -6.296012525400574,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-16",
+            "symbol": "SPY",
+            "short_strike": 655.0,
+            "long_strike": 650.0,
+            "credit": 1.2534191425318113,
+            "exit_date": "2026-03-27",
+            "exit_reason": "dte_21",
+            "result_r": -0.5251606306287585,
+            "raw_exit_mark": 2.990000000000002,
+            "curve_exit_mark": 3.005785072039089,
+            "pt_level": 0.6267095712659057,
+            "spot_entry": 669.03,
+            "spot_exit": 634.09,
+            "underlying_move_pct": -5.222486286115712,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-19",
+            "symbol": "SPY",
+            "short_strike": 645.0,
+            "long_strike": 640.0,
+            "credit": 1.3282895547453393,
+            "exit_date": "2026-04-06",
+            "exit_reason": "dte_21",
+            "result_r": 0.014459506455762891,
+            "raw_exit_mark": 1.04,
+            "curve_exit_mark": 1.1478565780397503,
+            "pt_level": 0.6641447773726696,
+            "spot_entry": 659.8,
+            "spot_exit": 658.93,
+            "underlying_move_pct": -0.13185813882995445,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-23",
+            "symbol": "SPY",
+            "short_strike": 640.0,
+            "long_strike": 635.0,
+            "credit": 1.2585249738519906,
+            "exit_date": "2026-04-06",
+            "exit_reason": "dte_21",
+            "result_r": 0.045299307429158796,
+            "raw_exit_mark": 1.0099999999999998,
+            "curve_exit_mark": 0.9700724295828991,
+            "pt_level": 0.6292624869259953,
+            "spot_entry": 655.38,
+            "spot_exit": 658.93,
+            "underlying_move_pct": 0.5416704812475137,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-03-26",
+            "symbol": "SPY",
+            "short_strike": 630.0,
+            "long_strike": 625.0,
+            "credit": 1.3082173506040249,
+            "exit_date": "2026-04-08",
+            "exit_reason": "profit_take",
+            "result_r": 0.1480351963679513,
+            "raw_exit_mark": 0.3700000000000001,
+            "curve_exit_mark": 0.41816576094161917,
+            "pt_level": 0.6541086753020124,
+            "spot_entry": 645.09,
+            "spot_exit": 676.01,
+            "underlying_move_pct": 4.7931296408253,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-03-30",
+            "symbol": "QQQ",
+            "short_strike": 540.0,
+            "long_strike": 535.0,
+            "credit": 1.306028123660127,
+            "exit_date": "2026-04-01",
+            "exit_reason": "profit_take",
+            "result_r": 0.12462070916741379,
+            "raw_exit_mark": 0.45999999999999996,
+            "curve_exit_mark": 0.5816086163012244,
+            "pt_level": 0.6530140618300635,
+            "spot_entry": 558.28,
+            "spot_exit": 584.31,
+            "underlying_move_pct": 4.662534928709605,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-03-30",
+            "symbol": "SPY",
+            "short_strike": 610.0,
+            "long_strike": 605.0,
+            "credit": 1.258908156758821,
+            "exit_date": "2026-04-01",
+            "exit_reason": "profit_take",
+            "result_r": 0.13825990809436117,
+            "raw_exit_mark": 0.4900000000000002,
+            "curve_exit_mark": 0.5549962691208208,
+            "pt_level": 0.6294540783794105,
+            "spot_entry": 631.97,
+            "spot_exit": 655.24,
+            "underlying_move_pct": 3.682136810291614,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-04-02",
+            "symbol": "QQQ",
+            "short_strike": 570.0,
+            "long_strike": 565.0,
+            "credit": 1.3770081281307682,
+            "exit_date": "2026-04-09",
+            "exit_reason": "profit_take",
+            "result_r": 0.1392835423103057,
+            "raw_exit_mark": 0.4500000000000002,
+            "curve_exit_mark": 0.523912473936349,
+            "pt_level": 0.6885040640653841,
+            "spot_entry": 584.98,
+            "spot_exit": 610.19,
+            "underlying_move_pct": 4.309549044411787,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-04-02",
+            "symbol": "SPY",
+            "short_strike": 640.0,
+            "long_strike": 635.0,
+            "credit": 1.2656682032171318,
+            "exit_date": "2026-04-08",
+            "exit_reason": "profit_take",
+            "result_r": 0.1396454291521942,
+            "raw_exit_mark": 0.5700000000000003,
+            "curve_exit_mark": 0.6156072437224793,
+            "pt_level": 0.6328341016085659,
+            "spot_entry": 655.83,
+            "spot_exit": 676.01,
+            "underlying_move_pct": 3.077016909869923,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-04-06",
+            "symbol": "SPY",
+            "short_strike": 645.0,
+            "long_strike": 640.0,
+            "credit": 1.3001819338743417,
+            "exit_date": "2026-04-09",
+            "exit_reason": "profit_take",
+            "result_r": 0.14700570478032357,
+            "raw_exit_mark": 0.52,
+            "curve_exit_mark": 0.5012203846381595,
+            "pt_level": 0.6500909669371708,
+            "spot_entry": 658.93,
+            "spot_exit": 679.91,
+            "underlying_move_pct": 3.183949736694336,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-04-27",
+            "symbol": "QQQ",
+            "short_strike": 650.0,
+            "long_strike": 645.0,
+            "credit": 1.3796989224616993,
+            "exit_date": "2026-05-06",
+            "exit_reason": "profit_take",
+            "result_r": 0.1469923971260061,
+            "raw_exit_mark": 0.48,
+            "curve_exit_mark": 0.4549290827522441,
+            "pt_level": 0.6898494612308497,
+            "spot_entry": 664.23,
+            "spot_exit": 695.77,
+            "underlying_move_pct": 4.74835523839634,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-06-04",
+            "symbol": "QQQ",
+            "short_strike": 720.0,
+            "long_strike": 715.0,
+            "credit": 1.278261509835886,
+            "exit_date": "2026-06-22",
+            "exit_reason": "dte_21",
+            "result_r": -0.032284740115419715,
+            "raw_exit_mark": 1.5600000000000005,
+            "curve_exit_mark": 1.1782118874215826,
+            "pt_level": 0.639130754917943,
+            "spot_entry": 740.61,
+            "spot_exit": 737.95,
+            "underlying_move_pct": -0.35916339233874606,
+            "curve_above_pt_level": true
+          },
+          {
+            "entry_date": "2026-06-08",
+            "symbol": "QQQ",
+            "short_strike": 695.0,
+            "long_strike": 690.0,
+            "credit": 1.292508115385317,
+            "exit_date": "2026-06-15",
+            "exit_reason": "profit_take",
+            "result_r": 0.12302064810130371,
+            "raw_exit_mark": 0.39999999999999947,
+            "curve_exit_mark": 0.5729622650553807,
+            "pt_level": 0.6462540576926585,
+            "spot_entry": 716.07,
+            "spot_exit": 744.0,
+            "underlying_move_pct": 3.90045665926515,
+            "curve_above_pt_level": false
+          },
+          {
+            "entry_date": "2026-06-11",
+            "symbol": "QQQ",
+            "short_strike": 690.0,
+            "long_strike": 685.0,
+            "credit": 1.2748723870232652,
+            "exit_date": "2026-06-15",
+            "exit_reason": "profit_take",
+            "result_r": 0.11436293358354939,
+            "raw_exit_mark": 0.71,
+            "curve_exit_mark": 0.6096606847119403,
+            "pt_level": 0.6374361935116326,
+            "spot_entry": 717.12,
+            "spot_exit": 744.0,
+            "underlying_move_pct": 3.748326639892907,
+            "curve_above_pt_level": false
+          }
+        ]
+      },
+      "survivorship": {
+        "what": "realized vol of the entries EXCLUDED from the availability denominator vs those kept. If dropping is vol-correlated, the surviving sample is not a random subsample and the availability rate is biased.",
+        "groups": {
+          "dropped_not_data_adequate": {
+            "trailing_rv20": {
+              "n": 25,
+              "mean": 0.12625574540083473,
+              "median": 0.13223177160327537,
+              "sd": 0.03182929167680204,
+              "p10": 0.08660232122199601,
+              "p90": 0.1651136526106076,
+              "min": 0.08246385412880225,
+              "max": 0.18315717515513297
+            },
+            "forward_rv10": {
+              "n": 25,
+              "mean": 0.1493845192098804,
+              "median": 0.13591768292821382,
+              "sd": 0.08202410553978658,
+              "p10": 0.07481784334436935,
+              "p90": 0.2555601918158783,
+              "min": 0.07088750389374612,
+              "max": 0.3869224824502395
+            }
+          },
+          "kept_data_adequate": {
+            "trailing_rv20": {
+              "n": 105,
+              "mean": 0.1593579888781331,
+              "median": 0.15383087086136324,
+              "sd": 0.03958495965219281,
+              "p10": 0.10964299100910395,
+              "p90": 0.21635583591125435,
+              "min": 0.08541690664186367,
+              "max": 0.2680095286297353
+            },
+            "forward_rv10": {
+              "n": 105,
+              "mean": 0.15954465628373923,
+              "median": 0.1549821696405836,
+              "sd": 0.05904009572360372,
+              "p10": 0.09495636882485724,
+              "p90": 0.21777812284690587,
+              "min": 0.06623861687329587,
+              "max": 0.4226279942282155
+            }
+          },
+          "kept_and_qualified": {
+            "trailing_rv20": {
+              "n": 26,
+              "mean": 0.1741335202868133,
+              "median": 0.1755189243686819,
+              "sd": 0.037478493575062256,
+              "p10": 0.12738452627344404,
+              "p90": 0.221595509713652,
+              "min": 0.11409633771192285,
+              "max": 0.2680095286297353
+            },
+            "forward_rv10": {
+              "n": 26,
+              "mean": 0.19375118657390442,
+              "median": 0.18058817458510684,
+              "sd": 0.07630620224500902,
+              "p10": 0.12411577117540465,
+              "p90": 0.2725737225971541,
+              "min": 0.07028779118716466,
+              "max": 0.4226279942282155
+            }
+          },
+          "kept_and_gate_rejected": {
+            "trailing_rv20": {
+              "n": 79,
+              "mean": 0.15449515575628905,
+              "median": 0.14444703767144562,
+              "sd": 0.03927295884175202,
+              "p10": 0.10587655404561176,
+              "p90": 0.21442152840182485,
+              "min": 0.08541690664186367,
+              "max": 0.24328738119374896
+            },
+            "forward_rv10": {
+              "n": 79,
+              "mean": 0.14828681087178613,
+              "median": 0.15002796967036888,
+              "sd": 0.047571224230298144,
+              "p10": 0.09148361069617958,
+              "p90": 0.21011303650746319,
+              "min": 0.06623861687329587,
+              "max": 0.28506686656647945
+            }
+          }
+        },
+        "welch_t_trailing_dropped_minus_kept": -4.445450617351149,
+        "interpretation": "|t| > 2 means the drop is vol-correlated; dropped days being LOWER vol biases availability UP, because low-IV days are the days a credit floor is hardest to clear."
+      },
+      "denominator_hygiene": {
+        "reason_breakdown": [
+          {
+            "reason": "band-not-fetched",
+            "class": "data",
+            "data_adequate": false,
+            "n": 4
+          },
+          {
+            "reason": "band-not-fetched",
+            "class": "data",
+            "data_adequate": true,
+            "n": 2
+          },
+          {
+            "reason": "credit-below-floor",
+            "class": "gate",
+            "data_adequate": true,
+            "n": 89
+          },
+          {
+            "reason": "no-contract-bars",
+            "class": "data",
+            "data_adequate": false,
+            "n": 10
+          },
+          {
+            "reason": "no-contract-file",
+            "class": "data",
+            "data_adequate": false,
+            "n": 11
+          },
+          {
+            "reason": "short-leg-illiquid",
+            "class": "gate",
+            "data_adequate": true,
+            "n": 2
+          }
+        ],
+        "n_qualified": 26,
+        "denominators": {
+          "planned": 144,
+          "marks_present": 123,
+          "data_adequate": 119,
+          "data_adequate_and_band_bracketed": 56
+        },
+        "availability_by_denominator": {
+          "planned": 0.18055555555555555,
+          "marks_present": 0.21138211382113822,
+          "data_adequate": 0.2184873949579832,
+          "data_adequate_and_band_bracketed": 0.4642857142857143
+        },
+        "passes_60pct_by_denominator": {
+          "planned": false,
+          "marks_present": false,
+          "data_adequate": false,
+          "data_adequate_and_band_bracketed": false
+        },
+        "gate_classified_entries_excluded_from_data_adequate": 0
+      },
+      "band_bracket_audit": {
+        "what": "every band-related rejection with the fetched grid's |delta| range. brackets_delta_band=False means the strikes that would have answered the question were never fetched.",
+        "delta_band": [
+          0.2,
+          0.35
+        ],
+        "n_rows": 6,
+        "n_data_gaps_band_not_fetched": 6,
+        "n_true_gate_rejections": 0,
+        "rows": [
+          {
+            "entry_date": "2025-12-26",
+            "symbol": "QQQ",
+            "spot": 623.89,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-01-30",
+            "n_liquid_invertible": 1,
+            "delta_min": 0.1653767042570233,
+            "delta_max": 0.1653767042570233,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2025-12-26",
+            "symbol": "SPY",
+            "spot": 690.31,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-01-30",
+            "n_liquid_invertible": 1,
+            "delta_min": 0.18666986189697848,
+            "delta_max": 0.18666986189697848,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2025-12-29",
+            "symbol": "QQQ",
+            "spot": 620.87,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-01-30",
+            "n_liquid_invertible": 1,
+            "delta_min": 0.1759504881885997,
+            "delta_max": 0.1759504881885997,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2025-12-29",
+            "symbol": "SPY",
+            "spot": 687.85,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-01-30",
+            "n_liquid_invertible": 1,
+            "delta_min": 0.19686198862130472,
+            "delta_max": 0.19686198862130472,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2026-01-26",
+            "symbol": "QQQ",
+            "spot": 625.46,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-02-27",
+            "n_liquid_invertible": 2,
+            "delta_min": 0.03984347775362562,
+            "delta_max": 0.045261748980111594,
+            "brackets_delta_band": false
+          },
+          {
+            "entry_date": "2026-05-11",
+            "symbol": "QQQ",
+            "spot": 713.29,
+            "reason": "band-not-fetched",
+            "reason_class": "data",
+            "expiry": "2026-06-12",
+            "n_liquid_invertible": 3,
+            "delta_min": 0.1474489039770319,
+            "delta_max": 0.1871977232755328,
+            "brackets_delta_band": false
+          }
+        ]
+      },
+      "blocking": {
+        "n_trades": 26,
+        "entry_week": {
+          "n_blocks": 15,
+          "block_sizes": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            4
+          ]
+        },
+        "exposure_cluster": {
+          "n_blocks": 7,
+          "block_sizes": [
+            1,
+            1,
+            2,
+            3,
+            3,
+            4,
+            12
+          ]
+        },
+        "pairs_open_simultaneously_in_different_entry_weeks": 40,
+        "total_pairs": 325,
+        "holding_period_days": {
+          "n": 26,
+          "mean": 10.423076923076923,
+          "median": 11.0,
+          "sd": 5.108213597124355,
+          "p10": 2.5,
+          "p90": 15.0,
+          "min": 1.0,
+          "max": 18.0
+        },
+        "why_it_matters": "entry-week blocks cannot contain a holding period longer than a week, so simultaneously-open trades are resampled as independent draws and the LB95 is too tight."
+      },
+      "walk_coverage": {
+        "what": "trading days inside a held window where at least one leg has no bar, so the day was never marked.",
+        "unwalkable_days_total": 0,
+        "reported_skipped_days_total": 0,
+        "trades_with_unwalkable_days": []
+      },
+      "friction": {
+        "n_trades": 26,
+        "replay_friction_r": {
+          "mean": 0.05108589966689259,
+          "median": 0.04742555910090684
+        },
+        "production_deployed_friction_r": {
+          "mean": 0.01642676161796076,
+          "median": 0.017120497511626497
+        },
+        "production_honest_leg_mark_friction_r": {
+          "mean": 0.05406153157278314,
+          "median": 0.05553994143648952
+        },
+        "replay_friction_dollars": {
+          "mean": 18.861043967110707,
+          "median": 16.971849348298864
+        },
+        "production_deployed_friction_dollars": {
+          "mean": 6.058630442890717,
+          "median": 6.386719734640309
+        },
+        "production_honest_leg_mark_friction_dollars": {
+          "mean": 19.941588626391876,
+          "median": 20.31967778236943
+        },
+        "ratio_replay_over_deployed": {
+          "mean": 3.082099036426035,
+          "min": 2.0051287936095243,
+          "max": 6.0590193366144804
+        },
+        "ratio_honest_over_deployed": {
+          "mean": 3.2564946556643055,
+          "median": 3.0660553166407363
+        },
+        "wing_ratio_long_over_short": {
+          "mean": 0.877551881100387,
+          "median": 0.8834063851856098
+        },
+        "leg_mid_sum_over_net_credit": {
+          "mean": 15.68916144609534,
+          "median": 16.153700143085654
+        },
+        "deployed_model_assumes_leg_mid_sum_over_credit": 2.0,
+        "deployed_model_exact_at_wing_ratio": 0.3333333333333333,
+        "note": "execution_costs.friction_r proxies each leg's mark by net_credit (leg-mid-sum = 2 x net_credit), exact only at wing ratio 1/3. Compare wing_ratio_long_over_short against 1/3: the deployed model's spread leg is off by exactly leg_mid_sum_over_net_credit / 2 (>1 = understated)."
+      },
+      "iv_by_month": {
+        "what": "UNCONDITIONAL IV is measured over every in-band liquid strike on every planned entry day. The CONDITIONAL figures are the qualified trades only and are selected on credit, hence on IV — they cannot be read as the month's vol level.",
+        "unconditional": {
+          "2025-10": {
+            "n_strikes": 62,
+            "n_entry_days": 16,
+            "median_iv": 0.20725236090864058,
+            "mean_iv": 0.20737753281579355,
+            "is_highest_iv_month": false
+          },
+          "2025-11": {
+            "n_strikes": 61,
+            "n_entry_days": 15,
+            "median_iv": 0.23211672581871967,
+            "mean_iv": 0.2330980296437873,
+            "is_highest_iv_month": false
+          },
+          "2025-12": {
+            "n_strikes": 37,
+            "n_entry_days": 13,
+            "median_iv": 0.17364784348411483,
+            "mean_iv": 0.18039550027324996,
+            "is_highest_iv_month": false
+          },
+          "2026-01": {
+            "n_strikes": 42,
+            "n_entry_days": 12,
+            "median_iv": 0.19540250302217899,
+            "mean_iv": 0.18915971455339872,
+            "is_highest_iv_month": false
+          },
+          "2026-02": {
+            "n_strikes": 56,
+            "n_entry_days": 16,
+            "median_iv": 0.22706642748601738,
+            "mean_iv": 0.23404887359879215,
+            "is_highest_iv_month": false
+          },
+          "2026-03": {
+            "n_strikes": 71,
+            "n_entry_days": 16,
+            "median_iv": 0.27547138324817655,
+            "mean_iv": 0.2749916971138586,
+            "is_highest_iv_month": true
+          },
+          "2026-04": {
+            "n_strikes": 71,
+            "n_entry_days": 16,
+            "median_iv": 0.22931115404879676,
+            "mean_iv": 0.22421976632356228,
+            "is_highest_iv_month": false
+          },
+          "2026-05": {
+            "n_strikes": 23,
+            "n_entry_days": 6,
+            "median_iv": 0.19037501232316717,
+            "mean_iv": 0.20401820741460625,
+            "is_highest_iv_month": false
+          },
+          "2026-06": {
+            "n_strikes": 20,
+            "n_entry_days": 5,
+            "median_iv": 0.26496623280420906,
+            "mean_iv": 0.2423513040609751,
+            "is_highest_iv_month": false
+          }
+        },
+        "conditional_qualified_only": {
+          "2025-11": {
+            "n_trades": 4,
+            "median_iv": 0.23026829236848287
+          },
+          "2025-12": {
+            "n_trades": 3,
+            "median_iv": 0.20670470995018259
+          },
+          "2026-01": {
+            "n_trades": 1,
+            "median_iv": 0.19598655632371087
+          },
+          "2026-02": {
+            "n_trades": 2,
+            "median_iv": 0.2471542159350589
+          },
+          "2026-03": {
+            "n_trades": 9,
+            "median_iv": 0.2527004894983955
+          },
+          "2026-04": {
+            "n_trades": 4,
+            "median_iv": 0.22565528780464084
+          },
+          "2026-06": {
+            "n_trades": 3,
+            "median_iv": 0.26320661781150856
+          }
+        },
+        "liquidity_lag_used": "same-day",
+        "liquidity_lag_note": "this section deliberately uses the same-day count so the IV census covers the widest strike set; it is a description of the data, not a tradeable screen."
+      },
+      "payoff_attribution": {
+        "n_trades": 26,
+        "mean_r": -0.04546940949561244,
+        "median_r": 0.09496985671523689,
+        "min_r": -0.6156847932949332,
+        "max_r": 0.1480351963679513,
+        "n_losers": 8,
+        "mean_r_of_losers": -0.3895612315359953,
+        "mean_r_excluding_k_worst": {
+          "1": {
+            "n_remaining": 25,
+            "mean_r": -0.02266079414363961,
+            "dropped_r": [
+              -0.6157
+            ]
+          },
+          "5": {
+            "n_remaining": 21,
+            "mean_r": 0.06805592128325376,
+            "dropped_r": [
+              -0.6157,
+              -0.5318,
+              -0.5252,
+              -0.4875,
+              -0.4512
+            ]
+          },
+          "10": {
+            "n_remaining": 16,
+            "mean_r": 0.1188415858716784,
+            "dropped_r": [
+              -0.6157,
+              -0.5318,
+              -0.5252,
+              -0.4875,
+              -0.4512,
+              -0.428,
+              -0.0448,
+              -0.0323,
+              0.0145,
+              0.0184
+            ]
+          }
+        },
+        "mean_r_excluding_each_month": {
+          "2025-11": {
+            "n_in_month": 4,
+            "mean_r_in_month": -0.16299673719447125,
+            "n_remaining": 22,
+            "mean_r_excluding_month": -0.024100804459456285,
+            "unconditional_median_iv": 0.23211672581871967,
+            "is_highest_iv_month": false
+          },
+          "2025-12": {
+            "n_in_month": 3,
+            "mean_r_in_month": 0.002523743144410186,
+            "n_remaining": 23,
+            "mean_r_excluding_month": -0.051729385926919766,
+            "unconditional_median_iv": 0.17364784348411483,
+            "is_highest_iv_month": false
+          },
+          "2026-01": {
+            "n_in_month": 1,
+            "mean_r_in_month": 0.0853595600609854,
+            "n_remaining": 25,
+            "mean_r_excluding_month": -0.05070256827787636,
+            "unconditional_median_iv": 0.19540250302217899,
+            "is_highest_iv_month": false
+          },
+          "2026-02": {
+            "n_in_month": 2,
+            "mean_r_in_month": 0.12599430756638558,
+            "n_remaining": 24,
+            "mean_r_excluding_month": -0.059758052584112285,
+            "unconditional_median_iv": 0.22706642748601738,
+            "is_highest_iv_month": false
+          },
+          "2026-03": {
+            "n_in_month": 9,
+            "mean_r_in_month": -0.18368477974147654,
+            "n_remaining": 17,
+            "mean_r_excluding_month": 0.027703433575727358,
+            "unconditional_median_iv": 0.27547138324817655,
+            "is_highest_iv_month": true
+          },
+          "2026-04": {
+            "n_in_month": 4,
+            "mean_r_in_month": 0.14323176834220738,
+            "n_remaining": 22,
+            "mean_r_excluding_month": -0.07977871455703424,
+            "unconditional_median_iv": 0.22931115404879676,
+            "is_highest_iv_month": false
+          },
+          "2026-06": {
+            "n_in_month": 3,
+            "mean_r_in_month": 0.06836628052314446,
+            "n_remaining": 23,
+            "mean_r_excluding_month": -0.06031754297631986,
+            "unconditional_median_iv": 0.26496623280420906,
+            "is_highest_iv_month": false
+          }
+        },
+        "worst_r_observed": -0.6156847932949332,
+        "full_loss_r": -1.0,
+        "tail_note": "the -1R tail is UNSAMPLED, not absent: a full -1R needs the short strike still breached at the forced 21-DTE exit, which never happened in this window. Its absence is a property of the window, not of the strategy.",
+        "attribution_warning": "deleting a month is not a neutral operation — check unconditional_median_iv on the month being deleted before reading any 'excluding X' figure as the strategy's expectancy."
+      }
+    }
+  }
+}

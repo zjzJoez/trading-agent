@@ -1259,9 +1259,9 @@ def friction_comparison(qualified: list[dict],
         "note": (
             "execution_costs.friction_r proxies each leg's mark by net_credit "
             "(leg-mid-sum = 2 x net_credit), exact only at wing ratio 1/3. "
-            "The measured wing ratio here is ~0.85, so the deployed model "
-            "UNDERSTATES the spread leg of friction by "
-            "leg_mid_sum_over_net_credit / 2."),
+            "Compare wing_ratio_long_over_short against 1/3: the deployed "
+            "model's spread leg is off by exactly "
+            "leg_mid_sum_over_net_credit / 2 (>1 = understated)."),
     }
 
 
@@ -1614,9 +1614,7 @@ def run(data_dir: Path, batch_plan: Path, out_dir: Path,
     summary["mark_diagnostics"] = mark_diag
     # What the DEPLOYED cost model would actually charge, if it were asked
     # today, from whatever is in data/execution_costs.json (finding 14).
-    file_pct = {s: e["spread_pct_of_mid"]
-                for s, e in (calibration or {}).get("per_symbol", {}).items()
-                if e.get("source") in ("per_underlying", "file_global")}
+    file_pct = dict((calibration or {}).get("resolved_from_file") or {})
     qualified = [r for r in records if r["qualified"]]
     if file_pct and all(r["symbol"] in file_pct for r in qualified):
         summary["friction_under_calibration_file"] = {

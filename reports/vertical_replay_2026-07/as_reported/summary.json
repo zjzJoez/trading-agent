@@ -17,7 +17,7 @@
       5.0,
       10.0
     ],
-    "credit_floor_frac": 0.2,
+    "credit_floor_frac": 0.25,
     "credit_floor_frac_spec": 0.25,
     "min_short_trades": 30,
     "dte_range": [
@@ -30,7 +30,53 @@
     "bootstrap_seed": 20260722,
     "fees_per_round_trip": 4.0,
     "availability_floor": 0.6,
-    "width_policy": "five-first"
+    "width_policy": "five-first",
+    "mark_convention": "close",
+    "liquidity_lag": "same-day",
+    "liquidity_screen_is_look_ahead": true,
+    "spread_pct_provenance": {
+      "path": "/Users/joez/Desktop/trading-agent/data/execution_costs.json",
+      "file_present": true,
+      "sha256": "a467989051373caebec888202b902107812f2dfc0b1be445c4a154cde63dbf42",
+      "calibrated_at": "2026-06-12T07:13:59.351387+00:00",
+      "file_globals": {
+        "calibrated_at": "2026-06-12T07:13:59.351387+00:00",
+        "n_samples": 160,
+        "spread_pct_of_mid_median": 0.07338,
+        "spread_pct_of_mid_p75": 0.09071,
+        "opt_half_spread_pct_of_mark": 0.03669
+      },
+      "per_symbol": {
+        "SPY": {
+          "spread_pct_of_mid": 0.0049,
+          "source": "cli_override",
+          "key": "spread_pct_of_mid_median",
+          "n_quotes": 160,
+          "zone": null,
+          "calibrated_at": "2026-06-12T07:13:59.351387+00:00",
+          "overrides_file_value": 0.07338
+        },
+        "QQQ": {
+          "spread_pct_of_mid": 0.0094,
+          "source": "cli_override",
+          "key": "spread_pct_of_mid_median",
+          "n_quotes": 160,
+          "zone": null,
+          "calibrated_at": "2026-06-12T07:13:59.351387+00:00",
+          "overrides_file_value": 0.07338
+        }
+      },
+      "warnings": [
+        "SPY: no per-underlying calibration \u2014 using the file's GLOBAL spread_pct_of_mid_median=0.0734, which was calibrated on a single-name watchlist, not this index chain",
+        "QQQ: no per-underlying calibration \u2014 using the file's GLOBAL spread_pct_of_mid_median=0.0734, which was calibrated on a single-name watchlist, not this index chain",
+        "SPY: --spread-pct override 0.0049 DISAGREES with the calibration file's 0.0734; the file is what production charges, the override is what this replay charged",
+        "QQQ: --spread-pct override 0.0094 DISAGREES with the calibration file's 0.0734; the file is what production charges, the override is what this replay charged"
+      ],
+      "resolved_from_file": {
+        "SPY": 0.07338,
+        "QQQ": 0.07338
+      }
+    }
   },
   "approximation_notes": [
     "IV inverted from EUROPEAN Black-Scholes put (bisection) although SPY/QQQ options are American; acceptable for OTM short-dated index puts, biases IV/delta slightly.",
@@ -40,38 +86,127 @@
     "r = 0.043 fixed; continuous dividend yield q: SPY 0.012, QQQ 0.006.",
     "Missing/limit-truncated data is skipped and counted, never interpolated: availability is measured only over entries whose fetched strikes could construct at least one vertical."
   ],
+  "verdict": {
+    "criterion_source": "docs/REVIVAL_PLAN_2026-07-20.md line 81 (M1-0.4)",
+    "criterion_text": "\u9a8c\u6536:**\u5141\u8bb8\u4ea4\u6613\u7684 regime \u5185\u5408\u683c vertical \u5b58\u5728\u4e8e \u226560% \u5feb\u7167\u65e5** \u2014 i.e. a qualifying vertical must exist on >=60% of snapshot days WITHIN THE REGIMES THE SLEEVE IS ALLOWED TO TRADE.",
+    "evaluated_as_specified": false,
+    "why_not": "NOT EVALUATED AS SPECIFIED: this replay carries no regime labels, so availability was measured UNCONDITIONALLY over all planned entry days. The criterion is conditional on the allowed regimes; an unconditional rate is neither the criterion nor a bound on it.",
+    "regime_labels_present": false,
+    "what_was_measured": "UNCONDITIONAL availability of a qualifying vertical over the planned entry days, under one mark convention at a time.",
+    "denominators": {
+      "data_adequate": {
+        "definition": "planned entries whose FETCHED strikes could construct at least one vertical",
+        "n": 119,
+        "n_qualified": 44,
+        "rate": 0.3697478991596639,
+        "floor": 0.6,
+        "passes": false
+      },
+      "planned": {
+        "definition": "every planned (entry_date, symbol) pair, data gaps charged against availability",
+        "n": 144,
+        "n_qualified": 44,
+        "rate": 0.3055555555555556,
+        "floor": 0.6,
+        "passes": false
+      }
+    },
+    "overall_verdict": "CRITERION NOT EVALUATED AS SPECIFIED (no regime labels). The unconditional rate FAILS the 60% floor on both denominators."
+  },
+  "friction_comparison": {
+    "n_trades": 44,
+    "replay_friction_r": {
+      "mean": 0.048632205280639655,
+      "median": 0.04726650045662101
+    },
+    "production_deployed_friction_r": {
+      "mean": 0.017622809519635657,
+      "median": 0.01761304347826087
+    },
+    "production_honest_leg_mark_friction_r": {
+      "mean": 0.0513605435441292,
+      "median": 0.053112805241215005
+    },
+    "replay_friction_dollars": {
+      "mean": 17.30755227272727,
+      "median": 16.7135
+    },
+    "production_deployed_friction_dollars": {
+      "mean": 6.254327272727273,
+      "median": 6.443999999999998
+    },
+    "production_honest_leg_mark_friction_dollars": {
+      "mean": 18.2527,
+      "median": 19.4818
+    },
+    "ratio_replay_over_deployed": {
+      "mean": 2.7365251533994783,
+      "min": 1.6302866716306776,
+      "max": 5.559965287821813
+    },
+    "ratio_honest_over_deployed": {
+      "mean": 2.879783945884483,
+      "median": 3.018861970760029
+    },
+    "wing_ratio_long_over_short": {
+      "mean": 0.8485999535205422,
+      "median": 0.8536364109542187
+    },
+    "leg_mid_sum_over_net_credit": {
+      "mean": 12.641093240217407,
+      "median": 12.664699757028814
+    },
+    "deployed_model_assumes_leg_mid_sum_over_credit": 2.0,
+    "deployed_model_exact_at_wing_ratio": 0.3333333333333333,
+    "note": "execution_costs.friction_r proxies each leg's mark by net_credit (leg-mid-sum = 2 x net_credit), exact only at wing ratio 1/3. Compare wing_ratio_long_over_short against 1/3: the deployed model's spread leg is off by exactly leg_mid_sum_over_net_credit / 2 (>1 = understated)."
+  },
   "availability": {
-    "acceptance_criterion": ">=60% of DATA-ADEQUATE entry days must have a qualifying vertical (revival plan M1-0.4). Entries whose option data was never fetched are excluded from the denominator and reported as data_coverage_rate instead.",
+    "acceptance_criterion": ">=60% of DATA-ADEQUATE entry days must have a qualifying vertical (revival plan M1-0.4). Entries whose option data was never fetched are excluded from the denominator and reported as data_coverage_rate instead. NOTE: the plan's own criterion is CONDITIONAL on the allowed regimes and is NOT what this number measures \u2014 see .verdict.",
     "overall": {
       "n_entries": 144,
       "n_marks_present": 123,
       "n_data_adequate": 119,
-      "n_qualified": 99,
+      "n_band_bracketed": 63,
+      "n_qualified": 44,
       "data_coverage_rate": 0.8263888888888888,
-      "availability_rate": 0.8319327731092437,
-      "availability_rate_strict": 0.8048780487804879,
-      "rate": 0.8319327731092437
+      "availability_rate": 0.3697478991596639,
+      "availability_rate_planned": 0.3055555555555556,
+      "availability_rate_strict": 0.35772357723577236,
+      "availability_rate_band_bracketed": 0.6984126984126984,
+      "passes_floor_on_data_adequate": false,
+      "passes_floor_on_planned": false,
+      "rate": 0.3697478991596639
     },
     "per_symbol": {
       "QQQ": {
         "n_entries": 72,
         "n_marks_present": 67,
         "n_data_adequate": 65,
-        "n_qualified": 56,
+        "n_band_bracketed": 35,
+        "n_qualified": 29,
         "data_coverage_rate": 0.9027777777777778,
-        "availability_rate": 0.8615384615384616,
-        "availability_rate_strict": 0.835820895522388,
-        "rate": 0.8615384615384616
+        "availability_rate": 0.4461538461538462,
+        "availability_rate_planned": 0.4027777777777778,
+        "availability_rate_strict": 0.43283582089552236,
+        "availability_rate_band_bracketed": 0.8285714285714286,
+        "passes_floor_on_data_adequate": false,
+        "passes_floor_on_planned": false,
+        "rate": 0.4461538461538462
       },
       "SPY": {
         "n_entries": 72,
         "n_marks_present": 56,
         "n_data_adequate": 54,
-        "n_qualified": 43,
+        "n_band_bracketed": 28,
+        "n_qualified": 15,
         "data_coverage_rate": 0.75,
-        "availability_rate": 0.7962962962962963,
-        "availability_rate_strict": 0.7678571428571429,
-        "rate": 0.7962962962962963
+        "availability_rate": 0.2777777777777778,
+        "availability_rate_planned": 0.20833333333333334,
+        "availability_rate_strict": 0.26785714285714285,
+        "availability_rate_band_bracketed": 0.5357142857142857,
+        "passes_floor_on_data_adequate": false,
+        "passes_floor_on_planned": false,
+        "rate": 0.2777777777777778
       }
     },
     "per_month": {
@@ -79,103 +214,148 @@
         "n_entries": 16,
         "n_marks_present": 16,
         "n_data_adequate": 16,
-        "n_qualified": 14,
+        "n_band_bracketed": 10,
+        "n_qualified": 6,
         "data_coverage_rate": 1.0,
-        "availability_rate": 0.875,
-        "availability_rate_strict": 0.875,
-        "rate": 0.875
+        "availability_rate": 0.375,
+        "availability_rate_planned": 0.375,
+        "availability_rate_strict": 0.375,
+        "availability_rate_band_bracketed": 0.6,
+        "passes_floor_on_data_adequate": false,
+        "passes_floor_on_planned": false,
+        "rate": 0.375
       },
       "2025-11": {
         "n_entries": 16,
         "n_marks_present": 15,
         "n_data_adequate": 15,
-        "n_qualified": 14,
+        "n_band_bracketed": 9,
+        "n_qualified": 8,
         "data_coverage_rate": 0.9375,
-        "availability_rate": 0.9333333333333333,
-        "availability_rate_strict": 0.9333333333333333,
-        "rate": 0.9333333333333333
+        "availability_rate": 0.5333333333333333,
+        "availability_rate_planned": 0.5,
+        "availability_rate_strict": 0.5333333333333333,
+        "availability_rate_band_bracketed": 0.8888888888888888,
+        "passes_floor_on_data_adequate": false,
+        "passes_floor_on_planned": false,
+        "rate": 0.5333333333333333
       },
       "2025-12": {
         "n_entries": 18,
         "n_marks_present": 17,
         "n_data_adequate": 13,
-        "n_qualified": 9,
+        "n_band_bracketed": 8,
+        "n_qualified": 2,
         "data_coverage_rate": 0.7222222222222222,
-        "availability_rate": 0.6923076923076923,
-        "availability_rate_strict": 0.5294117647058824,
-        "rate": 0.6923076923076923
+        "availability_rate": 0.15384615384615385,
+        "availability_rate_planned": 0.1111111111111111,
+        "availability_rate_strict": 0.11764705882352941,
+        "availability_rate_band_bracketed": 0.25,
+        "passes_floor_on_data_adequate": false,
+        "passes_floor_on_planned": false,
+        "rate": 0.15384615384615385
       },
       "2026-01": {
         "n_entries": 18,
         "n_marks_present": 15,
         "n_data_adequate": 15,
-        "n_qualified": 7,
+        "n_band_bracketed": 6,
+        "n_qualified": 1,
         "data_coverage_rate": 0.8333333333333334,
-        "availability_rate": 0.4666666666666667,
-        "availability_rate_strict": 0.4666666666666667,
-        "rate": 0.4666666666666667
+        "availability_rate": 0.06666666666666667,
+        "availability_rate_planned": 0.05555555555555555,
+        "availability_rate_strict": 0.06666666666666667,
+        "availability_rate_band_bracketed": 0.16666666666666666,
+        "passes_floor_on_data_adequate": false,
+        "passes_floor_on_planned": false,
+        "rate": 0.06666666666666667
       },
       "2026-02": {
         "n_entries": 16,
         "n_marks_present": 16,
         "n_data_adequate": 16,
-        "n_qualified": 15,
+        "n_band_bracketed": 6,
+        "n_qualified": 6,
         "data_coverage_rate": 1.0,
-        "availability_rate": 0.9375,
-        "availability_rate_strict": 0.9375,
-        "rate": 0.9375
+        "availability_rate": 0.375,
+        "availability_rate_planned": 0.375,
+        "availability_rate_strict": 0.375,
+        "availability_rate_band_bracketed": 1.0,
+        "passes_floor_on_data_adequate": false,
+        "passes_floor_on_planned": false,
+        "rate": 0.375
       },
       "2026-03": {
         "n_entries": 18,
         "n_marks_present": 16,
         "n_data_adequate": 16,
-        "n_qualified": 15,
+        "n_band_bracketed": 5,
+        "n_qualified": 11,
         "data_coverage_rate": 0.8888888888888888,
-        "availability_rate": 0.9375,
-        "availability_rate_strict": 0.9375,
-        "rate": 0.9375
+        "availability_rate": 0.6875,
+        "availability_rate_planned": 0.6111111111111112,
+        "availability_rate_strict": 0.6875,
+        "availability_rate_band_bracketed": 2.2,
+        "passes_floor_on_data_adequate": true,
+        "passes_floor_on_planned": true,
+        "rate": 0.6875
       },
       "2026-04": {
         "n_entries": 18,
         "n_marks_present": 16,
         "n_data_adequate": 16,
-        "n_qualified": 16,
+        "n_band_bracketed": 11,
+        "n_qualified": 6,
         "data_coverage_rate": 0.8888888888888888,
-        "availability_rate": 1.0,
-        "availability_rate_strict": 1.0,
-        "rate": 1.0
+        "availability_rate": 0.375,
+        "availability_rate_planned": 0.3333333333333333,
+        "availability_rate_strict": 0.375,
+        "availability_rate_band_bracketed": 0.5454545454545454,
+        "passes_floor_on_data_adequate": false,
+        "passes_floor_on_planned": false,
+        "rate": 0.375
       },
       "2026-05": {
         "n_entries": 16,
         "n_marks_present": 7,
         "n_data_adequate": 7,
-        "n_qualified": 5,
+        "n_band_bracketed": 3,
+        "n_qualified": 1,
         "data_coverage_rate": 0.4375,
-        "availability_rate": 0.7142857142857143,
-        "availability_rate_strict": 0.7142857142857143,
-        "rate": 0.7142857142857143
+        "availability_rate": 0.14285714285714285,
+        "availability_rate_planned": 0.0625,
+        "availability_rate_strict": 0.14285714285714285,
+        "availability_rate_band_bracketed": 0.3333333333333333,
+        "passes_floor_on_data_adequate": false,
+        "passes_floor_on_planned": false,
+        "rate": 0.14285714285714285
       },
       "2026-06": {
         "n_entries": 8,
         "n_marks_present": 5,
         "n_data_adequate": 5,
-        "n_qualified": 4,
+        "n_band_bracketed": 5,
+        "n_qualified": 3,
         "data_coverage_rate": 0.625,
-        "availability_rate": 0.8,
-        "availability_rate_strict": 0.8,
-        "rate": 0.8
+        "availability_rate": 0.6,
+        "availability_rate_planned": 0.375,
+        "availability_rate_strict": 0.6,
+        "availability_rate_band_bracketed": 0.6,
+        "passes_floor_on_data_adequate": true,
+        "passes_floor_on_planned": false,
+        "rate": 0.6
       }
     },
     "unqualified_reasons": {
-      "credit-below-floor": 16,
+      "band-not-fetched": 7,
+      "credit-below-floor": 71,
       "no-contract-bars": 10,
       "no-contract-file": 11,
-      "no-strike-in-band": 7,
       "short-leg-illiquid": 1
     },
     "unqualified_reason_classes": {
-      "data": 21,
-      "gate": 24
+      "data": 28,
+      "gate": 72
     },
     "reason_classes": {
       "no-data": "data",
@@ -186,6 +366,7 @@
       "no-entry-day-mark": "data",
       "short-leg-illiquid": "gate",
       "no-invertible-mark": "data",
+      "band-not-fetched": "data",
       "no-strike-in-band": "gate",
       "wing-missing": "data",
       "inverted-credit-mark": "data",
@@ -216,35 +397,53 @@
         "n_data_adequate": 119,
         "n_qualified": 99,
         "availability_rate": 0.8319327731092437
+      },
+      "0.225": {
+        "n_data_adequate": 119,
+        "n_qualified": 81,
+        "availability_rate": 0.680672268907563
+      },
+      "0.25": {
+        "n_data_adequate": 119,
+        "n_qualified": 44,
+        "availability_rate": 0.3697478991596639
       }
     }
   },
   "managed_payoff": {
-    "n_trades": 99,
-    "win_rate": 0.7373737373737373,
-    "mean_r": 0.025965744407702968,
-    "median_r": 0.103650375,
-    "std_r": 0.17566243918787566,
-    "sum_r": 2.570608696362594,
-    "net_pnl_dollars": 872.5898999999994,
-    "lb95_mean_r": -0.01439222141119001,
-    "max_drawdown_r": 2.92670767735195,
+    "n_trades": 44,
+    "win_rate": 0.7727272727272727,
+    "mean_r": 0.05612948510974885,
+    "median_r": 0.14199048319484997,
+    "std_r": 0.22161820351448078,
+    "sum_r": 2.4696973448289494,
+    "net_pnl_dollars": 832.4676999999996,
+    "lb95_mean_r": -0.0277102793748154,
+    "lb95_mean_r_by_blocking": {
+      "entry-week": -0.0277102793748154,
+      "exposure-cluster": -0.017365082801366706
+    },
+    "n_blocks": {
+      "entry-week": 25,
+      "exposure-cluster": 12
+    },
+    "max_drawdown_r": 2.3774186835553355,
     "per_symbol": {
       "QQQ": {
-        "n_trades": 56,
-        "win_rate": 0.75,
-        "mean_r": 0.021087270768137236,
-        "median_r": 0.1005764924116856,
-        "sum_r": 1.1808871630156852,
-        "net_pnl_dollars": 400.7108999999995
+        "n_trades": 29,
+        "win_rate": 0.8275862068965517,
+        "mean_r": 0.06367190115722209,
+        "median_r": 0.13727397260273966,
+        "sum_r": 1.8464851335594403,
+        "net_pnl_dollars": 650.4537999999998
       },
       "SPY": {
-        "n_trades": 43,
-        "win_rate": 0.7209302325581395,
-        "mean_r": 0.032319105426672295,
-        "median_r": 0.11460102040816314,
-        "sum_r": 1.3897215333469086,
-        "net_pnl_dollars": 471.8789999999999
+        "n_trades": 15,
+        "win_rate": 0.6666666666666666,
+        "mean_r": 0.041547480751300575,
+        "median_r": 0.15588678474114442,
+        "sum_r": 0.6232122112695087,
+        "net_pnl_dollars": 182.01389999999984
       }
     },
     "histogram_r": {
@@ -281,15 +480,15 @@
         0,
         0,
         0,
-        1,
-        4,
         2,
-        8,
-        5,
+        3,
+        0,
+        2,
+        1,
+        2,
+        0,
+        28,
         6,
-        18,
-        50,
-        5,
         0,
         0
       ],
@@ -299,21 +498,81 @@
   },
   "exit_degradation": {
     "counts": {
-      "profit_take": 60,
-      "dte_21": 39,
+      "profit_take": 34,
+      "dte_21": 10,
       "data_end": 0
     },
     "fractions": {
-      "profit_take": 0.6060606060606061,
-      "dte_21": 0.3939393939393939,
+      "profit_take": 0.7727272727272727,
+      "dte_21": 0.22727272727272727,
       "data_end": 0.0
     },
     "n_data_end_flagged": 0,
     "mean_r_by_exit": {
-      "profit_take": 0.13342706249639524,
-      "dte_21": -0.13935936034413138,
+      "profit_take": 0.16390194774237707,
+      "dte_21": -0.31029688784118714,
       "data_end": null
     }
+  },
+  "mark_diagnostics": {
+    "convention": "close",
+    "smile": {
+      "days_fitted": 0,
+      "days_unfittable": 0,
+      "bars_repriced": 0,
+      "bars_kept_raw": 0
+    }
+  },
+  "friction_under_calibration_file": {
+    "spread_pct": {
+      "SPY": 0.07338,
+      "QQQ": 0.07338
+    },
+    "note": "execution_costs.friction_r proxies each leg's mark by net_credit (leg-mid-sum = 2 x net_credit), exact only at wing ratio 1/3. Compare wing_ratio_long_over_short against 1/3: the deployed model's spread leg is off by exactly leg_mid_sum_over_net_credit / 2 (>1 = understated).",
+    "n_trades": 44,
+    "replay_friction_r": {
+      "mean": 0.35824869539833243,
+      "median": 0.3039044595373819
+    },
+    "production_deployed_friction_r": {
+      "mean": 0.07085940618920696,
+      "median": 0.06523999999999996
+    },
+    "production_honest_leg_mark_friction_r": {
+      "mean": 0.38244644477778844,
+      "median": 0.37830083117900515
+    },
+    "replay_friction_dollars": {
+      "mean": 127.51521727272726,
+      "median": 108.82332999999998
+    },
+    "production_deployed_friction_dollars": {
+      "mean": 25.05672454545454,
+      "median": 23.812599999999993
+    },
+    "production_honest_leg_mark_friction_dollars": {
+      "mean": 135.77880590909092,
+      "median": 134.57971
+    },
+    "ratio_replay_over_deployed": {
+      "mean": 5.144873529075,
+      "min": 3.065703321057263,
+      "max": 11.399962434195663
+    },
+    "ratio_honest_over_deployed": {
+      "mean": 5.455411030038134,
+      "median": 5.461336768642806
+    },
+    "wing_ratio_long_over_short": {
+      "mean": 0.8485999535205422,
+      "median": 0.8536364109542187
+    },
+    "leg_mid_sum_over_net_credit": {
+      "mean": 12.641093240217407,
+      "median": 12.664699757028814
+    },
+    "deployed_model_assumes_leg_mid_sum_over_credit": 2.0,
+    "deployed_model_exact_at_wing_ratio": 0.3333333333333333
   },
   "data_inventory": {
     "batches_planned": 74,
