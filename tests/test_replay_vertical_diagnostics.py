@@ -62,16 +62,24 @@ def _run(tmp_path, corrupt=None, **kwargs):
     return data_dir, plan, out_dir / "entries.jsonl"
 
 
-def test_null_study_estimator_is_unbiased_on_a_clean_curve(tmp_path):
+def test_null_study_finds_no_systematic_offset_between_conventions(tmp_path):
     # Every print already sits on one BS curve, so the same-day curve estimate
     # must reproduce the raw close difference to within numerical noise.
     data_dir, plan, entries = _run(tmp_path, mark="close")
     out = dg.diagnose(data_dir, plan, entries, ("SPY",), {"SPY": 0.0049})
-    null = out["null_study"]["ungated"]
+    ns = out["null_study"]
+    null = ns["ungated"]
     assert null["n"] > 0
     assert abs(null["mean"]) < 1e-3
-    assert out["null_study"]["estimator_is_unbiased"] is True
-    assert out["null_study"]["credit_noise_sd_as_pct_of_5_wide_width"] == (
+    # finding 3: the statistic is a DIFFERENCE of two conventions, so it can
+    # only speak about the offset BETWEEN them. The old key claimed the
+    # estimator itself was unbiased, which this study cannot identify.
+    assert ns["no_systematic_offset_between_conventions"] is True
+    assert "estimator_is_unbiased" not in ns
+    # and the artifact has to say out loud what is NOT identified
+    assert "OWN bias" in ns["what_is_not_identified"]
+    assert "COMBINED noise" in ns["what_is_not_identified"]
+    assert ns["credit_noise_sd_as_pct_of_5_wide_width"] == (
         pytest.approx(100.0 * null["sd"] / 5.0))
 
 
@@ -125,6 +133,40 @@ def test_denominator_hygiene_reports_every_denominator_and_its_verdict(tmp_path)
     assert dh["n_qualified"] == 1
     assert dh["availability_by_denominator"]["planned"] == pytest.approx(1.0)
     assert dh["passes_60pct_by_denominator"]["planned"] is True
+    # finding 1: every rate ships the numerator it was computed from, and that
+    # numerator is inside its own denominator.
+    assert set(dh["numerators"]) == set(dh["denominators"])
+    assert all(dh["numerator_is_subset_of_denominator"].values())
+    for k, rate in dh["availability_by_denominator"].items():
+        if rate is None:
+            continue
+        assert rate == pytest.approx(dh["numerators"][k] / dh["denominators"][k])
+        assert rate <= 1.0
+
+
+def test_denominator_hygiene_band_bracketed_rate_cannot_exceed_one():
+    # finding 1: qualified is not a subset of band-bracketed, so the
+    # band-bracketed rate needs its own numerator. Fed directly, because a
+    # synthetic chain cannot easily produce a qualifying entry whose grid
+    # stops short of the band's edge.
+    records = [
+        {"qualified": True, "marks_present": True, "data_adequate": True,
+         "brackets_delta_band": False, "reason": None},
+        {"qualified": True, "marks_present": True, "data_adequate": True,
+         "brackets_delta_band": False, "reason": None},
+        {"qualified": False, "marks_present": True, "data_adequate": True,
+         "brackets_delta_band": True, "reason": "credit-below-floor",
+         "reason_class": "gate"},
+    ]
+    dh = dg.denominator_hygiene(records)
+    assert dh["n_qualified"] == 2
+    assert dh["n_qualified_band_bracketed"] == 0
+    assert dh["denominators"]["data_adequate_and_band_bracketed"] == 1
+    assert dh["numerators"]["data_adequate_and_band_bracketed"] == 0
+    # the invalid arithmetic would have been 2/1 = 2.0
+    assert dh["availability_by_denominator"][
+        "data_adequate_and_band_bracketed"] == pytest.approx(0.0)
+    assert all(dh["numerator_is_subset_of_denominator"].values())
 
 
 def test_band_bracket_audit_separates_data_gaps_from_gate_rejections(tmp_path):
@@ -156,7 +198,17 @@ def test_band_bracket_audit_separates_data_gaps_from_gate_rejections(tmp_path):
     assert audit["n_rows"] == 1
     assert audit["n_data_gaps_band_not_fetched"] == 1
     assert audit["n_true_gate_rejections"] == 0
-    assert audit["rows"][0]["brackets_delta_band"] is False
+    row = audit["rows"][0]
+    assert row["brackets_delta_band"] is False
+    # finding 5: the row must carry BOTH counts and the strike grid, so the
+    # number of rows FETCHED can never be misquoted as the number that
+    # survived liquidity + invertibility.
+    assert row["n_contracts_fetched"] == 2
+    assert row["n_liquid_invertible"] == 2
+    assert (row["strike_min_fetched"], row["strike_max_fetched"]) == (75.0, 80.0)
+    assert (row["strike_min_invertible"],
+            row["strike_max_invertible"]) == (75.0, 80.0)
+    assert row["delta_max"] < rv.DELTA_LO
 
 
 def test_survivorship_needs_enough_history_and_reports_a_welch_t(tmp_path):
@@ -164,9 +216,22 @@ def test_survivorship_needs_enough_history_and_reports_a_welch_t(tmp_path):
     out = dg.diagnose(data_dir, plan, entries, ("SPY",), {"SPY": 0.0049})
     # only 5 underlying sessions exist, so no 20-session trailing window can be
     # formed: every group must be empty rather than silently short-windowed.
-    groups = out["survivorship"]["groups"]
+    sv = out["survivorship"]
+    groups = sv["groups"]
     assert all(g["trailing_rv20"]["n"] == 0 for g in groups.values())
-    assert out["survivorship"]["welch_t_trailing_dropped_minus_kept"] is None
+    assert sv["welch_t_trailing_dropped_minus_kept"] is None
+    # finding 8: the shrinking denominator is PUBLISHED, not silent. Here every
+    # record is skipped, and that must be visible from the artifact alone.
+    assert sv["n_records"] == 1
+    assert sv["n_records_with_rv"] == 0
+    assert sv["n_records_skipped_for_rv"] == 1
+    assert (sv["n_records_with_rv"] + sv["n_records_skipped_for_rv"]
+            == sv["n_records"])
+    assert sv["n_records_with_rv"] == sum(
+        g["trailing_rv20"]["n"] for k, g in groups.items()
+        if k in ("dropped_not_data_adequate", "kept_data_adequate"))
+    assert sv["records_skipped_for_rv"][0]["entry_date"] == ENTRY.isoformat()
+    assert "1 of 1" in sv["denominator_note"] or "0 of 1" in sv["denominator_note"]
 
 
 def test_blocking_and_walk_coverage(tmp_path):

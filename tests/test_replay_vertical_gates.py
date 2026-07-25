@@ -79,9 +79,10 @@ def _put(strike: float, close: float, n: int = 100,
     """A contract with a bar on `day` AND on the prior session.
 
     The prior-session bar carries the same trade count, because the liquidity
-    screen's default information set is the session BEFORE entry (screening on
-    the entry day's own full-day count is look-ahead). Its close is irrelevant
-    to selection — only the entry-day mark is ever read.
+    screen defaults to the session BEFORE entry. That default is stricter than
+    the engine's declared enter-at-the-close information set requires, not a
+    look-ahead fix — see rv.INFORMATION_SET. The prior bar's close is
+    irrelevant to selection; only the entry-day mark is ever read.
     """
     prior = day - timedelta(days=1)
     return strike, {"ticker": f"O:SPY260619P{int(strike * 1000):08d}",
@@ -393,14 +394,39 @@ def test_smile_repricing_keeps_raw_closes_when_no_curve_fits():
 # --------------------------------------- liquidity-screen information set
 
 
-def test_liquidity_screen_prior_day_vs_look_ahead_same_day():
-    # The entry day trades 100 times; the session before it traded 5. Screening
-    # on the entry day's own full-day count is look-ahead (finding 15).
+def test_the_information_set_is_declared_once_and_consistently():
+    # finding 2: the artifact used to defend entry-day marks as a
+    # close-to-close convention while calling the entry day's own full-day
+    # trade count look-ahead. Both come off the SAME completed bar, so exactly
+    # one information set governs both.
+    assert rv.INFORMATION_SET == "enter-at-the-close"
+    stmt = rv.INFORMATION_SET_STATEMENT
+    assert "enter-at-the-close" in stmt.lower()
+    # it must say the same-day count is legal, and why prior is still primary
+    assert "'same-day' screen is legal" in stmt
+    assert "robustness" in stmt
+    assert "not implemented and not measured" in stmt
+    # and the summary must publish it, with no residual look-ahead claim
+    cfg = rv.summarize([], 10, 1, {"SPY": 0.0049}, "five-first", 0.25,
+                       "same-day", "close")["config"]
+    assert cfg["information_set"] == "enter-at-the-close"
+    assert cfg["liquidity_screen_uses_future_information"] is False
+    assert cfg["liquidity_screen_stricter_than_declared_information_set"] is False
+    cfg_prior = rv.summarize([], 10, 1, {"SPY": 0.0049}, "five-first", 0.25,
+                             "prior", "smile")["config"]
+    assert cfg_prior["liquidity_screen_stricter_than_declared_information_set"] is True
+    assert "liquidity_screen_is_look_ahead" not in cfg
+
+
+def test_liquidity_screen_prior_day_vs_same_day():
+    # The entry day trades 100 times; the session before it traded 5. Both
+    # screens are legal under the declared information set; "prior" is the
+    # stricter one, and this is the measured difference between them.
     _, contract = _put(96, 1.3481, n=100)
     contract["bars"][ENTRY - timedelta(days=1)]["n"] = 5
     assert rv.short_leg_is_liquid(contract, ENTRY, 30, "same-day") is True
     assert rv.short_leg_is_liquid(contract, ENTRY, 30, "prior") is False
-    # a strike with no prior session at all fails the knowable screen
+    # a strike with no prior session at all fails the stricter screen
     fresh = {"bars": {ENTRY: {"c": 1.0, "n": 500}}}
     assert rv.short_leg_is_liquid(fresh, ENTRY, 30, "prior") is False
     assert rv.short_leg_is_liquid(fresh, ENTRY, 30, "same-day") is True
@@ -410,8 +436,8 @@ def test_liquidity_screen_prior_day_vs_look_ahead_same_day():
 
 def test_select_vertical_honours_the_liquidity_lag():
     # Both strikes traded heavily on the entry day but barely the day before.
-    # The wing needs no liquidity, so the same-day (look-ahead) run qualifies
-    # while the knowable run has no eligible short leg at all.
+    # The wing needs no liquidity, so the same-day run qualifies while the
+    # stricter prior-session run has no eligible short leg at all.
     chain = _chain(_put(97, 1.6697), _put(92, 0.30))
     for k in (97.0, 92.0):
         chain[k]["bars"][ENTRY - timedelta(days=1)]["n"] = 3
@@ -513,6 +539,40 @@ def test_max_drawdown_r():
     # path: .15, -.85, -.70, -1.20 ; peak .15 -> trough -1.20 => dd 1.35
     assert rv.max_drawdown_r(entries) == pytest.approx(1.35)
     assert rv.max_drawdown_r([]) == 0.0
+
+
+def test_max_drawdown_r_orders_by_when_pnl_is_booked():
+    # finding 7: a drawdown is a property of when P&L is BOOKED. The middle
+    # trade here is opened second but held far longest, so it books last.
+    entries = [
+        {"entry_date": "2026-04-06", "exit_date": "2026-04-10",
+         "symbol": "SPY", "result_r": -1.0},
+        {"entry_date": "2026-04-20", "exit_date": "2026-05-29",
+         "symbol": "QQQ", "result_r": -1.0},   # opened 2nd, booked LAST
+        {"entry_date": "2026-05-04", "exit_date": "2026-05-08",
+         "symbol": "SPY", "result_r": +0.2},
+    ]
+    # booking order: -1.0, -0.8, -1.8 -> peak 0.0, trough -1.8 => dd 1.8
+    assert rv.max_drawdown_r(entries) == pytest.approx(1.8)
+    # entry order gives -1.0, -2.0, -1.8 => dd 2.0, the old, wrong answer
+    cum = peak = dd = 0.0
+    for e in sorted(entries, key=lambda x: (x["entry_date"], x["symbol"])):
+        cum += e["result_r"]
+        peak = max(peak, cum)
+        dd = max(dd, peak - cum)
+    assert dd == pytest.approx(2.0)
+    # deterministic when several trades book on the SAME day
+    tie = [
+        {"entry_date": "2026-04-06", "exit_date": "2026-04-30",
+         "symbol": "SPY", "result_r": -0.5},
+        {"entry_date": "2026-04-07", "exit_date": "2026-04-30",
+         "symbol": "QQQ", "result_r": +0.3},
+    ]
+    assert rv.max_drawdown_r(tie) == rv.max_drawdown_r(list(reversed(tie)))
+    # records without an exit_date fall back to entry_date and do not crash
+    assert rv.max_drawdown_r(
+        [{"entry_date": "2026-04-06", "symbol": "SPY", "result_r": -0.4}]
+    ) == pytest.approx(0.4)
 
 
 # -------------------------------------------------------------- CLI / e2e
@@ -720,21 +780,44 @@ def test_end_to_end_sensitivity_table_covers_every_convention(tmp_path):
     rows = summary["sensitivity"]["rows"]
     for m in rv.MARK_CONVENTIONS:
         assert f"mark-{m}" in rows
-    assert "liquidity-same-day" in rows       # the look-ahead variant
+    assert "liquidity-same-day" in rows       # the less-strict screen variant
     assert "width-any" in rows
     assert summary["sensitivity"]["primary"]["mark"] == "smile"
     assert rows["mark-close"]["mark"] == "close"
     assert "UPPER BOUND" in rows["mark-close"]["note"]
     assert "PRIMARY" in rows["mark-smile"]["note"]
     assert rows["liquidity-same-day"]["liquidity_lag"] == "same-day"
-    assert "LOOK-AHEAD" in rows["liquidity-same-day"]["note"]
+    # finding 2: the row is labelled by the declared information set, and no
+    # row may still call the same-day count look-ahead.
+    assert "LEGAL UNDER THE DECLARED INFORMATION SET" in rows[
+        "liquidity-same-day"]["note"]
+    assert not any("LOOK-AHEAD" in r["note"] for r in rows.values())
     # every row ships the entries file it was computed from
     for tag, row in rows.items():
         assert (out_dir / row["entries_file"]).exists()
         assert row["n_entries"] == 2
     # the smile run repriced bars off a fitted curve, and says how many
-    assert summary["mark_diagnostics"]["convention"] == "smile"
-    assert summary["mark_diagnostics"]["smile"]["days_fitted"] >= 1
+    md = summary["mark_diagnostics"]
+    assert md["convention"] == "smile"
+    assert md["smile"]["days_fitted"] >= 1
+    # finding 12: the kept-raw count is split by cause, and the two parts add
+    # back to the total. Only the fitted-day part can create a MIXED pair.
+    sm = md["smile"]
+    assert (sm["bars_kept_raw_on_unfittable_days"]
+            + sm["bars_kept_raw_on_fitted_days"]) == sm["bars_kept_raw"]
+    # and the no-mixed-pair claim is a published per-trade audit, not prose
+    rme = md["raw_mark_exposure"]
+    assert rme["n_marked_pair_days_mixed"] == 0
+    assert rme["no_mixed_pair_anywhere"] is True
+    assert rme["n_trades_with_a_mixed_pair_day"] == 0
+    assert 0 <= rme["n_trades_with_any_raw_marked_leg_day"] <= rme["n_trades"]
+    assert rme["n_marked_leg_days"] == 2 * rme["n_marked_pair_days"]
+    # a raw leg-day always shows up in one of the two pair buckets
+    assert (rme["n_marked_pair_days_both_raw"] * 2
+            + rme["n_marked_pair_days_mixed"]) == rme["n_marked_leg_days_raw"]
+    # non-smile rows carry no raw-mark audit (nothing was repriced)
+    assert rows["mark-close"]["raw_mark_exposure"] is None
+    assert rows["mark-smile"]["raw_mark_exposure"] is not None
 
 
 def test_records_persist_diagnostics_even_when_unqualified(tmp_path):
@@ -842,3 +925,202 @@ def test_credit_floor_sensitivity_is_exact_at_and_below_the_floor_used():
     assert sens["0.2"]["n_qualified"] == 2
     assert sens["0.1"]["n_qualified"] == 3
     assert sens["0.2"]["availability_rate"] == pytest.approx(2 / 3)
+
+
+# --------------------------------------------- credit floor on the boundary
+
+
+def test_credit_floor_accepts_a_credit_exactly_on_the_spec_boundary():
+    # finding 10: the credit is a DIFFERENCE of two decimal closes, so an
+    # entry that is exactly on the spec boundary need not compare equal to it.
+    # 8.20 - 6.95 is 1.2499999999999991, not 1.25 — this is the real
+    # 2026-01-02 QQQ 600/595 entry that the bare `>=` rejected.
+    assert 8.20 - 6.95 < 1.25                    # the defect, in one line
+    # Same defect on an in-band synthetic pair: 2.01 - 0.76 is
+    # 1.2499999999999998, i.e. credit/width 0.24999999999999997 on a $5 width.
+    assert 2.01 - 0.76 < 1.25
+    chain = _chain(_put(94, 2.01), _put(89, 0.76))
+    sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q, credit_floor_frac=0.25)
+    assert sel["qualified"] is True, sel["reason"]
+    assert (sel["short_strike"], sel["long_strike"], sel["width"]) == (
+        94.0, 89.0, 5.0)
+    assert sel["credit"] == pytest.approx(1.25)
+    assert sel["credit"] / sel["width"] == pytest.approx(0.25)
+    # a credit genuinely below the floor is still rejected: tolerance is 1e-9,
+    # not slack
+    below = rv.select_vertical(ENTRY, EXPIRY, S,
+                               _chain(_put(94, 2.01), _put(89, 0.77)), Q,
+                               credit_floor_frac=0.25)
+    assert (below["qualified"], below["reason"]) == (False, "credit-below-floor")
+    assert below["diag"]["best_credit_frac"] == pytest.approx(1.24 / 5.0)
+    assert rv.CREDIT_FLOOR_TOL == 1e-9
+
+
+def test_credit_floor_sensitivity_uses_the_same_tolerance_as_the_gate():
+    # finding 10: the projection must reproduce the gate's own count at the
+    # floor the run used, so it needs the identical tolerant compare.
+    records = [{"qualified": False, "data_adequate": True,
+                "best_credit_frac": (8.20 - 6.95) / 5.0}]
+    assert records[0]["best_credit_frac"] < 0.25          # 0.24999999999999983
+    sens = rv.credit_floor_sensitivity(records, 0.25, (0.25,))
+    assert sens["0.25"]["n_qualified"] == 1
+
+
+# ------------------------------ availability denominators (numerator hygiene)
+
+
+def test_availability_band_bracketed_numerator_matches_its_denominator():
+    # finding 1: qualified is NOT a subset of band-bracketed. The bracket test
+    # asks whether the fetched liquid invertible grid STRADDLES [0.20, 0.35];
+    # an entry can qualify on an in-band strike while the grid stops short of
+    # one edge. Dividing ALL qualified entries by the bracketed count is
+    # arithmetically invalid and here would exceed 1.
+    records = [
+        # qualified, and the grid brackets the band
+        {"qualified": True, "marks_present": True, "data_adequate": True,
+         "brackets_delta_band": True},
+        # qualified on an in-band strike whose grid does NOT bracket the band
+        {"qualified": True, "marks_present": True, "data_adequate": True,
+         "brackets_delta_band": False},
+        {"qualified": True, "marks_present": True, "data_adequate": True,
+         "brackets_delta_band": False},
+        # rejected, grid brackets the band -> a real gate rejection
+        {"qualified": False, "marks_present": True, "data_adequate": True,
+         "brackets_delta_band": True},
+        # a pure data gap
+        {"qualified": False, "marks_present": False, "data_adequate": False,
+         "brackets_delta_band": None},
+    ]
+    av = rv._availability(records)
+    assert (av["n_entries"], av["n_qualified"]) == (5, 3)
+    assert av["n_band_bracketed"] == 2
+    assert av["n_qualified_band_bracketed"] == 1
+    # the invalid arithmetic would have been 3/2 = 1.5
+    assert av["availability_rate_band_bracketed"] == pytest.approx(0.5)
+    assert av["availability_rate_band_bracketed"] <= 1.0
+    assert av["passes_floor_on_band_bracketed"] is False
+    # every published rate has its numerator inside its denominator
+    assert av["n_qualified"] <= av["n_data_adequate"] <= av["n_entries"]
+    assert av["n_qualified"] <= av["n_marks_present"]
+    assert av["n_qualified_band_bracketed"] <= av["n_band_bracketed"]
+
+
+def test_selection_diag_publishes_the_strike_grid_behind_the_delta_range():
+    # finding 5: "n invertible strikes" alone cannot be read — a band-not-
+    # fetched row needs how many rows were FETCHED and WHERE the surviving
+    # strikes were. Here 3 strikes are fetched, only 2 survive the n>=30
+    # screen, and none reaches the band.
+    chain = _chain(_put(70, 0.05), _put(75, 0.08), _put(80, 0.12, n=3))
+    sel = rv.select_vertical(ENTRY, EXPIRY, S, chain, Q)
+    diag = sel["diag"]
+    assert sel["reason"] == "band-not-fetched"
+    assert diag["n_contracts"] == 3
+    assert diag["n_entry_mark"] == 3
+    assert diag["n_liquid"] == 2
+    assert diag["n_iv_ok"] == 2
+    assert (diag["strike_min_fetched"], diag["strike_max_fetched"]) == (70.0, 80.0)
+    # the invertible grid is the SUBSET the delta range was measured on
+    assert (diag["strike_min_invertible"],
+            diag["strike_max_invertible"]) == (70.0, 75.0)
+    assert diag["delta_max"] < rv.DELTA_LO
+    assert diag["brackets_delta_band"] is False
+    # a chain with nothing invertible reports None, never a bogus range
+    empty = rv.select_vertical(ENTRY, EXPIRY, S, {}, Q)
+    assert empty["diag"]["strike_min_fetched"] is None
+    assert empty["diag"]["strike_min_invertible"] is None
+
+
+# ------------------------------------- raw-mark exposure under the smile mark
+
+
+def _stamped(days: dict[date, str]) -> dict:
+    """A contract whose bars carry apply_smile_repricing()'s provenance stamp.
+
+    days maps day -> "repriced" | "raw".
+    """
+    bars = {}
+    for d, kind in days.items():
+        bar = {"c": 1.0, "n": 100}
+        if kind == "raw":
+            bar["smile_kept_raw"] = True
+        else:
+            bar["smile_repriced"] = True
+        bars[d] = bar
+    return {"ticker": "O:SPY260619P00097000", "bars": bars}
+
+
+def test_raw_mark_exposure_detects_a_mixed_leg_pair():
+    # finding 12: the report's cross-leg-consistency claim must be PROVABLE
+    # from the artifact. A day on which one leg was curve-priced and the other
+    # kept its raw close is the only way that claim can break, so the audit
+    # has to detect it.
+    d1, d2 = ENTRY, ENTRY + timedelta(days=1)
+    puts = {97.0: _stamped({d1: "repriced", d2: "repriced"}),
+            92.0: _stamped({d1: "repriced", d2: "raw"})}   # <- mixed on d2
+    trade = {"entry_date": d1.isoformat(), "exit_date": d2.isoformat(),
+             "symbol": "SPY", "expiry": EXPIRY.isoformat(),
+             "short_strike": 97.0, "long_strike": 92.0}
+    out = rv.raw_mark_exposure([trade], {("SPY", EXPIRY): puts})
+    assert out["n_marked_pair_days"] == 2
+    assert out["n_marked_pair_days_mixed"] == 1
+    assert out["n_marked_pair_days_both_raw"] == 0
+    assert out["n_trades_with_a_mixed_pair_day"] == 1
+    assert out["n_trades_with_any_raw_marked_leg_day"] == 1
+    assert out["no_mixed_pair_anywhere"] is False
+    assert out["trades_with_mixed_pair"] == [{
+        "entry_date": d1.isoformat(), "symbol": "SPY",
+        "short_strike": 97.0, "long_strike": 92.0}]
+
+    # a day where BOTH legs kept raw is raw+raw: one convention, NOT mixed
+    both = {97.0: _stamped({d1: "repriced", d2: "raw"}),
+            92.0: _stamped({d1: "repriced", d2: "raw"})}
+    out2 = rv.raw_mark_exposure([trade], {("SPY", EXPIRY): both})
+    assert out2["n_marked_pair_days_mixed"] == 0
+    assert out2["n_marked_pair_days_both_raw"] == 1
+    assert out2["n_trades_with_a_mixed_pair_day"] == 0
+    assert out2["n_trades_with_any_raw_marked_leg_day"] == 1   # still flagged
+    assert out2["no_mixed_pair_anywhere"] is True
+
+    # a fully repriced trade is clean on both counters
+    clean = {97.0: _stamped({d1: "repriced", d2: "repriced"}),
+             92.0: _stamped({d1: "repriced", d2: "repriced"})}
+    out3 = rv.raw_mark_exposure([trade], {("SPY", EXPIRY): clean})
+    assert out3["n_trades_with_any_raw_marked_leg_day"] == 0
+    assert out3["n_marked_leg_days_raw"] == 0
+
+    # a missing chain is skipped, never a crash or a false clean bill
+    assert rv.raw_mark_exposure([trade], {})["n_marked_pair_days"] == 0
+
+
+def test_smile_repricing_stamps_provenance_and_splits_kept_raw_by_cause():
+    # finding 12: bars_kept_raw alone cannot distinguish "the whole day had no
+    # curve" (raw+raw, consistent) from "this strike extrapolated insanely"
+    # (the only mixed-pair source).
+    day = ENTRY
+    thin = day + timedelta(days=1)          # too few strikes to fit
+    closes = {day: S, thin: S}
+    puts = {}
+    raw = {}
+    for k, px in ((90.0, 0.30), (92.0, 0.45), (94.0, 0.70),
+                  (96.0, 1.10), (98.0, 1.75)):
+        raw[k] = px
+        puts[k] = {"ticker": f"O:SPY260619P{int(k * 1000):08d}",
+                   "bars": {day: {"c": px, "n": 100},
+                            thin: {"c": px, "n": 1}}}   # n=1 -> unfittable
+    stats = rv.apply_smile_repricing(puts, EXPIRY, Q, closes)
+    assert stats["days_fitted"] == 1
+    assert stats["days_unfittable"] == 1
+    # the thin day left all 5 strikes raw, and says so by cause
+    assert stats["bars_kept_raw_on_unfittable_days"] == 5
+    assert (stats["bars_kept_raw_on_unfittable_days"]
+            + stats["bars_kept_raw_on_fitted_days"]) == stats["bars_kept_raw"]
+    for k in puts:
+        assert puts[k]["bars"][thin]["smile_kept_raw"] is True
+        assert puts[k]["bars"][thin]["smile_kept_raw_cause"] == "day-unfittable"
+        # kept raw means kept RAW: the close is untouched, never fabricated
+        assert puts[k]["bars"][thin]["c"] == pytest.approx(raw[k])
+        assert "smile_repriced" not in puts[k]["bars"][thin]
+    # the fitted day's bars are stamped as repriced
+    assert sum(1 for k in puts
+               if puts[k]["bars"][day].get("smile_repriced")) == stats[
+                   "bars_repriced"]

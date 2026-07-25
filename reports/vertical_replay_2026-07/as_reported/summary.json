@@ -33,7 +33,10 @@
     "width_policy": "five-first",
     "mark_convention": "close",
     "liquidity_lag": "same-day",
-    "liquidity_screen_is_look_ahead": true,
+    "information_set": "enter-at-the-close",
+    "information_set_statement": "ENTER-AT-THE-CLOSE: the decision is taken on the completed entry-day daily bar and filled at that bar's close. Every field of that bar (close, high, low, vwap, full-day trade count n) is therefore inside the information set; no bar dated after the entry day feeds selection anywhere. The 'prior' liquidity screen is a stricter-than-required robustness choice, not a look-ahead fix; the 'same-day' screen is legal under this declared convention. A decide-BEFORE-the-close variant of the marks is not implemented and not measured.",
+    "liquidity_screen_uses_future_information": false,
+    "liquidity_screen_stricter_than_declared_information_set": false,
     "spread_pct_provenance": {
       "path": "/Users/joez/Desktop/trading-agent/data/execution_costs.json",
       "file_present": true,
@@ -81,6 +84,7 @@
   "approximation_notes": [
     "IV inverted from EUROPEAN Black-Scholes put (bisection) although SPY/QQQ options are American; acceptable for OTM short-dated index puts, biases IV/delta slightly.",
     "Daily close used as the mark (mid proxy); measured half-spread x 2 legs x 2 directions + $1 x 4 fees charged on top.",
+    "ONE information set: enter-at-the-close. The completed entry-day bar (close/high/low/vwap/n) is knowable; nothing dated after it feeds selection. The 'prior' liquidity screen is stricter than this requires, not a look-ahead fix. A decide-before-the-close variant of the MARKS is not implemented and not measured.",
     "Long wing requires only a bar on entry day (no n>=30 trade-count gate); the n>=30 gate applies to the short leg.",
     "Profit-take exits fill at exactly 0.5 x credit; friction for that exit is priced off the trigger day's leg closes.",
     "r = 0.043 fixed; continuous dividend yield q: SPY 0.012, QQQ 0.006.",
@@ -97,16 +101,16 @@
       "data_adequate": {
         "definition": "planned entries whose FETCHED strikes could construct at least one vertical",
         "n": 119,
-        "n_qualified": 44,
-        "rate": 0.3697478991596639,
+        "n_qualified": 45,
+        "rate": 0.37815126050420167,
         "floor": 0.6,
         "passes": false
       },
       "planned": {
         "definition": "every planned (entry_date, symbol) pair, data gaps charged against availability",
         "n": 144,
-        "n_qualified": 44,
-        "rate": 0.3055555555555556,
+        "n_qualified": 45,
+        "rate": 0.3125,
         "floor": 0.6,
         "passes": false
       }
@@ -114,47 +118,47 @@
     "overall_verdict": "CRITERION NOT EVALUATED AS SPECIFIED (no regime labels). The unconditional rate FAILS the 60% floor on both denominators."
   },
   "friction_comparison": {
-    "n_trades": 44,
+    "n_trades": 45,
     "replay_friction_r": {
-      "mean": 0.048632205280639655,
-      "median": 0.04726650045662101
+      "mean": 0.0484307903484773,
+      "median": 0.04687546666666667
     },
     "production_deployed_friction_r": {
-      "mean": 0.017622809519635657,
+      "mean": 0.017607487826606715,
       "median": 0.01761304347826087
     },
     "production_honest_leg_mark_friction_r": {
-      "mean": 0.0513605435441292,
-      "median": 0.053112805241215005
+      "mean": 0.0513001462801856,
+      "median": 0.0528082191780822
     },
     "replay_friction_dollars": {
-      "mean": 17.30755227272727,
-      "median": 16.7135
+      "mean": 17.252677777777777,
+      "median": 16.6806
     },
     "production_deployed_friction_dollars": {
-      "mean": 6.254327272727273,
-      "median": 6.443999999999998
+      "mean": 6.256453333333333,
+      "median": 6.4251999999999985
     },
     "production_honest_leg_mark_friction_dollars": {
-      "mean": 18.2527,
-      "median": 19.4818
+      "mean": 18.25244,
+      "median": 19.434800000000003
     },
     "ratio_replay_over_deployed": {
-      "mean": 2.7365251533994783,
+      "mean": 2.727640692422797,
       "min": 1.6302866716306776,
       "max": 5.559965287821813
     },
     "ratio_honest_over_deployed": {
-      "mean": 2.879783945884483,
-      "median": 3.018861970760029
+      "mean": 2.87962426764698,
+      "median": 3.005758575608542
     },
     "wing_ratio_long_over_short": {
-      "mean": 0.8485999535205422,
-      "median": 0.8536364109542187
+      "mean": 0.8485768651225246,
+      "median": 0.8532423208191127
     },
     "leg_mid_sum_over_net_credit": {
-      "mean": 12.641093240217407,
-      "median": 12.664699757028814
+      "mean": 12.629513390434795,
+      "median": 12.627906976744194
     },
     "deployed_model_assumes_leg_mid_sum_over_credit": 2.0,
     "deployed_model_exact_at_wing_ratio": 0.3333333333333333,
@@ -167,15 +171,18 @@
       "n_marks_present": 123,
       "n_data_adequate": 119,
       "n_band_bracketed": 63,
-      "n_qualified": 44,
+      "n_qualified": 45,
+      "n_qualified_band_bracketed": 23,
       "data_coverage_rate": 0.8263888888888888,
-      "availability_rate": 0.3697478991596639,
-      "availability_rate_planned": 0.3055555555555556,
-      "availability_rate_strict": 0.35772357723577236,
-      "availability_rate_band_bracketed": 0.6984126984126984,
+      "availability_rate": 0.37815126050420167,
+      "availability_rate_planned": 0.3125,
+      "availability_rate_strict": 0.36585365853658536,
+      "availability_rate_band_bracketed": 0.36507936507936506,
+      "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
       "passes_floor_on_data_adequate": false,
       "passes_floor_on_planned": false,
-      "rate": 0.3697478991596639
+      "passes_floor_on_band_bracketed": false,
+      "rate": 0.37815126050420167
     },
     "per_symbol": {
       "QQQ": {
@@ -183,15 +190,18 @@
         "n_marks_present": 67,
         "n_data_adequate": 65,
         "n_band_bracketed": 35,
-        "n_qualified": 29,
+        "n_qualified": 30,
+        "n_qualified_band_bracketed": 16,
         "data_coverage_rate": 0.9027777777777778,
-        "availability_rate": 0.4461538461538462,
-        "availability_rate_planned": 0.4027777777777778,
-        "availability_rate_strict": 0.43283582089552236,
-        "availability_rate_band_bracketed": 0.8285714285714286,
+        "availability_rate": 0.46153846153846156,
+        "availability_rate_planned": 0.4166666666666667,
+        "availability_rate_strict": 0.44776119402985076,
+        "availability_rate_band_bracketed": 0.45714285714285713,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": false,
         "passes_floor_on_planned": false,
-        "rate": 0.4461538461538462
+        "passes_floor_on_band_bracketed": false,
+        "rate": 0.46153846153846156
       },
       "SPY": {
         "n_entries": 72,
@@ -199,13 +209,16 @@
         "n_data_adequate": 54,
         "n_band_bracketed": 28,
         "n_qualified": 15,
+        "n_qualified_band_bracketed": 7,
         "data_coverage_rate": 0.75,
         "availability_rate": 0.2777777777777778,
         "availability_rate_planned": 0.20833333333333334,
         "availability_rate_strict": 0.26785714285714285,
-        "availability_rate_band_bracketed": 0.5357142857142857,
+        "availability_rate_band_bracketed": 0.25,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": false,
         "passes_floor_on_planned": false,
+        "passes_floor_on_band_bracketed": false,
         "rate": 0.2777777777777778
       }
     },
@@ -216,13 +229,16 @@
         "n_data_adequate": 16,
         "n_band_bracketed": 10,
         "n_qualified": 6,
+        "n_qualified_band_bracketed": 4,
         "data_coverage_rate": 1.0,
         "availability_rate": 0.375,
         "availability_rate_planned": 0.375,
         "availability_rate_strict": 0.375,
-        "availability_rate_band_bracketed": 0.6,
+        "availability_rate_band_bracketed": 0.4,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": false,
         "passes_floor_on_planned": false,
+        "passes_floor_on_band_bracketed": false,
         "rate": 0.375
       },
       "2025-11": {
@@ -231,13 +247,16 @@
         "n_data_adequate": 15,
         "n_band_bracketed": 9,
         "n_qualified": 8,
+        "n_qualified_band_bracketed": 5,
         "data_coverage_rate": 0.9375,
         "availability_rate": 0.5333333333333333,
         "availability_rate_planned": 0.5,
         "availability_rate_strict": 0.5333333333333333,
-        "availability_rate_band_bracketed": 0.8888888888888888,
+        "availability_rate_band_bracketed": 0.5555555555555556,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": false,
         "passes_floor_on_planned": false,
+        "passes_floor_on_band_bracketed": false,
         "rate": 0.5333333333333333
       },
       "2025-12": {
@@ -246,13 +265,16 @@
         "n_data_adequate": 13,
         "n_band_bracketed": 8,
         "n_qualified": 2,
+        "n_qualified_band_bracketed": 2,
         "data_coverage_rate": 0.7222222222222222,
         "availability_rate": 0.15384615384615385,
         "availability_rate_planned": 0.1111111111111111,
         "availability_rate_strict": 0.11764705882352941,
         "availability_rate_band_bracketed": 0.25,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": false,
         "passes_floor_on_planned": false,
+        "passes_floor_on_band_bracketed": false,
         "rate": 0.15384615384615385
       },
       "2026-01": {
@@ -260,15 +282,18 @@
         "n_marks_present": 15,
         "n_data_adequate": 15,
         "n_band_bracketed": 6,
-        "n_qualified": 1,
+        "n_qualified": 2,
+        "n_qualified_band_bracketed": 0,
         "data_coverage_rate": 0.8333333333333334,
-        "availability_rate": 0.06666666666666667,
-        "availability_rate_planned": 0.05555555555555555,
-        "availability_rate_strict": 0.06666666666666667,
-        "availability_rate_band_bracketed": 0.16666666666666666,
+        "availability_rate": 0.13333333333333333,
+        "availability_rate_planned": 0.1111111111111111,
+        "availability_rate_strict": 0.13333333333333333,
+        "availability_rate_band_bracketed": 0.0,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": false,
         "passes_floor_on_planned": false,
-        "rate": 0.06666666666666667
+        "passes_floor_on_band_bracketed": false,
+        "rate": 0.13333333333333333
       },
       "2026-02": {
         "n_entries": 16,
@@ -276,13 +301,16 @@
         "n_data_adequate": 16,
         "n_band_bracketed": 6,
         "n_qualified": 6,
+        "n_qualified_band_bracketed": 1,
         "data_coverage_rate": 1.0,
         "availability_rate": 0.375,
         "availability_rate_planned": 0.375,
         "availability_rate_strict": 0.375,
-        "availability_rate_band_bracketed": 1.0,
+        "availability_rate_band_bracketed": 0.16666666666666666,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": false,
         "passes_floor_on_planned": false,
+        "passes_floor_on_band_bracketed": false,
         "rate": 0.375
       },
       "2026-03": {
@@ -291,13 +319,16 @@
         "n_data_adequate": 16,
         "n_band_bracketed": 5,
         "n_qualified": 11,
+        "n_qualified_band_bracketed": 4,
         "data_coverage_rate": 0.8888888888888888,
         "availability_rate": 0.6875,
         "availability_rate_planned": 0.6111111111111112,
         "availability_rate_strict": 0.6875,
-        "availability_rate_band_bracketed": 2.2,
+        "availability_rate_band_bracketed": 0.8,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": true,
         "passes_floor_on_planned": true,
+        "passes_floor_on_band_bracketed": true,
         "rate": 0.6875
       },
       "2026-04": {
@@ -306,13 +337,16 @@
         "n_data_adequate": 16,
         "n_band_bracketed": 11,
         "n_qualified": 6,
+        "n_qualified_band_bracketed": 4,
         "data_coverage_rate": 0.8888888888888888,
         "availability_rate": 0.375,
         "availability_rate_planned": 0.3333333333333333,
         "availability_rate_strict": 0.375,
-        "availability_rate_band_bracketed": 0.5454545454545454,
+        "availability_rate_band_bracketed": 0.36363636363636365,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": false,
         "passes_floor_on_planned": false,
+        "passes_floor_on_band_bracketed": false,
         "rate": 0.375
       },
       "2026-05": {
@@ -321,13 +355,16 @@
         "n_data_adequate": 7,
         "n_band_bracketed": 3,
         "n_qualified": 1,
+        "n_qualified_band_bracketed": 0,
         "data_coverage_rate": 0.4375,
         "availability_rate": 0.14285714285714285,
         "availability_rate_planned": 0.0625,
         "availability_rate_strict": 0.14285714285714285,
-        "availability_rate_band_bracketed": 0.3333333333333333,
+        "availability_rate_band_bracketed": 0.0,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": false,
         "passes_floor_on_planned": false,
+        "passes_floor_on_band_bracketed": false,
         "rate": 0.14285714285714285
       },
       "2026-06": {
@@ -336,26 +373,29 @@
         "n_data_adequate": 5,
         "n_band_bracketed": 5,
         "n_qualified": 3,
+        "n_qualified_band_bracketed": 3,
         "data_coverage_rate": 0.625,
         "availability_rate": 0.6,
         "availability_rate_planned": 0.375,
         "availability_rate_strict": 0.6,
         "availability_rate_band_bracketed": 0.6,
+        "availability_rate_band_bracketed_definition": "n_qualified_band_bracketed / n_band_bracketed \u2014 numerator and denominator are the SAME population (qualified AND data_adequate AND brackets_delta_band)",
         "passes_floor_on_data_adequate": true,
         "passes_floor_on_planned": false,
+        "passes_floor_on_band_bracketed": true,
         "rate": 0.6
       }
     },
     "unqualified_reasons": {
       "band-not-fetched": 7,
-      "credit-below-floor": 71,
+      "credit-below-floor": 70,
       "no-contract-bars": 10,
       "no-contract-file": 11,
       "short-leg-illiquid": 1
     },
     "unqualified_reason_classes": {
       "data": 28,
-      "gate": 72
+      "gate": 71
     },
     "reason_classes": {
       "no-data": "data",
@@ -405,37 +445,37 @@
       },
       "0.25": {
         "n_data_adequate": 119,
-        "n_qualified": 44,
-        "availability_rate": 0.3697478991596639
+        "n_qualified": 45,
+        "availability_rate": 0.37815126050420167
       }
     }
   },
   "managed_payoff": {
-    "n_trades": 44,
-    "win_rate": 0.7727272727272727,
-    "mean_r": 0.05612948510974885,
-    "median_r": 0.14199048319484997,
-    "std_r": 0.22161820351448078,
-    "sum_r": 2.4696973448289494,
-    "net_pnl_dollars": 832.4676999999996,
-    "lb95_mean_r": -0.0277102793748154,
+    "n_trades": 45,
+    "win_rate": 0.7777777777777778,
+    "mean_r": 0.05566212173693961,
+    "median_r": 0.14124726775956284,
+    "std_r": 0.2191077722585412,
+    "sum_r": 2.5047954781622823,
+    "net_pnl_dollars": 845.6294999999994,
+    "lb95_mean_r": -0.026088844050459407,
     "lb95_mean_r_by_blocking": {
-      "entry-week": -0.0277102793748154,
-      "exposure-cluster": -0.017365082801366706
+      "entry-week": -0.026088844050459407,
+      "exposure-cluster": -0.01802708727436757
     },
     "n_blocks": {
-      "entry-week": 25,
-      "exposure-cluster": 12
+      "entry-week": 26,
+      "exposure-cluster": 13
     },
-    "max_drawdown_r": 2.3774186835553355,
+    "max_drawdown_r": 2.474755004060623,
     "per_symbol": {
       "QQQ": {
-        "n_trades": 29,
-        "win_rate": 0.8275862068965517,
-        "mean_r": 0.06367190115722209,
-        "median_r": 0.13727397260273966,
-        "sum_r": 1.8464851335594403,
-        "net_pnl_dollars": 650.4537999999998
+        "n_trades": 30,
+        "win_rate": 0.8333333333333334,
+        "mean_r": 0.0627194422297591,
+        "median_r": 0.13719896401724727,
+        "sum_r": 1.8815832668927732,
+        "net_pnl_dollars": 663.6155999999996
       },
       "SPY": {
         "n_trades": 15,
@@ -486,7 +526,7 @@
         2,
         1,
         2,
-        0,
+        1,
         28,
         6,
         0,
@@ -499,18 +539,18 @@
   "exit_degradation": {
     "counts": {
       "profit_take": 34,
-      "dte_21": 10,
+      "dte_21": 11,
       "data_end": 0
     },
     "fractions": {
-      "profit_take": 0.7727272727272727,
-      "dte_21": 0.22727272727272727,
+      "profit_take": 0.7555555555555555,
+      "dte_21": 0.24444444444444444,
       "data_end": 0.0
     },
     "n_data_end_flagged": 0,
     "mean_r_by_exit": {
       "profit_take": 0.16390194774237707,
-      "dte_21": -0.31029688784118714,
+      "dte_21": -0.2788973404616853,
       "data_end": null
     }
   },
@@ -520,7 +560,9 @@
       "days_fitted": 0,
       "days_unfittable": 0,
       "bars_repriced": 0,
-      "bars_kept_raw": 0
+      "bars_kept_raw": 0,
+      "bars_kept_raw_on_unfittable_days": 0,
+      "bars_kept_raw_on_fitted_days": 0
     }
   },
   "friction_under_calibration_file": {
@@ -529,47 +571,47 @@
       "QQQ": 0.07338
     },
     "note": "execution_costs.friction_r proxies each leg's mark by net_credit (leg-mid-sum = 2 x net_credit), exact only at wing ratio 1/3. Compare wing_ratio_long_over_short against 1/3: the deployed model's spread leg is off by exactly leg_mid_sum_over_net_credit / 2 (>1 = understated).",
-    "n_trades": 44,
+    "n_trades": 45,
     "replay_friction_r": {
-      "mean": 0.35824869539833243,
-      "median": 0.3039044595373819
+      "mean": 0.355538406759851,
+      "median": 0.3020223460410559
     },
     "production_deployed_friction_r": {
-      "mean": 0.07085940618920696,
+      "mean": 0.07060890086648383,
       "median": 0.06523999999999996
     },
     "production_honest_leg_mark_friction_r": {
-      "mean": 0.38244644477778844,
-      "median": 0.37830083117900515
+      "mean": 0.38077256526420783,
+      "median": 0.3781074594594595
     },
     "replay_friction_dollars": {
-      "mean": 127.51521727272726,
-      "median": 108.82332999999998
+      "mean": 126.65059333333335,
+      "median": 108.78663999999998
     },
     "production_deployed_friction_dollars": {
-      "mean": 25.05672454545454,
+      "mean": 24.996463999999996,
       "median": 23.812599999999993
     },
     "production_honest_leg_mark_friction_dollars": {
-      "mean": 135.77880590909092,
-      "median": 134.57971
+      "mean": 135.32084799999998,
+      "median": 134.54302
     },
     "ratio_replay_over_deployed": {
-      "mean": 5.144873529075,
+      "mean": 5.118663281684651,
       "min": 3.065703321057263,
       "max": 11.399962434195663
     },
     "ratio_honest_over_deployed": {
-      "mean": 5.455411030038134,
-      "median": 5.461336768642806
+      "mean": 5.448717552037884,
+      "median": 5.446363196911667
     },
     "wing_ratio_long_over_short": {
-      "mean": 0.8485999535205422,
-      "median": 0.8536364109542187
+      "mean": 0.8485768651225246,
+      "median": 0.8532423208191127
     },
     "leg_mid_sum_over_net_credit": {
-      "mean": 12.641093240217407,
-      "median": 12.664699757028814
+      "mean": 12.629513390434795,
+      "median": 12.627906976744194
     },
     "deployed_model_assumes_leg_mid_sum_over_credit": 2.0,
     "deployed_model_exact_at_wing_ratio": 0.3333333333333333

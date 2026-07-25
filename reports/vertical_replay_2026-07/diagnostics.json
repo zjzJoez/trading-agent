@@ -1,6 +1,6 @@
 {
-  "data_dir": "/private/tmp/claude-501/-Users-joez-Desktop-trading-agent--claude-worktrees-great-lehmann-18cf01/a53d296b-c285-4b43-8bc0-9ddddfac776b/scratchpad/replay_data",
-  "batch_plan": "/private/tmp/claude-501/-Users-joez-Desktop-trading-agent--claude-worktrees-great-lehmann-18cf01/a53d296b-c285-4b43-8bc0-9ddddfac776b/scratchpad/replay_data/batch_plan.json",
+  "data_dir": "reports/vertical_replay_2026-07/inputs",
+  "batch_plan": "reports/vertical_replay_2026-07/inputs/batch_plan.json",
   "spread_pct": {
     "SPY": 0.0049,
     "QQQ": 0.0094
@@ -9,7 +9,7 @@
     "as_reported_close_sameday": {
       "entries_file": "entries.jsonl",
       "n_records": 144,
-      "n_qualified": 44,
+      "n_qualified": 45,
       "mark_convention_of_entries": "close",
       "liquidity_lag_of_entries": "same-day",
       "null_study": {
@@ -34,26 +34,28 @@
           "min": -2.365044245558183,
           "max": 2.727228456198562
         },
-        "estimator_is_unbiased": true,
-        "credit_noise_sd_as_pct_of_5_wide_width": 5.188399522188055
+        "no_systematic_offset_between_conventions": true,
+        "what_is_not_identified": "Neither convention's OWN bias and neither convention's OWN variance. A bias common to both cancels in the difference, and no ground-truth mid exists in daily trade aggregates to compare either against. The sd below bounds the COMBINED noise of the two conventions (sqrt(var_raw + var_curve) if independent), so each one's own noise is at most that sd, not equal to it.",
+        "credit_noise_sd_as_pct_of_5_wide_width": 5.188399522188055,
+        "credit_noise_sd_interpretation": "the scale on which the two conventions disagree about the SAME spread, expressed as percentage points of a $5 width. It is the bar any claimed edge has to clear to be identifiable here."
       },
       "selection_bias": {
         "what": "the null statistic evaluated on the GATE-SELECTED entries. Negative = the booked credit is HIGHER than a same-day cross-leg-consistent estimate, i.e. the floor selected days whose raw print pair happened to be wide.",
         "selected": {
-          "n": 44,
-          "mean": -0.29464777070562453,
-          "median": -0.283493908178611,
-          "sd": 0.2410867685385896,
-          "p10": -0.5194205931192425,
-          "p90": -0.05024937368493718,
+          "n": 45,
+          "mean": -0.2877846833462457,
+          "median": -0.27921425162996005,
+          "sd": 0.24273739950965345,
+          "p10": -0.5135246920542993,
+          "p90": -0.04754548559860581,
           "min": -1.1171688010211982,
           "max": 0.09483369783180962
         },
-        "shift_vs_in_band_null_dollars": -0.29932187537684735,
-        "shift_as_pct_of_5_wide_width": -5.986437507536946,
-        "shift_in_in_band_null_sd": -1.229889618968738,
-        "shift_in_ungated_null_sd": -1.15381197649412,
-        "implied_measurement_bias_in_credit_r": 0.08417969601828551
+        "shift_vs_in_band_null_dollars": -0.2924587880174685,
+        "shift_as_pct_of_5_wide_width": -5.84917576034937,
+        "shift_in_in_band_null_sd": -1.201689742542237,
+        "shift_in_ungated_null_sd": -1.1273564680852972,
+        "implied_measurement_bias_in_credit_r": 0.08215487890940956
       },
       "exit_trigger_audit": {
         "what": "for every booked exit, the raw close-difference mark that triggered it vs the same-day cross-leg-consistent spread.",
@@ -71,12 +73,12 @@
           "max": 1.5616273465983195
         },
         "curve_minus_raw_on_21_dte_days": {
-          "n": 10,
-          "mean": 0.12642697684641516,
-          "median": 0.030428773402322307,
-          "sd": 0.4941543852940307,
-          "p10": -0.21559411623334324,
-          "p90": 0.5636014450189363,
+          "n": 11,
+          "mean": 0.09911976196549466,
+          "median": 0.015785072039086856,
+          "sd": 0.4774643700684583,
+          "p10": -0.18989737419441255,
+          "p90": 0.4750663625305318,
           "min": -0.4468647945837194,
           "max": 1.3604171874145798
         },
@@ -598,6 +600,23 @@
             "curve_above_pt_level": true
           },
           {
+            "entry_date": "2026-01-02",
+            "symbol": "QQQ",
+            "short_strike": 600.0,
+            "long_strike": 595.0,
+            "credit": 1.2499999999999991,
+            "exit_date": "2026-01-16",
+            "exit_reason": "dte_21",
+            "result_r": 0.035098133333333045,
+            "raw_exit_mark": 0.9700000000000002,
+            "curve_exit_mark": 0.7960476131562899,
+            "pt_level": 0.6249999999999996,
+            "spot_entry": 613.12,
+            "spot_exit": 621.26,
+            "underlying_move_pct": 1.327635699373686,
+            "curve_above_pt_level": true
+          },
+          {
             "entry_date": "2026-01-20",
             "symbol": "SPY",
             "short_strike": 665.0,
@@ -1077,6 +1096,138 @@
       },
       "survivorship": {
         "what": "realized vol of the entries EXCLUDED from the availability denominator vs those kept. If dropping is vol-correlated, the surviving sample is not a random subsample and the availability rate is biased.",
+        "n_records": 144,
+        "n_records_with_rv": 130,
+        "n_records_skipped_for_rv": 14,
+        "denominator_note": "this section compares 130 of 144 planned entries; 14 lack a trailing-20 and/or forward-10 realized-vol window (entries too close to either end of the underlying history) and are in NEITHER group. The group counts below sum to n_records_with_rv, not to n_records.",
+        "records_skipped_for_rv": [
+          {
+            "entry_date": "2025-10-06",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-06",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-09",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-09",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-13",
+            "symbol": "QQQ",
+            "qualified": true,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-13",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-16",
+            "symbol": "QQQ",
+            "qualified": true,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-16",
+            "symbol": "SPY",
+            "qualified": true,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-20",
+            "symbol": "QQQ",
+            "qualified": true,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-20",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-23",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-23",
+            "symbol": "SPY",
+            "qualified": true,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-27",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-27",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          }
+        ],
         "groups": {
           "dropped_not_data_adequate": {
             "trailing_rv20": {
@@ -1124,44 +1275,44 @@
           },
           "kept_and_qualified": {
             "trailing_rv20": {
-              "n": 39,
-              "mean": 0.172795543907608,
-              "median": 0.1742821149054181,
-              "sd": 0.03975965623875657,
-              "p10": 0.12148174796038695,
-              "p90": 0.2259681543421845,
+              "n": 40,
+              "mean": 0.17176659420202162,
+              "median": 0.1731429779875141,
+              "sd": 0.03978247924338134,
+              "p10": 0.12206568636779419,
+              "p90": 0.22595554678030835,
               "min": 0.08898512319358154,
               "max": 0.2680095286297353
             },
             "forward_rv10": {
-              "n": 39,
-              "mean": 0.1795294144778215,
-              "median": 0.16846393007233068,
-              "sd": 0.05831306087871565,
-              "p10": 0.1215759147590976,
-              "p90": 0.2530350132466338,
+              "n": 40,
+              "mean": 0.17763779996928875,
+              "median": 0.16635410669111295,
+              "sd": 0.05879074083822217,
+              "p10": 0.11738560899452363,
+              "p90": 0.2521382816032128,
               "min": 0.07028779118716466,
               "max": 0.3685958953334811
             }
           },
           "kept_and_gate_rejected": {
             "trailing_rv20": {
-              "n": 66,
-              "mean": 0.15141761545162521,
-              "median": 0.14230544840921444,
-              "sd": 0.03755812165308718,
-              "p10": 0.10632342829934624,
-              "p90": 0.20441571312428128,
+              "n": 65,
+              "mean": 0.15172192406343252,
+              "median": 0.1430103440725949,
+              "sd": 0.037768319774583434,
+              "p10": 0.10631772895024562,
+              "p90": 0.2048763608313799,
               "min": 0.08541690664186367,
               "max": 0.24328738119374896
             },
             "forward_rv10": {
-              "n": 66,
-              "mean": 0.14773548098723607,
-              "median": 0.14705140395076294,
-              "sd": 0.05663923028223466,
-              "p10": 0.09102879428232903,
-              "p90": 0.20960235026043172,
+              "n": 65,
+              "mean": 0.14841041401570873,
+              "median": 0.1473156034445088,
+              "sd": 0.0568119036064708,
+              "p10": 0.09087718881104552,
+              "p90": 0.2096301664350977,
               "min": 0.06623861687329587,
               "max": 0.4226279942282155
             }
@@ -1188,7 +1339,7 @@
             "reason": "credit-below-floor",
             "class": "gate",
             "data_adequate": true,
-            "n": 71
+            "n": 70
           },
           {
             "reason": "no-contract-bars",
@@ -1209,29 +1360,42 @@
             "n": 1
           }
         ],
-        "n_qualified": 44,
+        "n_qualified": 45,
+        "n_qualified_band_bracketed": 23,
         "denominators": {
           "planned": 144,
           "marks_present": 123,
           "data_adequate": 119,
           "data_adequate_and_band_bracketed": 63
         },
+        "numerators": {
+          "planned": 45,
+          "marks_present": 45,
+          "data_adequate": 45,
+          "data_adequate_and_band_bracketed": 23
+        },
         "availability_by_denominator": {
-          "planned": 0.3055555555555556,
-          "marks_present": 0.35772357723577236,
-          "data_adequate": 0.3697478991596639,
-          "data_adequate_and_band_bracketed": 0.6984126984126984
+          "planned": 0.3125,
+          "marks_present": 0.36585365853658536,
+          "data_adequate": 0.37815126050420167,
+          "data_adequate_and_band_bracketed": 0.36507936507936506
         },
         "passes_60pct_by_denominator": {
           "planned": false,
           "marks_present": false,
           "data_adequate": false,
+          "data_adequate_and_band_bracketed": false
+        },
+        "numerator_is_subset_of_denominator": {
+          "planned": true,
+          "marks_present": true,
+          "data_adequate": true,
           "data_adequate_and_band_bracketed": true
         },
         "gate_classified_entries_excluded_from_data_adequate": 0
       },
       "band_bracket_audit": {
-        "what": "every band-related rejection with the fetched grid's |delta| range. brackets_delta_band=False means the strikes that would have answered the question were never fetched.",
+        "what": "every band-related rejection with the fetched grid's strike range and |delta| range, the number of put rows FETCHED and the number that survived liquidity + invertibility. brackets_delta_band=False means the strikes that would have answered the question were never fetched.",
         "delta_band": [
           0.2,
           0.35
@@ -1247,7 +1411,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-01-30",
+            "n_contracts_fetched": 1,
+            "n_entry_day_marks": 1,
+            "n_liquid": 1,
             "n_liquid_invertible": 1,
+            "strike_min_fetched": 590.0,
+            "strike_max_fetched": 590.0,
+            "strike_min_invertible": 590.0,
+            "strike_max_invertible": 590.0,
             "delta_min": 0.1653767042570233,
             "delta_max": 0.1653767042570233,
             "brackets_delta_band": false
@@ -1259,7 +1430,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-01-30",
+            "n_contracts_fetched": 1,
+            "n_entry_day_marks": 1,
+            "n_liquid": 1,
             "n_liquid_invertible": 1,
+            "strike_min_fetched": 665.0,
+            "strike_max_fetched": 665.0,
+            "strike_min_invertible": 665.0,
+            "strike_max_invertible": 665.0,
             "delta_min": 0.18666986189697848,
             "delta_max": 0.18666986189697848,
             "brackets_delta_band": false
@@ -1271,7 +1449,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-01-30",
+            "n_contracts_fetched": 1,
+            "n_entry_day_marks": 1,
+            "n_liquid": 1,
             "n_liquid_invertible": 1,
+            "strike_min_fetched": 590.0,
+            "strike_max_fetched": 590.0,
+            "strike_min_invertible": 590.0,
+            "strike_max_invertible": 590.0,
             "delta_min": 0.1759504881885997,
             "delta_max": 0.1759504881885997,
             "brackets_delta_band": false
@@ -1283,7 +1468,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-01-30",
+            "n_contracts_fetched": 1,
+            "n_entry_day_marks": 1,
+            "n_liquid": 1,
             "n_liquid_invertible": 1,
+            "strike_min_fetched": 665.0,
+            "strike_max_fetched": 665.0,
+            "strike_min_invertible": 665.0,
+            "strike_max_invertible": 665.0,
             "delta_min": 0.19686198862130472,
             "delta_max": 0.19686198862130472,
             "brackets_delta_band": false
@@ -1295,7 +1487,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-02-27",
+            "n_contracts_fetched": 6,
+            "n_entry_day_marks": 6,
+            "n_liquid": 4,
             "n_liquid_invertible": 4,
+            "strike_min_fetched": 520.0,
+            "strike_max_fetched": 545.0,
+            "strike_min_invertible": 520.0,
+            "strike_max_invertible": 545.0,
             "delta_min": 0.06457115300734512,
             "delta_max": 0.11455449453674776,
             "brackets_delta_band": false
@@ -1307,7 +1506,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-02-27",
+            "n_contracts_fetched": 6,
+            "n_entry_day_marks": 6,
+            "n_liquid": 1,
             "n_liquid_invertible": 1,
+            "strike_min_fetched": 520.0,
+            "strike_max_fetched": 545.0,
+            "strike_min_invertible": 530.0,
+            "strike_max_invertible": 530.0,
             "delta_min": 0.031499056671253585,
             "delta_max": 0.031499056671253585,
             "brackets_delta_band": false
@@ -1319,7 +1525,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-06-12",
+            "n_contracts_fetched": 3,
+            "n_entry_day_marks": 3,
+            "n_liquid": 3,
             "n_liquid_invertible": 3,
+            "strike_min_fetched": 660.0,
+            "strike_max_fetched": 670.0,
+            "strike_min_invertible": 660.0,
+            "strike_max_invertible": 670.0,
             "delta_min": 0.1474489039770319,
             "delta_max": 0.1871977232755328,
             "brackets_delta_band": false
@@ -1327,10 +1540,11 @@
         ]
       },
       "blocking": {
-        "n_trades": 44,
+        "n_trades": 45,
         "entry_week": {
-          "n_blocks": 25,
+          "n_blocks": 26,
           "block_sizes": [
+            1,
             1,
             1,
             1,
@@ -1359,8 +1573,9 @@
           ]
         },
         "exposure_cluster": {
-          "n_blocks": 12,
+          "n_blocks": 13,
           "block_sizes": [
+            1,
             1,
             1,
             1,
@@ -1376,14 +1591,14 @@
           ]
         },
         "pairs_open_simultaneously_in_different_entry_weeks": 51,
-        "total_pairs": 946,
+        "total_pairs": 990,
         "holding_period_days": {
-          "n": 44,
-          "mean": 6.795454545454546,
-          "median": 5.5,
-          "sd": 4.526816970190728,
+          "n": 45,
+          "mean": 6.955555555555556,
+          "median": 6.0,
+          "sd": 4.602151451201707,
           "p10": 2.0,
-          "p90": 14.400000000000006,
+          "p90": 14.600000000000001,
           "min": 1.0,
           "max": 18.0
         },
@@ -1396,47 +1611,47 @@
         "trades_with_unwalkable_days": []
       },
       "friction": {
-        "n_trades": 44,
+        "n_trades": 45,
         "replay_friction_r": {
-          "mean": 0.048632205280639655,
-          "median": 0.04726650045662101
+          "mean": 0.0484307903484773,
+          "median": 0.04687546666666667
         },
         "production_deployed_friction_r": {
-          "mean": 0.017622809519635657,
+          "mean": 0.017607487826606715,
           "median": 0.01761304347826087
         },
         "production_honest_leg_mark_friction_r": {
-          "mean": 0.0513605435441292,
-          "median": 0.053112805241215005
+          "mean": 0.0513001462801856,
+          "median": 0.0528082191780822
         },
         "replay_friction_dollars": {
-          "mean": 17.30755227272727,
-          "median": 16.7135
+          "mean": 17.252677777777777,
+          "median": 16.6806
         },
         "production_deployed_friction_dollars": {
-          "mean": 6.254327272727273,
-          "median": 6.443999999999998
+          "mean": 6.256453333333333,
+          "median": 6.4251999999999985
         },
         "production_honest_leg_mark_friction_dollars": {
-          "mean": 18.2527,
-          "median": 19.4818
+          "mean": 18.25244,
+          "median": 19.434800000000003
         },
         "ratio_replay_over_deployed": {
-          "mean": 2.7365251533994783,
+          "mean": 2.727640692422797,
           "min": 1.6302866716306776,
           "max": 5.559965287821813
         },
         "ratio_honest_over_deployed": {
-          "mean": 2.879783945884483,
-          "median": 3.018861970760029
+          "mean": 2.87962426764698,
+          "median": 3.005758575608542
         },
         "wing_ratio_long_over_short": {
-          "mean": 0.8485999535205422,
-          "median": 0.8536364109542187
+          "mean": 0.8485768651225246,
+          "median": 0.8532423208191127
         },
         "leg_mid_sum_over_net_credit": {
-          "mean": 12.641093240217407,
-          "median": 12.664699757028814
+          "mean": 12.629513390434795,
+          "median": 12.627906976744194
         },
         "deployed_model_assumes_leg_mid_sum_over_credit": 2.0,
         "deployed_model_exact_at_wing_ratio": 0.3333333333333333,
@@ -1523,8 +1738,8 @@
             "median_iv": 0.20793582392185928
           },
           "2026-01": {
-            "n_trades": 1,
-            "median_iv": 0.18546150857089083
+            "n_trades": 2,
+            "median_iv": 0.19018539883932095
           },
           "2026-02": {
             "n_trades": 6,
@@ -1585,24 +1800,24 @@
         "interpretation": "if the spec floor sits ABOVE the median credit/width, low availability is a gate-design consequence, not a data artifact — and widening cannot help when the wider width's median is lower."
       },
       "payoff_attribution": {
-        "n_trades": 44,
-        "mean_r": 0.05612948510974885,
-        "median_r": 0.14199048319484997,
+        "n_trades": 45,
+        "mean_r": 0.05566212173693961,
+        "median_r": 0.14124726775956284,
         "min_r": -0.5693959420289852,
         "max_r": 0.29447100000000004,
         "n_losers": 10,
         "mean_r_of_losers": -0.31029688784118714,
         "mean_r_excluding_k_worst": {
           "1": {
-            "n_remaining": 43,
-            "mean_r": 0.07067658806646358,
+            "n_remaining": 44,
+            "mean_r": 0.0698679868225288,
             "dropped_r": [
               -0.5694
             ]
           },
           "5": {
-            "n_remaining": 39,
-            "mean_r": 0.12428502636882777,
+            "n_remaining": 40,
+            "mean_r": 0.1220553540429404,
             "dropped_r": [
               -0.5694,
               -0.5123,
@@ -1612,8 +1827,8 @@
             ]
           },
           "10": {
-            "n_remaining": 34,
-            "mean_r": 0.16390194774237704,
+            "n_remaining": 35,
+            "mean_r": 0.16022183875926152,
             "dropped_r": [
               -0.5694,
               -0.5123,
@@ -1632,30 +1847,30 @@
           "2025-10": {
             "n_in_month": 6,
             "mean_r_in_month": 0.1081015844071344,
-            "n_remaining": 38,
-            "mean_r_excluding_month": 0.04792336416805637,
+            "n_remaining": 39,
+            "mean_r_excluding_month": 0.04759451209537117,
             "unconditional_median_iv": 0.20725236090864058,
             "is_highest_iv_month": false
           },
           "2025-11": {
             "n_in_month": 8,
             "mean_r_in_month": 0.0781752806196356,
-            "n_remaining": 36,
-            "mean_r_excluding_month": 0.051230419440885105,
+            "n_remaining": 37,
+            "mean_r_excluding_month": 0.05079441170824856,
             "unconditional_median_iv": 0.23211672581871967,
             "is_highest_iv_month": false
           },
           "2025-12": {
             "n_in_month": 2,
             "mean_r_in_month": 0.16607567305330384,
-            "n_remaining": 42,
-            "mean_r_excluding_month": 0.05089395235053193,
+            "n_remaining": 43,
+            "mean_r_excluding_month": 0.050526607722224975,
             "unconditional_median_iv": 0.17364784348411483,
             "is_highest_iv_month": false
           },
           "2026-01": {
-            "n_in_month": 1,
-            "mean_r_in_month": 0.20049281524926685,
+            "n_in_month": 2,
+            "mean_r_in_month": 0.11779547429129994,
             "n_remaining": 43,
             "mean_r_excluding_month": 0.05277219836231819,
             "unconditional_median_iv": 0.19540250302217899,
@@ -1664,40 +1879,40 @@
           "2026-02": {
             "n_in_month": 6,
             "mean_r_in_month": 0.11178682240834398,
-            "n_remaining": 38,
-            "mean_r_excluding_month": 0.04734148448365487,
+            "n_remaining": 39,
+            "mean_r_excluding_month": 0.047027552402877384,
             "unconditional_median_iv": 0.22706642748601738,
             "is_highest_iv_month": false
           },
           "2026-03": {
             "n_in_month": 11,
             "mean_r_in_month": -0.12033498553010026,
-            "n_remaining": 33,
-            "mean_r_excluding_month": 0.11495097532303186,
+            "n_remaining": 34,
+            "mean_r_excluding_month": 0.11260236232333487,
             "unconditional_median_iv": 0.27547138324817655,
             "is_highest_iv_month": true
           },
           "2026-04": {
             "n_in_month": 6,
             "mean_r_in_month": 0.14957916817264102,
-            "n_remaining": 38,
-            "mean_r_excluding_month": 0.04137427199455533,
+            "n_remaining": 39,
+            "mean_r_excluding_month": 0.041213345362216304,
             "unconditional_median_iv": 0.22931115404879676,
             "is_highest_iv_month": false
           },
           "2026-05": {
             "n_in_month": 1,
             "mean_r_in_month": 0.13727397260273966,
-            "n_remaining": 43,
-            "mean_r_excluding_month": 0.05424240400526068,
+            "n_remaining": 44,
+            "mean_r_excluding_month": 0.05380730694453506,
             "unconditional_median_iv": 0.19037501232316717,
             "is_highest_iv_month": false
           },
           "2026-06": {
             "n_in_month": 3,
             "mean_r_in_month": 0.09375211893854551,
-            "n_remaining": 41,
-            "mean_r_excluding_month": 0.05337660946373933,
+            "n_remaining": 42,
+            "mean_r_excluding_month": 0.052941407651110606,
             "unconditional_median_iv": 0.26496623280420906,
             "is_highest_iv_month": false
           }
@@ -1736,8 +1951,10 @@
           "min": -2.365044245558183,
           "max": 2.727228456198562
         },
-        "estimator_is_unbiased": true,
-        "credit_noise_sd_as_pct_of_5_wide_width": 5.188399522188055
+        "no_systematic_offset_between_conventions": true,
+        "what_is_not_identified": "Neither convention's OWN bias and neither convention's OWN variance. A bias common to both cancels in the difference, and no ground-truth mid exists in daily trade aggregates to compare either against. The sd below bounds the COMBINED noise of the two conventions (sqrt(var_raw + var_curve) if independent), so each one's own noise is at most that sd, not equal to it.",
+        "credit_noise_sd_as_pct_of_5_wide_width": 5.188399522188055,
+        "credit_noise_sd_interpretation": "the scale on which the two conventions disagree about the SAME spread, expressed as percentage points of a $5 width. It is the bar any claimed edge has to clear to be identifiable here."
       },
       "selection_bias": {
         "what": "the null statistic evaluated on the GATE-SELECTED entries. Negative = the booked credit is HIGHER than a same-day cross-leg-consistent estimate, i.e. the floor selected days whose raw print pair happened to be wide.",
@@ -2232,6 +2449,138 @@
       },
       "survivorship": {
         "what": "realized vol of the entries EXCLUDED from the availability denominator vs those kept. If dropping is vol-correlated, the surviving sample is not a random subsample and the availability rate is biased.",
+        "n_records": 144,
+        "n_records_with_rv": 130,
+        "n_records_skipped_for_rv": 14,
+        "denominator_note": "this section compares 130 of 144 planned entries; 14 lack a trailing-20 and/or forward-10 realized-vol window (entries too close to either end of the underlying history) and are in NEITHER group. The group counts below sum to n_records_with_rv, not to n_records.",
+        "records_skipped_for_rv": [
+          {
+            "entry_date": "2025-10-06",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-06",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-09",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-09",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-13",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-13",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-16",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-16",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-20",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-20",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-23",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-23",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-27",
+            "symbol": "QQQ",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          },
+          {
+            "entry_date": "2025-10-27",
+            "symbol": "SPY",
+            "qualified": false,
+            "data_adequate": true,
+            "missing_windows": [
+              "trailing_rv20"
+            ]
+          }
+        ],
         "groups": {
           "dropped_not_data_adequate": {
             "trailing_rv20": {
@@ -2365,17 +2714,24 @@
           }
         ],
         "n_qualified": 26,
+        "n_qualified_band_bracketed": 8,
         "denominators": {
           "planned": 144,
           "marks_present": 123,
           "data_adequate": 119,
           "data_adequate_and_band_bracketed": 56
         },
+        "numerators": {
+          "planned": 26,
+          "marks_present": 26,
+          "data_adequate": 26,
+          "data_adequate_and_band_bracketed": 8
+        },
         "availability_by_denominator": {
           "planned": 0.18055555555555555,
           "marks_present": 0.21138211382113822,
           "data_adequate": 0.2184873949579832,
-          "data_adequate_and_band_bracketed": 0.4642857142857143
+          "data_adequate_and_band_bracketed": 0.14285714285714285
         },
         "passes_60pct_by_denominator": {
           "planned": false,
@@ -2383,10 +2739,16 @@
           "data_adequate": false,
           "data_adequate_and_band_bracketed": false
         },
+        "numerator_is_subset_of_denominator": {
+          "planned": true,
+          "marks_present": true,
+          "data_adequate": true,
+          "data_adequate_and_band_bracketed": true
+        },
         "gate_classified_entries_excluded_from_data_adequate": 0
       },
       "band_bracket_audit": {
-        "what": "every band-related rejection with the fetched grid's |delta| range. brackets_delta_band=False means the strikes that would have answered the question were never fetched.",
+        "what": "every band-related rejection with the fetched grid's strike range and |delta| range, the number of put rows FETCHED and the number that survived liquidity + invertibility. brackets_delta_band=False means the strikes that would have answered the question were never fetched.",
         "delta_band": [
           0.2,
           0.35
@@ -2402,7 +2764,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-01-30",
+            "n_contracts_fetched": 1,
+            "n_entry_day_marks": 1,
+            "n_liquid": 1,
             "n_liquid_invertible": 1,
+            "strike_min_fetched": 590.0,
+            "strike_max_fetched": 590.0,
+            "strike_min_invertible": 590.0,
+            "strike_max_invertible": 590.0,
             "delta_min": 0.1653767042570233,
             "delta_max": 0.1653767042570233,
             "brackets_delta_band": false
@@ -2414,7 +2783,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-01-30",
+            "n_contracts_fetched": 1,
+            "n_entry_day_marks": 1,
+            "n_liquid": 1,
             "n_liquid_invertible": 1,
+            "strike_min_fetched": 665.0,
+            "strike_max_fetched": 665.0,
+            "strike_min_invertible": 665.0,
+            "strike_max_invertible": 665.0,
             "delta_min": 0.18666986189697848,
             "delta_max": 0.18666986189697848,
             "brackets_delta_band": false
@@ -2426,7 +2802,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-01-30",
+            "n_contracts_fetched": 1,
+            "n_entry_day_marks": 1,
+            "n_liquid": 1,
             "n_liquid_invertible": 1,
+            "strike_min_fetched": 590.0,
+            "strike_max_fetched": 590.0,
+            "strike_min_invertible": 590.0,
+            "strike_max_invertible": 590.0,
             "delta_min": 0.1759504881885997,
             "delta_max": 0.1759504881885997,
             "brackets_delta_band": false
@@ -2438,7 +2821,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-01-30",
+            "n_contracts_fetched": 1,
+            "n_entry_day_marks": 1,
+            "n_liquid": 1,
             "n_liquid_invertible": 1,
+            "strike_min_fetched": 665.0,
+            "strike_max_fetched": 665.0,
+            "strike_min_invertible": 665.0,
+            "strike_max_invertible": 665.0,
             "delta_min": 0.19686198862130472,
             "delta_max": 0.19686198862130472,
             "brackets_delta_band": false
@@ -2450,7 +2840,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-02-27",
+            "n_contracts_fetched": 6,
+            "n_entry_day_marks": 6,
+            "n_liquid": 2,
             "n_liquid_invertible": 2,
+            "strike_min_fetched": 520.0,
+            "strike_max_fetched": 545.0,
+            "strike_min_invertible": 540.0,
+            "strike_max_invertible": 545.0,
             "delta_min": 0.03984347775362562,
             "delta_max": 0.045261748980111594,
             "brackets_delta_band": false
@@ -2462,7 +2859,14 @@
             "reason": "band-not-fetched",
             "reason_class": "data",
             "expiry": "2026-06-12",
+            "n_contracts_fetched": 3,
+            "n_entry_day_marks": 3,
+            "n_liquid": 3,
             "n_liquid_invertible": 3,
+            "strike_min_fetched": 660.0,
+            "strike_max_fetched": 670.0,
+            "strike_min_invertible": 660.0,
+            "strike_max_invertible": 670.0,
             "delta_min": 0.1474489039770319,
             "delta_max": 0.1871977232755328,
             "brackets_delta_band": false

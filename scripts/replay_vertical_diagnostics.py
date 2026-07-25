@@ -11,9 +11,10 @@ Sections, each keyed by the entries sample it was computed from:
   null_study            Over EVERY liquid 5-wide adjacent put pair on EVERY
                         day in EVERY fetched chain (no gate), compare the raw
                         close-difference credit to the same-day-curve-consistent
-                        value. If the ungated gap is ~0, the curve estimator is
-                        unbiased and its dispersion IS the credit noise of a
-                        daily trade-print aggregate.
+                        value. This is a DIFFERENCE of two conventions: a
+                        ~0 mean says there is no systematic offset BETWEEN
+                        them, and the sd BOUNDS their combined noise. Neither
+                        convention's own bias or own variance is identified.
   selection_bias        The same statistic on the GATE-SELECTED entries,
                         expressed in ungated-null sd units. A large negative
                         shift means the credit floor is selecting days whose
@@ -156,7 +157,26 @@ class Chains:
 
 
 def null_study(ch: Chains, min_trades: int = E.MIN_SHORT_TRADES) -> dict:
-    """Ungated distribution of (curve spread - raw close-difference)."""
+    """Ungated distribution of (curve spread - raw close-difference).
+
+    WHAT THIS IDENTIFIES, AND WHAT IT DOES NOT (finding 3). The statistic is a
+    DIFFERENCE between two conventions for the same quantity. Therefore:
+
+      * mean ~ 0 says there is NO SYSTEMATIC OFFSET BETWEEN the two
+        conventions. It does NOT say either one is unbiased: any bias common
+        to both cancels exactly in the difference, and neither convention is
+        compared here against a ground truth (a real quoted mid), because no
+        ground truth exists in this data source.
+      * sd is a bound on the COMBINED noise of the two conventions. If their
+        errors are independent it is sqrt(var_raw + var_curve), so each
+        convention's own noise is at most this sd and the raw close-difference
+        alone cannot be read off it.
+
+    Neither convention's own bias, and neither convention's own variance, is
+    identified by this study. What it does deliver is the scale on which the
+    two disagree — which is the number that matters, because the sleeve's
+    claimed edge has to be resolved against exactly that disagreement.
+    """
     gaps, gaps_in_band = [], []
     for path in sorted(ch.data_dir.glob("contracts_*.jsonl")):
         _, symbol, exp = path.stem.split("_")
@@ -208,14 +228,26 @@ def null_study(ch: Chains, min_trades: int = E.MIN_SHORT_TRADES) -> dict:
                  "chain. No gate applied."),
         "ungated": all_stats,
         "ungated_in_dte_and_delta_band": band_stats,
-        # "unbiased" = the mean gap is small next to its own dispersion (and,
-        # for a synthetic chain that already sits on one curve, small outright).
-        "estimator_is_unbiased": (
+        # finding 3: this is a DIFFERENCE of two conventions, so a near-zero
+        # mean identifies the absence of a systematic offset BETWEEN them —
+        # not the unbiasedness of either one. Named for what it tests.
+        "no_systematic_offset_between_conventions": (
             abs(all_stats.get("mean", 1.0))
             < max(0.1 * (all_stats.get("sd") or 0.0), 1e-6)),
+        "what_is_not_identified": (
+            "Neither convention's OWN bias and neither convention's OWN "
+            "variance. A bias common to both cancels in the difference, and "
+            "no ground-truth mid exists in daily trade aggregates to compare "
+            "either against. The sd below bounds the COMBINED noise of the "
+            "two conventions (sqrt(var_raw + var_curve) if independent), so "
+            "each one's own noise is at most that sd, not equal to it."),
         "credit_noise_sd_as_pct_of_5_wide_width": (
             None if all_stats.get("sd") is None
             else 100.0 * all_stats["sd"] / 5.0),
+        "credit_noise_sd_interpretation": (
+            "the scale on which the two conventions disagree about the SAME "
+            "spread, expressed as percentage points of a $5 width. It is the "
+            "bar any claimed edge has to clear to be identifiable here."),
     }
 
 
@@ -321,17 +353,39 @@ def exit_trigger_audit(ch: Chains, qualified: list[dict],
 
 
 def survivorship(ch: Chains, records: list[dict]) -> dict:
+    """Realized-vol comparison of dropped vs kept entries.
+
+    A record enters this test only if BOTH realized-vol windows exist for it —
+    trailing 20 sessions and forward 10 sessions. Entries near either end of
+    the underlying history therefore fall out, so the groups below do NOT sum
+    to len(records). The two counts are published
+    (n_records_with_rv / n_records_skipped_for_rv, finding 8) because a
+    silently shrinking denominator is exactly the kind of thing this section
+    exists to catch.
+    """
     groups: dict[str, dict[str, list[float]]] = {
         k: {"trailing": [], "forward": []} for k in
         ("dropped_not_data_adequate", "kept_data_adequate",
          "kept_and_qualified", "kept_and_gate_rejected")}
+    n_with_rv = 0
+    skipped: list[dict] = []
     for r in records:
         day = date.fromisoformat(r["entry_date"])
         sym = r["symbol"]
         trailing = ch.realized_vol(sym, day, 20, forward=False)
         forward = ch.realized_vol(sym, day, 10, forward=True)
         if trailing is None or forward is None:
+            skipped.append({
+                "entry_date": r["entry_date"], "symbol": sym,
+                "qualified": bool(r["qualified"]),
+                "data_adequate": bool(r.get("data_adequate")),
+                "missing_windows": [
+                    name for name, value in (("trailing_rv20", trailing),
+                                             ("forward_rv10", forward))
+                    if value is None],
+            })
             continue
+        n_with_rv += 1
         keys = (["kept_data_adequate"] if r.get("data_adequate")
                 else ["dropped_not_data_adequate"])
         if r.get("data_adequate"):
@@ -348,6 +402,17 @@ def survivorship(ch: Chains, records: list[dict]) -> dict:
                  "denominator vs those kept. If dropping is vol-correlated, "
                  "the surviving sample is not a random subsample and the "
                  "availability rate is biased."),
+        # finding 8: this test's OWN denominator, stated rather than implied.
+        "n_records": len(records),
+        "n_records_with_rv": n_with_rv,
+        "n_records_skipped_for_rv": len(skipped),
+        "denominator_note": (
+            f"this section compares {n_with_rv} of {len(records)} planned "
+            f"entries; {len(skipped)} lack a trailing-20 and/or forward-10 "
+            f"realized-vol window (entries too close to either end of the "
+            f"underlying history) and are in NEITHER group. The group counts "
+            f"below sum to n_records_with_rv, not to n_records."),
+        "records_skipped_for_rv": skipped,
         "groups": out,
         "welch_t_trailing_dropped_minus_kept": _welch_t(
             groups["dropped_not_data_adequate"]["trailing"],
@@ -360,6 +425,16 @@ def survivorship(ch: Chains, records: list[dict]) -> dict:
 
 
 def denominator_hygiene(records: list[dict]) -> dict:
+    """Availability under every candidate denominator, each with its OWN
+    numerator.
+
+    A rate is only meaningful when its numerator is a subset of its
+    denominator (finding 1). `qualified` implies marks_present and
+    data_adequate, so those three rates share the numerator n_qualified. It
+    does NOT imply brackets_delta_band — an entry can qualify on an in-band
+    strike whose grid never reached one of the band's two edges — so the
+    band-bracketed rate takes the numerator restricted to its own population.
+    """
     counts = Counter(
         (r["reason"], r.get("reason_class"), bool(r.get("data_adequate")))
         for r in records if not r["qualified"])
@@ -369,11 +444,17 @@ def denominator_hygiene(records: list[dict]) -> dict:
     n_q = sum(1 for r in records if r["qualified"])
     n_bracketed = sum(1 for r in records if r.get("data_adequate")
                       and r.get("brackets_delta_band"))
+    n_q_bracketed = sum(1 for r in records if r["qualified"]
+                        and r.get("data_adequate")
+                        and r.get("brackets_delta_band"))
     excluded_gate = sum(n for (_, klass, adeq), n in counts.items()
                         if klass == "gate" and not adeq)
-    denominators = {
-        "planned": n_all, "marks_present": n_marks,
-        "data_adequate": n_adequate, "data_adequate_and_band_bracketed": n_bracketed,
+    # (numerator, denominator) per population — never a global numerator.
+    populations = {
+        "planned": (n_q, n_all),
+        "marks_present": (n_q, n_marks),
+        "data_adequate": (n_q, n_adequate),
+        "data_adequate_and_band_bracketed": (n_q_bracketed, n_bracketed),
     }
     return {
         "reason_breakdown": [
@@ -381,12 +462,16 @@ def denominator_hygiene(records: list[dict]) -> dict:
             for (reason, klass, adeq), n in sorted(counts.items(),
                                                    key=lambda kv: str(kv[0]))],
         "n_qualified": n_q,
-        "denominators": denominators,
+        "n_qualified_band_bracketed": n_q_bracketed,
+        "denominators": {k: d for k, (_, d) in populations.items()},
+        "numerators": {k: nu for k, (nu, _) in populations.items()},
         "availability_by_denominator": {
-            k: (n_q / v if v else None) for k, v in denominators.items()},
+            k: (nu / d if d else None) for k, (nu, d) in populations.items()},
         "passes_60pct_by_denominator": {
-            k: (None if not v else (n_q / v) >= E.AVAILABILITY_FLOOR)
-            for k, v in denominators.items()},
+            k: (None if not d else (nu / d) >= E.AVAILABILITY_FLOOR)
+            for k, (nu, d) in populations.items()},
+        "numerator_is_subset_of_denominator": {
+            k: (nu <= d) for k, (nu, d) in populations.items()},
         "gate_classified_entries_excluded_from_data_adequate": excluded_gate,
     }
 
@@ -403,15 +488,29 @@ def band_bracket_audit(records: list[dict]) -> dict:
             "spot": r.get("spot"), "reason": r["reason"],
             "reason_class": r.get("reason_class"),
             "expiry": r.get("reason_expiry"),
+            # finding 5: a row is unreadable without BOTH counts and the
+            # strike grid. n_contracts is how many put rows were FETCHED;
+            # n_liquid_invertible is how many survived the n>=30 screen AND
+            # inverted to a sane IV. Quoting one as the other is the error
+            # this row set exists to prevent.
+            "n_contracts_fetched": diag.get("n_contracts"),
+            "n_entry_day_marks": diag.get("n_entry_mark"),
+            "n_liquid": diag.get("n_liquid"),
             "n_liquid_invertible": diag.get("n_iv_ok"),
+            "strike_min_fetched": diag.get("strike_min_fetched"),
+            "strike_max_fetched": diag.get("strike_max_fetched"),
+            "strike_min_invertible": diag.get("strike_min_invertible"),
+            "strike_max_invertible": diag.get("strike_max_invertible"),
             "delta_min": diag.get("delta_min"),
             "delta_max": diag.get("delta_max"),
             "brackets_delta_band": diag.get("brackets_delta_band"),
         })
     return {
-        "what": ("every band-related rejection with the fetched grid's "
-                 "|delta| range. brackets_delta_band=False means the strikes "
-                 "that would have answered the question were never fetched."),
+        "what": ("every band-related rejection with the fetched grid's strike "
+                 "range and |delta| range, the number of put rows FETCHED and "
+                 "the number that survived liquidity + invertibility. "
+                 "brackets_delta_band=False means the strikes that would have "
+                 "answered the question were never fetched."),
         "delta_band": [E.DELTA_LO, E.DELTA_HI],
         "n_rows": len(rows),
         "n_data_gaps_band_not_fetched": sum(

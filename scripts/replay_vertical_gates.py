@@ -43,6 +43,15 @@ never reported as a *gate* rejection:
   data_coverage_rate = |L2| / |all planned entries|
   availability_rate  = |qualified| / |L2|      <- the >=60% acceptance test
 
+INFORMATION SET (ONE, declared once, applied to every gate — see
+INFORMATION_SET below): ENTER-AT-THE-CLOSE. The decision is taken on the
+completed entry-day daily bar and filled at that bar's close, so every field
+of that bar — close, high, low, vwap and the full-day trade count n — is
+inside the information set, and no bar dated after the entry day feeds
+selection anywhere. The 'prior' liquidity screen is therefore a robustness
+choice (it also survives a decide-before-the-close reading), NOT a look-ahead
+fix; 'same-day' is legal under the declared convention.
+
 MODELING APPROXIMATIONS (also recorded in summary.json):
   * IV is inverted from a EUROPEAN Black-Scholes put on daily closes.
     SPY/QQQ options are American, but for OTM short-dated index puts the
@@ -94,12 +103,48 @@ SMILE_MIN_POINTS = 5        # strikes needed to fit a same-day curve
 SMILE_MIN_TRADES = 10       # per-strike trade count to enter the fit
 SMILE_IV_BOUNDS = (0.03, 2.0)
 
-# --- liquidity-screen timing (B7) ----------------------------------------
-# The n >= 30 trade-count screen on a DAILY bar is the FULL-DAY count. At the
-# moment of entry that number does not exist yet, so screening on it is
-# look-ahead. "prior" screens on the most recent session strictly before
-# entry (knowable); "same-day" is the original look-ahead rule, kept only so
-# the historical numbers stay reproducible as a disclosed sensitivity.
+# --- THE DECLARED INFORMATION SET (B7) -----------------------------------
+# ONE information set governs this whole engine, and every gate is judged
+# against it:
+#
+#   ENTER-AT-THE-CLOSE. The decision is taken once the entry day's daily bar
+#   is complete, and the fill is at that same bar's close.
+#
+# Consequences, applied consistently:
+#   * Entry-day leg closes as selection marks: LEGAL. A close-to-close model
+#     is a convention, not future information.
+#   * The entry day's own FULL-DAY trade count n: also LEGAL. It is part of
+#     the same completed bar as the closes the selection already reads. It is
+#     therefore WRONG to call the "same-day" screen look-ahead while pricing
+#     the trade off the same bar — that was the artifact's one self-
+#     contradiction, and this is where it is resolved.
+#   * Same-day full-day HIGH/LOW/VWAP (the hl2 and vw marks): LEGAL for the
+#     same reason.
+#   * What is NOT legal under any reading, and does not occur anywhere here:
+#     any bar dated after the entry day feeding the entry decision.
+#
+# So why is "prior" still the PRIMARY screen? Not as a look-ahead fix, but as
+# a ROBUSTNESS choice: it is the only variant that is also valid under the
+# stricter decide-before-the-close information set, under which the entry
+# day's own bar does not exist yet. Selecting on the prior session's trade
+# count costs one trade and buys validity under both readings. The cost of
+# the choice is measured and published (sensitivity row "liquidity-same-day").
+#
+# NOTE the asymmetry this leaves, stated rather than hidden: this engine does
+# NOT implement a decide-before-the-close variant of the MARKS. Under that
+# stricter information set the entry-day closes would be unknowable too, and
+# nothing in this replay would be legal. That variant is not measured here.
+INFORMATION_SET = "enter-at-the-close"
+INFORMATION_SET_STATEMENT = (
+    "ENTER-AT-THE-CLOSE: the decision is taken on the completed entry-day "
+    "daily bar and filled at that bar's close. Every field of that bar "
+    "(close, high, low, vwap, full-day trade count n) is therefore inside "
+    "the information set; no bar dated after the entry day feeds selection "
+    "anywhere. The 'prior' liquidity screen is a stricter-than-required "
+    "robustness choice, not a look-ahead fix; the 'same-day' screen is legal "
+    "under this declared convention. A decide-BEFORE-the-close variant of "
+    "the marks is not implemented and not measured."
+)
 LIQUIDITY_LAGS = ("prior", "same-day")
 PRIMARY_LIQUIDITY_LAG = "prior"
 
@@ -122,6 +167,13 @@ TARGET_DELTA = 0.5 * (DELTA_LO + DELTA_HI)            # deterministic tie-break
 WIDTHS = (5.0, 10.0)                                  # 5 preferred, 10 fallback
 CREDIT_FLOOR_FRAC = 0.25                              # credit >= width/4
 CREDIT_FLOOR_GRID = (0.10, 0.125, 0.15, 0.175, 0.20, 0.225, 0.25)
+# The credit is a DIFFERENCE of two decimal-quoted closes, so a spread that is
+# exactly on the spec boundary need not compare equal to it in binary. 8.20 -
+# 6.95 = 1.2499999999999991 on a $5 width -> credit/width 0.24999999999999983,
+# which a bare `>=` rejects while an identical 1.25 quoted directly passes.
+# One real entry (2026-01-02 QQQ 600/595) was rejected for exactly this, so
+# the gate and the credit-floor projection both compare with this tolerance.
+CREDIT_FLOOR_TOL = 1e-9
 MIN_SHORT_TRADES = 30                                 # bar n >= 30 on entry day
 DTE_RANGE = (30, 45)
 PT_FRAC = 0.5                                         # 50% profit take
@@ -139,6 +191,11 @@ APPROXIMATION_NOTES = [
     "puts, biases IV/delta slightly.",
     "Daily close used as the mark (mid proxy); measured half-spread x 2 "
     "legs x 2 directions + $1 x 4 fees charged on top.",
+    "ONE information set: enter-at-the-close. The completed entry-day bar "
+    "(close/high/low/vwap/n) is knowable; nothing dated after it feeds "
+    "selection. The 'prior' liquidity screen is stricter than this requires, "
+    "not a look-ahead fix. A decide-before-the-close variant of the MARKS is "
+    "not implemented and not measured.",
     "Long wing requires only a bar on entry day (no n>=30 trade-count "
     "gate); the n>=30 gate applies to the short leg.",
     "Profit-take exits fill at exactly 0.5 x credit; friction for that "
@@ -467,9 +524,29 @@ def apply_smile_repricing(puts: dict[float, dict], expiry: date, q: float,
     longer inherits the leg-vs-leg last-trade timing gap. Days with no
     fittable curve, and strikes the curve extrapolates to an insane IV, keep
     their raw close and are counted in the returned stats.
+
+    The kept-raw count is SPLIT by cause, because only one of the two can
+    break cross-leg consistency (finding 12):
+
+      bars_kept_raw_on_unfittable_days  the whole day had no curve, so EVERY
+                                        strike that day kept its raw close.
+                                        A pair drawn from such a day is
+                                        raw+raw — one convention, no mixing.
+      bars_kept_raw_on_fitted_days      a curve existed but THIS strike
+                                        extrapolated to an insane IV. This is
+                                        the ONLY way a curve-priced leg can
+                                        end up paired with a raw-priced leg,
+                                        so if this count is 0 no mixed pair
+                                        is possible anywhere in the run.
+
+    Every kept-raw bar is also stamped `smile_kept_raw=True` (and every
+    repriced bar `smile_repriced=True`) so a specific trade's marked days can
+    be audited after the fact — see raw_mark_exposure().
     """
     stats = {"days_fitted": 0, "days_unfittable": 0,
-             "bars_repriced": 0, "bars_kept_raw": 0}
+             "bars_repriced": 0, "bars_kept_raw": 0,
+             "bars_kept_raw_on_unfittable_days": 0,
+             "bars_kept_raw_on_fitted_days": 0}
     lo, hi = SMILE_IV_BOUNDS
     days: set[date] = set()
     for contract in puts.values():
@@ -480,8 +557,14 @@ def apply_smile_repricing(puts: dict[float, dict], expiry: date, q: float,
         coef = fit_iv_curve(puts, day, spot, t_years, q)
         if coef is None:
             stats["days_unfittable"] += 1
-            stats["bars_kept_raw"] += sum(1 for c in puts.values()
-                                          if day in c["bars"])
+            for contract in puts.values():
+                bar = contract["bars"].get(day)
+                if bar is None:
+                    continue
+                stats["bars_kept_raw"] += 1
+                stats["bars_kept_raw_on_unfittable_days"] += 1
+                contract["bars"][day] = {**bar, "smile_kept_raw": True,
+                                         "smile_kept_raw_cause": "day-unfittable"}
             continue
         stats["days_fitted"] += 1
         for strike, contract in puts.items():
@@ -494,12 +577,88 @@ def apply_smile_repricing(puts: dict[float, dict], expiry: date, q: float,
                   if lo < iv < hi else None)
             if px is None or px <= 0:
                 stats["bars_kept_raw"] += 1
+                stats["bars_kept_raw_on_fitted_days"] += 1
+                contract["bars"][day] = {
+                    **bar, "smile_kept_raw": True,
+                    "smile_kept_raw_cause": "strike-extrapolated-insane-iv"}
                 continue
             repriced = dict(bar)
             repriced["c"] = px
+            repriced["smile_repriced"] = True
             contract["bars"][day] = repriced
             stats["bars_repriced"] += 1
     return stats
+
+
+def raw_mark_exposure(qualified: list[dict],
+                      puts_by_key: dict[tuple[str, date], dict | None]) -> dict:
+    """Which booked trades touched a bar that kept its RAW close.
+
+    Makes the report's cross-leg-consistency claim provable from the artifact
+    instead of asserted (finding 12). For every qualified trade, walk the days
+    that actually produced a mark it used — the entry day and every day of the
+    managed walk up to and including the exit — and ask whether either leg's
+    bar on that day was left raw by apply_smile_repricing().
+
+    The distinction that matters is MIXED vs raw+raw:
+      n_trades_with_any_raw_marked_leg_day  any leg-day left raw at all
+      n_trades_with_a_mixed_pair_day        a day where ONE leg was repriced
+                                            and the other was left raw. This
+                                            is the only cross-leg-inconsistent
+                                            case; the claim is that it is 0.
+    """
+    out = {
+        "what": ("per-trade audit of whether a booked trade's marked leg-days "
+                 "used a raw (un-repriced) close, and whether any single day "
+                 "mixed a repriced leg with a raw one."),
+        "n_trades": len(qualified),
+        "n_trades_with_any_raw_marked_leg_day": 0,
+        "n_trades_with_a_mixed_pair_day": 0,
+        "n_marked_leg_days": 0,
+        "n_marked_leg_days_raw": 0,
+        "n_marked_pair_days": 0,
+        "n_marked_pair_days_both_raw": 0,
+        "n_marked_pair_days_mixed": 0,
+        "trades_with_raw": [],
+        "trades_with_mixed_pair": [],
+    }
+    for r in qualified:
+        expiry = date.fromisoformat(r["expiry"])
+        puts = puts_by_key.get((r["symbol"], expiry))
+        if not puts:
+            continue
+        short_c = puts.get(r["short_strike"])
+        long_c = puts.get(r["long_strike"])
+        if short_c is None or long_c is None:
+            continue
+        entry = date.fromisoformat(r["entry_date"])
+        exit_day = date.fromisoformat(r["exit_date"])
+        days = sorted(d for d in short_c["bars"]
+                      if d in long_c["bars"] and entry <= d <= exit_day)
+        any_raw = mixed = False
+        for d in days:
+            s_raw = bool(short_c["bars"][d].get("smile_kept_raw"))
+            l_raw = bool(long_c["bars"][d].get("smile_kept_raw"))
+            out["n_marked_leg_days"] += 2
+            out["n_marked_leg_days_raw"] += int(s_raw) + int(l_raw)
+            out["n_marked_pair_days"] += 1
+            if s_raw and l_raw:
+                out["n_marked_pair_days_both_raw"] += 1
+            elif s_raw or l_raw:
+                out["n_marked_pair_days_mixed"] += 1
+                mixed = True
+            any_raw = any_raw or s_raw or l_raw
+        key = {"entry_date": r["entry_date"], "symbol": r["symbol"],
+               "short_strike": r["short_strike"],
+               "long_strike": r["long_strike"]}
+        if any_raw:
+            out["n_trades_with_any_raw_marked_leg_day"] += 1
+            out["trades_with_raw"].append(key)
+        if mixed:
+            out["n_trades_with_a_mixed_pair_day"] += 1
+            out["trades_with_mixed_pair"].append(key)
+    out["no_mixed_pair_anywhere"] = out["n_marked_pair_days_mixed"] == 0
+    return out
 
 
 def load_batch_plan(path: Path) -> list[dict]:
@@ -544,13 +703,20 @@ def _prior_bar_day(contract: dict, entry_date: date) -> date | None:
 
 def short_leg_is_liquid(contract: dict, entry_date: date, min_trades: int,
                         lag: str = PRIMARY_LIQUIDITY_LAG) -> bool:
-    """The n >= min_trades liquidity screen, with an explicit information set.
+    """The n >= min_trades liquidity screen. See INFORMATION_SET above.
 
-    lag="prior"     screen the most recent session strictly BEFORE entry. Only
-                    this version is knowable at the moment of entry.
+    Both variants are legal under the declared enter-at-the-close information
+    set; they differ in how much they additionally survive.
+
+    lag="prior"     screen the most recent session strictly BEFORE entry.
+                    PRIMARY — stricter than the declared information set
+                    requires, and the only variant that is also valid if the
+                    decision were taken before the close.
     lag="same-day"  screen the entry day's own FULL-DAY trade count. This is
-                    LOOK-AHEAD (the count does not exist until the close) and
-                    is retained only as a disclosed sensitivity.
+                    part of the same completed bar whose close the selection
+                    already uses as its mark, so under the declared
+                    convention it is NOT look-ahead. Reported as a
+                    sensitivity so the cost of the stricter choice is visible.
     A contract with no prior session at all fails the "prior" screen: an
     untraded/newly-listed strike is exactly what the screen exists to reject.
     """
@@ -633,13 +799,22 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
             "liquidity_lag": liquidity_lag, "credit_floor_frac": credit_floor_frac,
             "mark_convention": _MARK_CONVENTION, "best_credit_frac": None,
             "best_credit_frac_by_width": {}, "delta_min": None,
-            "delta_max": None, "brackets_delta_band": None}
+            "delta_max": None, "brackets_delta_band": None,
+            # The STRIKE grid behind delta_min/delta_max (finding 5). Without
+            # it a band-not-fetched row cannot be read: "n invertible strikes"
+            # alone does not say where they were, and n_contracts (how many
+            # were FETCHED) is a different number from how many survived
+            # liquidity + invertibility.
+            "strike_min_fetched": (min(puts) if puts else None),
+            "strike_max_fetched": (max(puts) if puts else None),
+            "strike_min_invertible": None, "strike_max_invertible": None}
     diag["n_constructible"] = count_constructible(entry_date, puts)
     diag["n_constructible_by_width"] = {
         f"{w:g}": count_constructible(entry_date, puts, widths=(w,))
         for w in WIDTHS}
     in_band: list[dict] = []
     deltas: list[float] = []
+    invertible_strikes: list[float] = []
     for strike in sorted(puts):
         mark = _entry_mark(puts[strike], entry_date)
         if mark is None:
@@ -653,12 +828,16 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
         if iv is None:
             continue
         diag["n_iv_ok"] += 1
+        invertible_strikes.append(strike)
         delta = bs_put_delta(spot, strike, t_years, r, q, iv)
         deltas.append(abs(delta))
         if DELTA_LO <= abs(delta) <= DELTA_HI:
             diag["n_in_band"] += 1
             in_band.append({"strike": strike, "mark": mark, "iv": iv,
                             "delta": delta})
+    if invertible_strikes:
+        diag["strike_min_invertible"] = min(invertible_strikes)
+        diag["strike_max_invertible"] = max(invertible_strikes)
     if deltas:
         diag["delta_min"] = min(deltas)
         diag["delta_max"] = max(deltas)
@@ -714,7 +893,9 @@ def select_vertical(entry_date: date, expiry: date, spot: float,
             prev = diag["best_credit_frac_by_width"].get(key)
             if prev is None or frac > prev:
                 diag["best_credit_frac_by_width"][key] = frac
-            if credit >= width * credit_floor_frac:
+            # Tolerant compare: an exactly-on-the-boundary credit must not be
+            # rejected by float representation error (CREDIT_FLOOR_TOL).
+            if credit >= width * credit_floor_frac - CREDIT_FLOOR_TOL:
                 return {
                     "qualified": True, "reason": None, "diag": diag,
                     "short_strike": short_strike, "long_strike": long_strike,
@@ -1009,9 +1190,26 @@ def block_bootstrap_lb95_mean(entries: list[dict],
 
 
 def max_drawdown_r(entries: list[dict]) -> float:
-    """Max peak-to-trough drop of the cumulative result_r path, entries in
-    (entry_date, symbol) order. Positive number in R units; 0.0 if empty."""
-    ordered = sorted(entries, key=lambda e: (e["entry_date"], e["symbol"]))
+    """Max peak-to-trough drop of the cumulative result_r path.
+
+    ORDERING: (exit_date, entry_date, symbol). A drawdown is a property of
+    when P&L is BOOKED, not of when the position was opened — an equity curve
+    walked in entry order credits a trade's result before the days it was
+    actually still open, which both mis-times and mis-measures the trough.
+    Trades sharing an exit_date are ordered by (entry_date, symbol). That
+    secondary key is a CONVENTION, not a measurement: at daily granularity the
+    order in which same-day exits book is not observable, and it can move the
+    within-day path (hence, in principle, the trough) even though it cannot
+    move the day's net. The key is fixed so the number is reproducible, and
+    the choice is disclosed here rather than left implicit. An entry with no
+    exit_date falls back to its entry_date (only data_end/flat records lack
+    one).
+
+    Positive number in R units; 0.0 if empty.
+    """
+    ordered = sorted(entries, key=lambda e: (e.get("exit_date")
+                                             or e["entry_date"],
+                                             e["entry_date"], e["symbol"]))
     cum = peak = 0.0
     dd = 0.0
     for e in ordered:
@@ -1033,6 +1231,17 @@ def _availability(records: list[dict]) -> dict:
     availability_rate  = n_qualified / n_data_adequate   <- the >=60% test
     availability_rate_strict uses n_marks_present as the denominator, i.e.
     it charges wing-fetch gaps against the gate (conservative bound).
+
+    EVERY rate here is a fraction whose numerator is a SUBSET of its
+    denominator. That is not automatic: `qualified` implies marks_present and
+    data_adequate (the gate cannot fire without them), but it does NOT imply
+    brackets_delta_band — the bracket test asks whether the fetched liquid
+    invertible grid STRADDLES [0.20, 0.35], and an entry can qualify on an
+    in-band strike while the grid stops short of one of the two edges. The
+    band-bracketed rate therefore has its own numerator,
+    n_qualified_band_bracketed, restricted to the denominator's own
+    population. Dividing all qualified entries by the bracketed count is
+    arithmetically invalid and can exceed 1.
     """
     n = len(records)
     marks = sum(1 for r in records if r.get("marks_present"))
@@ -1040,25 +1249,39 @@ def _availability(records: list[dict]) -> dict:
     brack = sum(1 for r in records
                 if r.get("data_adequate") and r.get("brackets_delta_band"))
     q = sum(1 for r in records if r["qualified"])
+    q_brack = sum(1 for r in records
+                  if r["qualified"] and r.get("data_adequate")
+                  and r.get("brackets_delta_band"))
     floor = AVAILABILITY_FLOOR
     rate_adeq = (q / adeq) if adeq else None
     rate_plan = (q / n) if n else None
+    rate_brack = (q_brack / brack) if brack else None
     return {
         "n_entries": n,
         "n_marks_present": marks,
         "n_data_adequate": adeq,
         "n_band_bracketed": brack,
         "n_qualified": q,
+        # The band-bracketed rate's OWN numerator (finding 1): qualified AND
+        # data_adequate AND brackets_delta_band, i.e. the same population as
+        # n_band_bracketed. n_qualified is NOT a subset of n_band_bracketed.
+        "n_qualified_band_bracketed": q_brack,
         "data_coverage_rate": (adeq / n) if n else None,
         # BOTH denominators, side by side, each with its own verdict (finding 5).
         "availability_rate": rate_adeq,          # q / data-adequate
         "availability_rate_planned": rate_plan,  # q / all planned entry days
         "availability_rate_strict": (q / marks) if marks else None,
-        "availability_rate_band_bracketed": (q / brack) if brack else None,
+        "availability_rate_band_bracketed": rate_brack,
+        "availability_rate_band_bracketed_definition": (
+            "n_qualified_band_bracketed / n_band_bracketed — numerator and "
+            "denominator are the SAME population (qualified AND "
+            "data_adequate AND brackets_delta_band)"),
         "passes_floor_on_data_adequate": (None if rate_adeq is None
                                           else rate_adeq >= floor),
         "passes_floor_on_planned": (None if rate_plan is None
                                     else rate_plan >= floor),
+        "passes_floor_on_band_bracketed": (None if rate_brack is None
+                                           else rate_brack >= floor),
         "rate": rate_adeq,  # back-compat alias
     }
 
@@ -1074,6 +1297,9 @@ def credit_floor_sensitivity(records: list[dict],
     rejected entry's scan is exhaustive); the SELECTED strike/width — and
     therefore the payoff — can differ, so this projects availability only,
     never P&L.
+
+    Compares with CREDIT_FLOOR_TOL, identically to the gate itself, so the
+    projection at the floor the run used reproduces the run's own count.
     """
     adequate = [r for r in records if r.get("data_adequate")]
     out = {}
@@ -1083,7 +1309,7 @@ def credit_floor_sensitivity(records: list[dict],
         n_q = sum(1 for r in adequate
                   if r["qualified"]
                   or (r.get("best_credit_frac") is not None
-                      and r["best_credit_frac"] >= floor))
+                      and r["best_credit_frac"] >= floor - CREDIT_FLOOR_TOL))
         out[f"{floor:g}"] = {
             "n_data_adequate": len(adequate), "n_qualified": n_q,
             "availability_rate": (n_q / len(adequate)) if adequate else None,
@@ -1314,7 +1540,12 @@ def summarize(records: list[dict], resamples: int, seed: int,
             "width_policy": width_policy,
             "mark_convention": mark,
             "liquidity_lag": liquidity_lag,
-            "liquidity_screen_is_look_ahead": liquidity_lag == "same-day",
+            # ONE declared information set, applied to every gate (finding 2).
+            "information_set": INFORMATION_SET,
+            "information_set_statement": INFORMATION_SET_STATEMENT,
+            "liquidity_screen_uses_future_information": False,
+            "liquidity_screen_stricter_than_declared_information_set": (
+                liquidity_lag == "prior"),
         },
         "approximation_notes": APPROXIMATION_NOTES,
         "verdict": {
@@ -1461,7 +1692,9 @@ def replay_records(data_dir: Path, batch_plan: Path,
         file_diags: dict[str, dict] = {}
         mark_diag = {"convention": mark, "smile": {
             "days_fitted": 0, "days_unfittable": 0,
-            "bars_repriced": 0, "bars_kept_raw": 0}}
+            "bars_repriced": 0, "bars_kept_raw": 0,
+            "bars_kept_raw_on_unfittable_days": 0,
+            "bars_kept_raw_on_fitted_days": 0}}
         records: list[dict] = []
         for (entry_date, symbol), expiries in sorted(grouped.items()):
             if symbol not in closes_cache:
@@ -1484,6 +1717,11 @@ def replay_records(data_dir: Path, batch_plan: Path,
                 {e: puts_cache[(symbol, e)] for e in expiries},
                 spread_pct[symbol], DIV_YIELD.get(symbol, 0.0), width_policy,
                 credit_floor_frac, liquidity_lag))
+        if mark == "smile":
+            # Prove, per booked trade, that no leg pair mixed a curve-priced
+            # leg with a raw one (finding 12).
+            mark_diag["raw_mark_exposure"] = raw_mark_exposure(
+                [r for r in records if r["qualified"]], puts_cache)
         return records, file_diags, mark_diag
     finally:
         set_mark_convention(prev_mark)
@@ -1549,6 +1787,7 @@ def _sensitivity_table(data_dir: Path, batch_plan: Path, out_dir: Path,
         rows[tag] = {"mark": m, "liquidity_lag": lag, "width_policy": wp,
                      "note": note, "entries_file": f"sensitivity/entries_{tag}.jsonl",
                      "smile_diagnostics": mdiag["smile"] if m == "smile" else None,
+                     "raw_mark_exposure": mdiag.get("raw_mark_exposure"),
                      **_headline(recs, resamples, seed, spread_pct)}
 
     for m in MARK_CONVENTIONS:
@@ -1565,10 +1804,15 @@ def _sensitivity_table(data_dir: Path, batch_plan: Path, out_dir: Path,
         if lag == liquidity_lag:
             continue
         add(f"liquidity-{lag}", m=mark, lag=lag, wp=width_policy,
-            note=("LOOK-AHEAD: screens on the entry day's own full-day trade "
-                  "count, which does not exist until the close"
+            note=("LEGAL UNDER THE DECLARED INFORMATION SET (enter-at-the-"
+                  "close): screens the entry day's own full-day trade count, "
+                  "which belongs to the same completed bar the selection "
+                  "already marks off. Shown so the cost of the stricter "
+                  "'prior' primary is visible."
                   if lag == "same-day" else
-                  "screens the last session before entry (knowable at entry)"))
+                  "screens the last session before entry — stricter than the "
+                  "declared information set requires, and the only variant "
+                  "also valid under a decide-before-the-close reading"))
     for wp in ("five-first", "any"):
         if wp == width_policy:
             continue
@@ -1674,8 +1918,11 @@ def main(argv: list[str] | None = None) -> int:
                          "cross-leg-consistent one; close is an upper bound)")
     ap.add_argument("--liquidity-lag", choices=LIQUIDITY_LAGS,
                     default=PRIMARY_LIQUIDITY_LAG,
-                    help="information set for the n>=30 screen (default prior "
-                         "= knowable at entry; same-day is LOOK-AHEAD)")
+                    help="which session the n>=30 screen reads. Both are "
+                         "legal under the declared enter-at-the-close "
+                         "information set; 'prior' (default) is the stricter "
+                         "variant that also survives a decide-before-the-"
+                         "close reading")
     ap.add_argument("--symbols", default="SPY,QQQ",
                     help="symbols to resolve calibrated spreads for")
     ap.add_argument("--no-sensitivity", action="store_true",
