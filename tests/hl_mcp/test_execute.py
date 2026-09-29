@@ -12,6 +12,8 @@ from hyperliquid.utils.signing import (
 )
 
 from trading_agent.mcp_servers.hyperliquid import actions as A
+from trading_agent.mcp_servers.hyperliquid import guard
+from trading_agent.mcp_servers.hyperliquid import tools_account as AC
 from trading_agent.mcp_servers.hyperliquid import tools_funds as F
 from trading_agent.mcp_servers.hyperliquid import tools_trade as T
 from trading_agent.mcp_servers.hyperliquid.client import (
@@ -68,6 +70,7 @@ def test_global_dry_run_overrides_the_call(hl):
     ({"read_only": True}, "read-only"),
     ({"private_key": None}, "no signing key"),
     ({"network": "mainnet"}, "HL_ALLOW_MAINNET_WRITES"),
+    ({"network": "mainnet", "allow_mainnet_writes": True}, "disabled in code"),
 ])
 def test_each_gate_blocks_before_signing(hl, overrides, needle):
     hl.configure(**overrides)
@@ -82,7 +85,7 @@ def test_dry_run_still_reports_what_would_block(hl):
     hl.configure(write_modules=frozenset(), network="mainnet")
     out = T.leverage_update("BTC", 3, dry_run=True)
     assert out["status"] == "dry_run" and out["live_send_would_be_blocked"] is True
-    assert len(out["blocked_reasons"]) == 2
+    assert len(out["blocked_reasons"]) == 3  # module, code switch, env flag
 
 
 def test_live_l1_send_carries_a_signature_that_recovers_to_the_signer(hl):
@@ -95,7 +98,21 @@ def test_live_l1_send_carries_a_signature_that_recovers_to_the_signer(hl):
     assert signer.lower() == ME
 
 
-def test_mainnet_opt_in_signs_for_mainnet(hl):
+def test_mainnet_writes_are_off_in_code():
+    """README principle 9: real money is a reviewed code change, not a config
+    flip. Flipping the switch must also change this test, on purpose."""
+    assert guard.MAINNET_WRITES_ENABLED_IN_CODE is False
+
+
+def test_env_flags_alone_cannot_enable_mainnet(hl):
+    hl.configure(network="mainnet", allow_mainnet_writes=True)
+    out = T.leverage_update("BTC", 3)
+    assert out["status"] == "blocked" and hl.sent == []
+    assert AC.server_status()["live_writes_possible"] is False
+
+
+def test_mainnet_opt_in_signs_for_mainnet(hl, monkeypatch):
+    monkeypatch.setattr(guard, "MAINNET_WRITES_ENABLED_IN_CODE", True)
     hl.configure(network="mainnet", allow_mainnet_writes=True)
     T.leverage_update("BTC", 3)
     p = hl.sent[-1]

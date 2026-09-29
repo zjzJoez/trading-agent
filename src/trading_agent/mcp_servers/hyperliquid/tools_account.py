@@ -93,8 +93,7 @@ def server_status() -> dict:
         live_blockers.append("HL_READ_ONLY=true")
     if c.wallet is None:
         live_blockers.append("no HL_PRIVATE_KEY")
-    if s.is_mainnet and not s.allow_mainnet_writes:
-        live_blockers.append("mainnet without HL_ALLOW_MAINNET_WRITES=true")
+    live_blockers += guard.mainnet_write_blockers(s)
     if s.dry_run:
         live_blockers.append("HL_DRY_RUN=true (every write is a dry run)")
     try:
@@ -109,7 +108,8 @@ def server_status() -> dict:
         "account_address": c.account_address(),
         "default_vault_address": s.vault_address,
         "read_only": s.read_only, "dry_run": s.dry_run,
-        "mainnet_writes_allowed": s.allow_mainnet_writes if s.is_mainnet else None,
+        "mainnet_writes_allowed": (not guard.mainnet_write_blockers(s)) if s.is_mainnet else None,
+        "mainnet_writes_enabled_in_code": guard.MAINNET_WRITES_ENABLED_IN_CODE,
         "write_modules": {m: (m in s.write_modules) for m in WRITE_MODULES},
         "live_writes_possible": not live_blockers and bool(s.write_modules),
         "live_write_blockers": live_blockers,

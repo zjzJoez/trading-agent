@@ -6,7 +6,8 @@ Design invariants:
   environment variables read once at startup (settings.py). No tool takes
   them as parameters, so a prompt cannot move the server to mainnet, swap
   the key or lift a cap.
-- Testnet by default. Mainnet writes need HL_NETWORK=mainnet AND
+- Testnet by default. Mainnet writes need a reviewed code change
+  (guard.MAINNET_WRITES_ENABLED_IN_CODE = True) AND HL_NETWORK=mainnet AND
   HL_ALLOW_MAINNET_WRITES=true.
 - Reads (market data, any account's public state) never sign. Writes are
   grouped into modules — trade (on by default), transfer, withdraw, admin,
@@ -23,6 +24,7 @@ from __future__ import annotations
 import sys
 
 from trading_agent.mcp_servers.hyperliquid import (  # noqa: F401  (registers tools)
+    guard,
     tools_account,
     tools_admin,
     tools_funds,
@@ -39,7 +41,7 @@ def main() -> None:
     print(
         f"[hyperliquid-mcp] network={s.network} signer={c.signer_address or 'none'} "
         f"read_only={s.read_only} dry_run={s.dry_run} write_modules={writes} "
-        f"mainnet_writes={'allowed' if s.allow_mainnet_writes else 'blocked'}",
+        f"mainnet_writes={'blocked' if guard.mainnet_write_blockers(s) else 'allowed'}",
         file=sys.stderr,
     )
     mcp.run()

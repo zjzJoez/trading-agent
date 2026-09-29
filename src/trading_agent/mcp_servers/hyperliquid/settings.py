@@ -7,7 +7,8 @@ trd_env — so a prompt can never talk the server onto mainnet or past a cap.
 
 Defaults are the safe side of every switch:
   * HL_NETWORK defaults to testnet.
-  * Mainnet writes need BOTH HL_NETWORK=mainnet AND HL_ALLOW_MAINNET_WRITES=true.
+  * Mainnet writes need HL_NETWORK=mainnet AND HL_ALLOW_MAINNET_WRITES=true AND
+    a reviewed code change (guard.MAINNET_WRITES_ENABLED_IN_CODE; README principle 9).
   * Only the `trade` write module is on by default; moving funds
     (`transfer`), sending them to another address (`withdraw`), account
     administration (`admin`) and raw signed actions (`advanced`) are opt-in.

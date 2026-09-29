@@ -433,7 +433,7 @@ The full deployment recipe — including the iOS killswitch, Cloudflare Tunnel f
 | `tests/learning/` | 31 | Param bounds · resolver fallback · shadow counterfactuals · composite scoring · canary math |
 | `tests/llm/` | 27 | OAuth subprocess invocation · schema retry · weekly budget · degrade path |
 | `tests/graph/` | 36 | Subgraph compilation · every Phase 2.5+ node behavioral test |
-| `tests/hl_mcp/` | 132 (+58 live) | hyperliquid-mcp · SDK byte-equivalence · every write gate · review regressions · testnet signature oracle (`-m integration`) |
+| `tests/hl_mcp/` | 135 (+58 live) | hyperliquid-mcp · SDK byte-equivalence · every write gate · review regressions · testnet signature oracle (`-m integration`) |
 
 ---
 
@@ -449,7 +449,7 @@ The full deployment recipe — including the iOS killswitch, Cloudflare Tunnel f
 It is **not** part of the paper-trading loop above. It defaults to Hyperliquid **testnet**:
 - Only the `trade` write module is on.
 - Opening orders are capped at $1,000 notional each, $10,000 per day, and 10x leverage.
-- Mainnet writes need both `HL_NETWORK=mainnet` and `HL_ALLOW_MAINNET_WRITES=true`.
+- Mainnet writes need a reviewed code change (`MAINNET_WRITES_ENABLED_IN_CODE` in `guard.py`, per principle 9) plus `HL_NETWORK=mainnet` and `HL_ALLOW_MAINNET_WRITES=true`.
 - Sending funds or control to any other address needs an explicit address allowlist.
 
 Configuration, safety model and the full tool list: [`docs/hyperliquid_mcp.md`](docs/hyperliquid_mcp.md).

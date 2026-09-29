@@ -10,12 +10,12 @@ Source: `src/trading_agent/mcp_servers/hyperliquid/`. Tests: `tests/hl_mcp/`.
 
 ## Safety model
 
-**This repo is paper-only by design, and this server is the one exception.** It can sign real mainnet transactions if you set two flags. Everything defaults to the safe side, and nothing a prompt says can change these settings:
+**This repo is paper-only by design, and this server is the one exception.** Signing real mainnet transactions takes a reviewed code change plus two settings (README principle 9: real money is a code edit, not a config flip). Everything defaults to the safe side, and nothing a prompt says can change these settings:
 
 | Layer | Default | To loosen |
 |---|---|---|
 | Network | testnet | `HL_NETWORK=mainnet` |
-| Mainnet writes | refused | also `HL_ALLOW_MAINNET_WRITES=true` |
+| Mainnet writes | refused | a reviewed commit setting `MAINNET_WRITES_ENABLED_IN_CODE = True` in `guard.py` (a test pins it to `False`, so that test changes too), **and** `HL_ALLOW_MAINNET_WRITES=true` |
 | Signing | none (read-only) | `HL_PRIVATE_KEY` (use an API-wallet key) |
 | Write modules | `trade` only | `HL_WRITE_MODULES=trade,transfer,withdraw,admin,advanced` |
 | Funds or control to another address | refused | the tool's module **and** the address in `HL_WITHDRAW_ALLOWLIST` |
@@ -182,7 +182,7 @@ Read-only tools never sign anything. Write tools are grouped by module. All writ
   - 57 signed-action checks, covering every action type the server can send, all recovered to our wallet. That includes the ones the Python SDK does not implement: TWAP, borrow/lend, cDeposit/cWithdraw, userOutcome, portfolio margin, staking links, vault create/modify/distribute, sendToEvmWithData, agentSendAsset, batchModify with `always_place`, and whole-position TP/SL.
   - Their field order follows the [nktkas TypeScript SDK](https://github.com/nktkas/hyperliquid) schemas.
 - **Live reads.** Every read tool was run against mainnet.
-- **Guards** (`tests/hl_mcp/test_execute.py`, `test_tools.py`). Each gate and each tool's refusal paths are tested against a fake API. None of the 132 unit tests touches the network.
+- **Guards** (`tests/hl_mcp/test_execute.py`, `test_tools.py`). Each gate and each tool's refusal paths are tested against a fake API. None of the 135 unit tests touches the network.
 - **Adversarial review** (`tests/hl_mcp/test_review_fixes.py`). A separate review tried to get past every guard and to make exits fail. Each confirmed finding is fixed and has a regression test. Examples: `reduce_only` on a spot buy skipping the caps, a low sell limit valued below where it fills, and a market stop-loss whose limit equalled its trigger, so it could miss in a gap.
 
 ## Known limits

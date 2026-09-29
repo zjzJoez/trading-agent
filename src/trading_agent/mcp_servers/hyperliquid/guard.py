@@ -1,7 +1,7 @@
 """Deterministic write gates + audit log for hyperliquid-mcp.
 
 Every signed action passes `write_block_reasons` (module switch, read-only,
-key present, key type, mainnet opt-in). Orders additionally pass
+key present, key type, mainnet: code switch + env opt-in). Orders additionally pass
 `order_block_reasons` (coin allowlist, per-order notional cap, slippage cap),
 `price_band_reasons` (no limit priced through the market by more than
 HL_MAX_SLIPPAGE), `daily_budget_reasons` (HL_MAX_DAILY_NOTIONAL_USD) and a
@@ -26,6 +26,28 @@ from typing import Any
 from trading_agent.mcp_servers.hyperliquid.settings import Settings
 from trading_agent.mcp_servers.hyperliquid.universe import Instrument
 
+# README design principle 9: graduating to real money takes a code edit and
+# review, not a config flip. Mainnet writes need this set to True in a
+# reviewed commit, AND HL_NETWORK=mainnet, AND HL_ALLOW_MAINNET_WRITES=true.
+# tests/hl_mcp/test_execute.py pins it to False, so flipping it also means
+# editing that test on purpose.
+MAINNET_WRITES_ENABLED_IN_CODE = False
+
+
+def mainnet_write_blockers(settings: Settings) -> list[str]:
+    """Why mainnet writes are off ([] on testnet or when fully enabled)."""
+    if not settings.is_mainnet:
+        return []
+    out = []
+    if not MAINNET_WRITES_ENABLED_IN_CODE:
+        out.append("mainnet writes are disabled in code "
+                   "(guard.MAINNET_WRITES_ENABLED_IN_CODE = False); enabling them is a "
+                   "reviewed code change, not a setting")
+    if not settings.allow_mainnet_writes:
+        out.append("mainnet writes are disabled; HL_ALLOW_MAINNET_WRITES=true is also required")
+    return out
+
+
 MODULE_HINTS = {
     "trade": "orders, cancels, TWAP, leverage and margin",
     "transfer": "moving funds between your own balances, sub-accounts, vaults, staking, "
@@ -49,10 +71,7 @@ def write_block_reasons(settings: Settings, module: str, *, has_signer: bool,
         reasons.append("server is read-only (HL_READ_ONLY=true)")
     if not has_signer:
         reasons.append("no signing key configured (HL_PRIVATE_KEY)")
-    if settings.is_mainnet and not settings.allow_mainnet_writes:
-        reasons.append(
-            "mainnet writes are disabled; set HL_ALLOW_MAINNET_WRITES=true to trade real funds"
-        )
+    reasons += mainnet_write_blockers(settings)
     if needs_owner_key and signer_is_agent:
         reasons.append(
             "this action must be signed by the account owner's key; the configured key is an "
