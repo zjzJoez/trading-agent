@@ -37,6 +37,11 @@ dependencies = [
     # free source that bulk-downloads 19 tickers × 8y daily in <5s; moomoo
     # OpenD hangs on multi-year historical kline requests.
     "yfinance>=0.2.0",
+    # hyperliquid-mcp — official Hyperliquid SDK (signing, wire formats, info
+    # API). Capped below 0.25: the server builds actions itself and signs them
+    # with the SDK's signing helpers, so a signing-layer change must be
+    # re-verified (tests/test_hyperliquid_mcp.py pins the SDK equivalence).
+    "hyperliquid-python-sdk>=0.24.0,<0.25",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +55,7 @@ dev = [
 moomoo-mcp = "trading_agent.mcp_servers.moomoo.server:main"
 edgar-mcp = "trading_agent.mcp_servers.edgar.server:main"
 journal-mcp = "trading_agent.mcp_servers.journal.server:main"
+hyperliquid-mcp = "trading_agent.mcp_servers.hyperliquid.server:main"
 ta-migrate = "trading_agent.db:migrate_cli"
 ta-pg-migrate = "trading_agent.store.postgres:migrate_cli"
 ta-brain = "trading_agent.orchestrator:main"

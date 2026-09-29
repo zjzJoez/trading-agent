@@ -327,7 +327,7 @@ trading-agent/
 │   ├── risk/                      portfolio aggregates + tiered guardrails + LLM council
 │   ├── learning/                  params · shadow · canary · promote · replay · soak
 │   ├── llm/                       OAuth subprocess router · 21 Pydantic schemas · weekly budget
-│   ├── mcp_servers/{moomoo,edgar,journal}/   stdio MCP servers
+│   ├── mcp_servers/{moomoo,edgar,journal,hyperliquid}/   stdio MCP servers
 │   ├── hooks/                     reject_real_env · pretool_order_guard · posttool_fill_capture
 │   └── notify/                    ntfy.sh + Discord mirror + filesystem fallback
 ├── migrations/                    schema + idempotent re-run
@@ -433,6 +433,26 @@ The full deployment recipe — including the iOS killswitch, Cloudflare Tunnel f
 | `tests/learning/` | 31 | Param bounds · resolver fallback · shadow counterfactuals · composite scoring · canary math |
 | `tests/llm/` | 27 | OAuth subprocess invocation · schema retry · weekly budget · degrade path |
 | `tests/graph/` | 36 | Subgraph compilation · every Phase 2.5+ node behavioral test |
+| `tests/hl_mcp/` | 104 (+57 live) | hyperliquid-mcp · SDK byte-equivalence · every write gate · testnet signature oracle (`-m integration`) |
+
+---
+
+## Hyperliquid MCP (optional)
+
+`hyperliquid-mcp` exposes the whole Hyperliquid API (102 tools) to an agent. It is built on the official `hyperliquid-python-sdk` and covers:
+- market data, including HIP-3 perps and HIP-4 outcomes;
+- any account's state;
+- trading: orders, TP/SL, TWAP, leverage;
+- fund movements, staking, vaults, borrow/lend;
+- account administration.
+
+It is **not** part of the paper-trading loop above. It defaults to Hyperliquid **testnet**:
+- Only the `trade` write module is on.
+- Opening orders are capped at $1,000 notional and 10x leverage.
+- Mainnet writes need both `HL_NETWORK=mainnet` and `HL_ALLOW_MAINNET_WRITES=true`.
+- Sending funds anywhere else needs an explicit address allowlist.
+
+Configuration, safety model and the full tool list: [`docs/hyperliquid_mcp.md`](docs/hyperliquid_mcp.md).
 
 ---
 

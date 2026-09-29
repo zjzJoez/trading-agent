@@ -15,6 +15,11 @@
       "command": "__PROJECT_DIR__/.venv/bin/journal-mcp",
       "args": [],
       "env": {}
+    },
+    "hyperliquid-mcp": {
+      "command": "__PROJECT_DIR__/.venv/bin/hyperliquid-mcp",
+      "args": [],
+      "env": {}
     }
   }
 }

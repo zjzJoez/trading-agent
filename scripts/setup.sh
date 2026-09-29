@@ -3,7 +3,7 @@
 #
 # What this does:
 #   1. Installs the Python toolchain with `uv sync` (creates .venv + wires up
-#      the moomoo-mcp / edgar-mcp / journal-mcp console_scripts).
+#      the moomoo-mcp / edgar-mcp / journal-mcp / hyperliquid-mcp console_scripts).
 #   2. Generates `.env` from `.env.example` if missing, and prompts you to
 #      edit SEC_UA_EMAIL.
 #   3. Generates `.claude/settings.json` from its `.example` template by
