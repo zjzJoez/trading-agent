@@ -184,3 +184,4 @@ Read-only tools never sign anything. Write tools are grouped by module. All writ
   - Order-priority grouping (`{"p": …}`) and the deprecated `userDexAbstraction` action. Their builders exist in `actions.py` and are signature-verified.
   - The TWAP trigger/stop `details` option and `expiresAfter`. These are not implemented.
 - The notional cap is per order and per batch. It does not cap total exposure across many calls.
+- This repo's `reject_real_env` PreToolUse hook blocks any tool input whose value is exactly `live`, `real` or `production`, for example `market_search("live")`. Normal trading calls pass it.
