@@ -51,8 +51,16 @@ def test_aliases_case_and_cex_suffixes(uni):
     assert u.resolve("hype/usdc").coin == "@1"
     # mainnet remaps BTC/USDC to UBTC/USDC on HyperCore
     assert u.resolve("BTC/USDC").name == "UBTC/USDC"
-    for alias in ("BTC-PERP", "BTC-USD", "BTC-USDT-SWAP", "BTCPERP"):
+    for alias in ("BTC-PERP", "BTC-SWAP", "BTC-USDT-SWAP", "BTCPERP"):
         assert u.resolve(alias).coin == "BTC"
+
+
+@pytest.mark.parametrize("name", ["BTC-USDC", "BTC-USDT", "HYPE-USD"])
+def test_dash_pairs_are_ambiguous_not_guessed(uni, name):
+    """On OKX / Coinbase "BTC-USDT" is SPOT; guessing the perp could flip exposure."""
+    u, _ = uni
+    with pytest.raises(UnknownInstrument, match="ambiguous"):
+        u.resolve(name)
 
 
 def test_unknown_names_suggest_matches(uni):

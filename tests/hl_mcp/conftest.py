@@ -125,8 +125,9 @@ class FakeAPI:
         raise AssertionError(f"FakeAPI: unmodelled /info request {payload}")
 
 
-def position(coin: str, szi: str) -> dict:
+def position(coin: str, szi: str, value: str | None = None, margin: str = "0") -> dict:
     return {"type": "oneWay", "position": {"coin": coin, "szi": szi, "entryPx": "1",
+                                           "positionValue": value, "marginUsed": margin,
                                            "leverage": {"type": "cross", "value": 5}}}
 
 
@@ -162,6 +163,15 @@ class HL:
     def audit_lines(self) -> list[str]:
         p = self.tmp_path / "audit.jsonl"
         return p.read_text().splitlines() if p.exists() else []
+
+
+@pytest.fixture()
+def clean_hl_env(monkeypatch):
+    """Strip every HL_* variable (trading_agent.config loads the user's .env
+    into os.environ at import) so load_settings() tests see only their own."""
+    import os
+    for var in [v for v in os.environ if v.startswith("HL_")]:
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture()

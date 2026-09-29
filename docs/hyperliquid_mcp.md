@@ -18,10 +18,11 @@ Source: `src/trading_agent/mcp_servers/hyperliquid/`. Tests: `tests/hl_mcp/`.
 | Mainnet writes | refused | also `HL_ALLOW_MAINNET_WRITES=true` |
 | Signing | none (read-only) | `HL_PRIVATE_KEY` (use an API-wallet key) |
 | Write modules | `trade` only | `HL_WRITE_MODULES=trade,transfer,withdraw,admin,advanced` |
-| Sending funds to other addresses | refused | module `withdraw` **and** destination in `HL_WITHDRAW_ALLOWLIST` |
+| Funds or control to another address | refused | the tool's module **and** the address in `HL_WITHDRAW_ALLOWLIST` |
 | Order size | ≤ $1,000 notional per order and per batch | `HL_MAX_ORDER_NOTIONAL_USD` |
+| Daily volume | ≤ $10,000 of opening orders sent per UTC day | `HL_MAX_DAILY_NOTIONAL_USD` |
 | Leverage | ≤ 10x, checked live before every perp entry | `HL_MAX_LEVERAGE` |
-| Market-order slippage | 1% default, 5% cap | `HL_DEFAULT_SLIPPAGE`, `HL_MAX_SLIPPAGE` |
+| Slippage | market orders 1% by default; market and limit prices at most 5% through the mid | `HL_DEFAULT_SLIPPAGE`, `HL_MAX_SLIPPAGE` |
 | Instruments | any | `HL_ALLOWED_COINS` allowlist |
 | Kill switch | off | `HL_READ_ONLY=true`, or `HL_DRY_RUN=true` to preview every write |
 
@@ -30,8 +31,14 @@ Properties that hold for every write tool:
 - **Settings are fixed at startup.** No tool takes the network, the key or a limit as a parameter. This is the same invariant moomoo-mcp keeps for `trd_env`.
 - **One code path.** Every signed action goes through `core.execute`. It checks the gates, then either returns a dry run, refuses, or signs and sends. It then appends a JSONL record to `data/logs/hyperliquid_audit.jsonl`. The private key never appears in results or in the audit log.
 - **Dry runs everywhere.** Every write tool takes `dry_run=true`. A dry run returns the exact action that would be signed, plus every gate that would block it. It works without a key.
-- **Exits are never blocked by entry limits.** Reduce-only orders and position closes skip the notional cap and the coin allowlist.
-- **Guards fail closed.** An order that cannot be valued in USD, or whose current leverage cannot be read, is refused.
+- **Perp exits are never blocked by entry limits.**
+  - Reduce-only perp orders and position closes skip the notional caps, the daily budget and the coin allowlist.
+  - They may slip up to the larger of `HL_MAX_SLIPPAGE` and 10%, so a stop can still fill in a fast market.
+  - On spot and outcomes `reduce_only` means nothing. The server clears it there and treats the order as an entry.
+- **Exposure is valued where the order would fill.** Buys count at their limit price. Sells count at the higher of their limit and the mid, because a low sell limit still fills at the bid.
+- **The daily budget is shared.** It is summed from the audit log, so every server process and every restart sees the same total. A send whose outcome is unknown counts too.
+- **Anything that pays or empowers another address needs the allowlist.** That covers withdrawals and sends, deposits into a vault you don't lead, builder codes and builder-fee approvals, and multi-sig signers. Your own account and signer are always allowed. Sub-account transfers are checked against your actual sub-accounts.
+- **Guards fail closed.** An order is refused if it cannot be valued in USD, if its limit price cannot be checked against a mid, or if its current leverage cannot be read.
 - **Rejections are not reported as success.** The exchange answers `"status": "ok"` even when it rejected an order. `ok` is `false` whenever any order in a batch carries an error.
 - **Lost sends can be found and stopped.** Every order gets a client order id (cloid). If a send ends in `status: "error"`, the outcome is unknown. Look the order up with `account_get_order_status(cloid=…)`, or stop it from landing with `nonce_invalidate(nonce)`.
 - **API-wallet keys never pass through the model.** `agent_approve` writes the new key to a `0600` file under `data/hyperliquid_agents/` and returns only the path and address.
@@ -77,7 +84,7 @@ One order action serves every instrument. The coin name decides which one:
 | Spot | `HYPE/USDC` or `@107` | 10000 + spot index |
 | HIP-4 outcome side | `#12090` | 100000000 + 10 × outcome + side |
 
-Also accepted: any casing, the mainnet `U`-prefixed spot remaps (`BTC/USDC` → `UBTC/USDC`), and CEX-style suffixes (`BTC-PERP`, `BTC-USDT-SWAP`). Use `market_search` to find anything else.
+Also accepted: any casing, the mainnet `U`-prefixed spot remaps (`BTC/USDC` → `UBTC/USDC`), and CEX-style perp names (`BTC-PERP`, `BTC-SWAP`, `BTC-USDT-SWAP`). A bare pair like `BTC-USDT` is refused as ambiguous, because on most exchanges it names spot. Use `market_search` to find anything else.
 
 Prices snap to valid ticks in the trader's favour: buys round down and sells round up. The tick rule is at most 5 significant figures and at most 6 (perp) or 8 (spot) minus `szDecimals` decimals. Pass `round_to_tick=false` to get an error instead. Sizes are floored to the lot size.
 
@@ -126,10 +133,12 @@ Read-only tools never sign anything. Write tools are grouped by module. All writ
 - Placing orders:
   - `order_place_limit`: limit order with TIF Gtc, Alo (post-only) or Ioc.
   - `order_place_market`: IOC order at mid ± slippage.
-  - `order_place_trigger`: stop or take-profit, market or limit.
+  - `order_place_trigger`: stop or take-profit, market or limit. A market trigger fills no worse than trigger ± 10% for exits (Hyperliquid's own frontend default) or ± `HL_DEFAULT_SLIPPAGE` for entries.
   - `order_place_bracket`: entry plus TP/SL legs.
   - `order_place_batch`: several orders in one action, with an optional builder code.
-- Positions: `position_close`, `position_close_all`, `position_set_tpsl`.
+- Positions:
+  - `position_close`, `position_close_all`: reduce-only market exits. `position_close_all` closes every position it can and lists the rest in `not_closed`.
+  - `position_set_tpsl`: TP/SL on an existing position. Without `size` it covers the whole position and resizes with it (sent as size 0, like Hyperliquid's frontend).
 - Changing and cancelling: `order_modify`, `order_cancel`, `order_cancel_batch`, `order_cancel_all`, `order_schedule_cancel_all` (dead man's switch).
 - Leverage and margin: `leverage_update`, `margin_adjust_isolated`, `margin_set_isolated_leverage`.
 - TWAP: `twap_place`, `twap_cancel`.
@@ -170,10 +179,11 @@ Read-only tools never sign anything. Write tools are grouped by module. All writ
 - **SDK equivalence** (`tests/hl_mcp/test_sdk_equivalence.py`). Every action the SDK can build is built by both `hyperliquid.exchange.Exchange` and this server. Both must produce the same keys in the same order and the same signature. This matters because L1 actions are msgpack-hashed, so key order is part of the signature.
 - **Signature oracle on testnet** (`tests/hl_mcp/test_live.py`, run with `-m integration`).
   - A fresh random key has no account, so the exchange rejects every action. The rejection names the address the exchange recovered from the signature.
-  - 56 signed-action checks, covering every action type the server can send, all recovered to our wallet. That includes the ones the Python SDK does not implement: TWAP, borrow/lend, cDeposit/cWithdraw, userOutcome, portfolio margin, staking links, vault create/modify/distribute, sendToEvmWithData, agentSendAsset, and batchModify with `always_place`.
+  - 57 signed-action checks, covering every action type the server can send, all recovered to our wallet. That includes the ones the Python SDK does not implement: TWAP, borrow/lend, cDeposit/cWithdraw, userOutcome, portfolio margin, staking links, vault create/modify/distribute, sendToEvmWithData, agentSendAsset, batchModify with `always_place`, and whole-position TP/SL.
   - Their field order follows the [nktkas TypeScript SDK](https://github.com/nktkas/hyperliquid) schemas.
 - **Live reads.** Every read tool was run against mainnet.
-- **Guards** (`tests/hl_mcp/test_execute.py`, `test_tools.py`). Each gate and each tool's refusal paths are tested against a fake API. None of the 104 unit tests touches the network.
+- **Guards** (`tests/hl_mcp/test_execute.py`, `test_tools.py`). Each gate and each tool's refusal paths are tested against a fake API. None of the 132 unit tests touches the network.
+- **Adversarial review** (`tests/hl_mcp/test_review_fixes.py`). A separate review tried to get past every guard and to make exits fail. Each confirmed finding is fixed and has a regression test. Examples: `reduce_only` on a spot buy skipping the caps, a low sell limit valued below where it fills, and a market stop-loss whose limit equalled its trigger, so it could miss in a gap.
 
 ## Known limits
 
@@ -183,5 +193,5 @@ Read-only tools never sign anything. Write tools are grouped by module. All writ
 - Not exposed as tools:
   - Order-priority grouping (`{"p": …}`) and the deprecated `userDexAbstraction` action. Their builders exist in `actions.py` and are signature-verified.
   - The TWAP trigger/stop `details` option and `expiresAfter`. These are not implemented.
-- The notional cap is per order and per batch. It does not cap total exposure across many calls.
+- The daily budget counts opening orders sent, not net exposure. Orders that never fill still count, and closing a position does not free budget. It lives in the audit log, so deleting the log resets it, and two processes sending at the same instant can both pass the check.
 - This repo's `reject_real_env` PreToolUse hook blocks any tool input whose value is exactly `live`, `real` or `production`, for example `market_search("live")`. Normal trading calls pass it.

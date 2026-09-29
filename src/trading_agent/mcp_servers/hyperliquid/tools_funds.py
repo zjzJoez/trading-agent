@@ -11,6 +11,9 @@ HL_WITHDRAW_ALLOWLIST; there is no per-call override.
 
 Most of these are user-signed (EIP-712) actions: only the account owner's key
 can sign them, an API wallet cannot.
+Deposits into a vault or a sub-account hand the funds to whoever controls it,
+so they are checked too: a vault must be led by this account or be in
+HL_WITHDRAW_ALLOWLIST, and a sub-account must belong to this account.
 """
 from __future__ import annotations
 
@@ -18,13 +21,14 @@ from decimal import Decimal
 from typing import Literal
 
 from trading_agent.mcp_servers.hyperliquid import actions as A
-from trading_agent.mcp_servers.hyperliquid import guard
 from trading_agent.mcp_servers.hyperliquid.core import (
     WRITE,
     address,
     client,
+    destination_reasons,
     execute,
     mcp,
+    own_addresses,
 )
 from trading_agent.mcp_servers.hyperliquid.universe import fmt_decimal, to_decimal
 
@@ -71,13 +75,39 @@ def _dex(name: str) -> str:
     return n
 
 
-def _own() -> set[str]:
-    acct = client().account_address()
-    return {acct} if acct else set()
-
-
 def _dest_reasons(destination: str) -> list[str]:
-    return guard.destination_block_reasons(client().settings, destination, _own())
+    return destination_reasons(destination)
+
+
+def _sub_account_reasons(sub: str) -> list[str]:
+    """The exchange should refuse a transfer to someone else's sub-account, but
+    this checks it first and fails closed if it cannot."""
+    me = client().account_address()
+    if not me:
+        return ["cannot verify the sub-account: no account address configured"]
+    try:
+        subs = client().info({"type": "subAccounts", "user": me}) or []
+    except Exception as e:
+        return [f"cannot verify {sub} is your sub-account ({e}); refusing fail-closed"]
+    if sub.lower() not in {str(s.get("subAccountUser", "")).lower() for s in subs}:
+        return [f"{sub} is not a sub-account of {me}"]
+    return []
+
+
+def _vault_deposit_reasons(vault: str) -> list[str]:
+    """A vault's leader trades its deposits, so depositing into someone else's
+    vault hands them the funds: allow only your own vaults and allowlisted ones."""
+    if vault in own_addresses() or vault in client().settings.withdraw_allowlist:
+        return []
+    try:
+        details = client().info({"type": "vaultDetails", "vaultAddress": vault}) or {}
+    except Exception as e:
+        return [f"cannot verify vault {vault} ({e}); refusing fail-closed"]
+    leader = str(details.get("leader", "")).lower()
+    if leader and leader in own_addresses():
+        return []
+    return [f"vault {vault} is led by {leader or 'unknown'}, not this account; add it to "
+            "HL_WITHDRAW_ALLOWLIST to allow deposits"]
 
 
 # --------------------------------------------------------------------------
@@ -130,6 +160,7 @@ def transfer_sub_account_usdc(sub_account: str, amount_usd: float,
     req = A.sub_account_transfer(sub, direction == "deposit", _micro_usd(amount_usd),
                                  client().next_nonce())
     return execute("transfer_sub_account_usdc", "transfer", req, dry_run=dry_run,
+                   reasons=_sub_account_reasons(sub),
                    summary={"sub_account": sub, "amount_usd": amount_usd, "direction": direction})
 
 
@@ -144,6 +175,7 @@ def transfer_sub_account_spot(sub_account: str, token: str, amount: float,
     req = A.sub_account_spot_transfer(sub, direction == "deposit", wire, amt,
                                       client().next_nonce())
     return execute("transfer_sub_account_spot", "transfer", req, dry_run=dry_run,
+                   reasons=_sub_account_reasons(sub),
                    summary={"sub_account": sub, "token": wire, "amount": amt,
                             "direction": direction})
 
@@ -152,11 +184,14 @@ def transfer_sub_account_spot(sub_account: str, token: str, amount: float,
 def vault_transfer(vault_address: str, amount_usd: float,
                    direction: Literal["deposit", "withdraw"], dry_run: bool = False) -> dict:
     """Deposit USDC into, or withdraw from, a vault (check lock-ups with
-    market_get_vault_details first)."""
+    market_get_vault_details first). Deposits are allowed only into vaults this
+    account leads or that are in HL_WITHDRAW_ALLOWLIST: a vault's leader
+    controls the funds."""
     vault = address(vault_address, "vault_address")
     req = A.vault_transfer(vault, direction == "deposit", _micro_usd(amount_usd),
                            client().next_nonce())
-    return execute("vault_transfer", "transfer", req, dry_run=dry_run,
+    reasons = _vault_deposit_reasons(vault) if direction == "deposit" else []
+    return execute("vault_transfer", "transfer", req, dry_run=dry_run, reasons=reasons,
                    summary={"vault": vault, "amount_usd": amount_usd, "direction": direction})
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from importlib import metadata
 from typing import Any, Literal
 
+from trading_agent.mcp_servers.hyperliquid import guard
 from trading_agent.mcp_servers.hyperliquid.core import (
     READ,
     address,
@@ -62,6 +63,13 @@ def _margin(state: dict) -> dict:
     }
 
 
+def _daily_used() -> float | str:
+    try:
+        return float(guard.daily_opening_notional(client().settings))
+    except OSError as e:
+        return f"unreadable audit log: {e}"
+
+
 def _dex_list(dex: str | None, all_dexs: bool) -> list[str]:
     if all_dexs:
         return client().universe.dex_names()
@@ -107,6 +115,8 @@ def server_status() -> dict:
         "live_write_blockers": live_blockers,
         "limits": {
             "max_order_notional_usd": s.max_order_notional_usd,
+            "max_daily_notional_usd": s.max_daily_notional_usd,
+            "daily_notional_used_usd": _daily_used(),
             "max_leverage": s.max_leverage,
             "default_slippage": s.default_slippage, "max_slippage": s.max_slippage,
             "allowed_coins": sorted(s.allowed_coins) if s.allowed_coins else "any",

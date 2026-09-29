@@ -7,18 +7,10 @@ from trading_agent.mcp_servers.hyperliquid.settings import SettingsError, load_s
 
 from .conftest import TEST_KEY
 
-HL_VARS = [
-    "HL_NETWORK", "HL_PRIVATE_KEY", "HL_ACCOUNT_ADDRESS", "HL_VAULT_ADDRESS", "HL_READ_ONLY",
-    "HL_ALLOW_MAINNET_WRITES", "HL_DRY_RUN", "HL_WRITE_MODULES", "HL_MAX_ORDER_NOTIONAL_USD",
-    "HL_MAX_LEVERAGE", "HL_DEFAULT_SLIPPAGE", "HL_MAX_SLIPPAGE", "HL_ALLOWED_COINS",
-    "HL_WITHDRAW_ALLOWLIST", "HL_AUDIT_LOG", "HL_AGENT_KEY_DIR", "HL_TIMEOUT",
-]
-
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    for v in HL_VARS:
-        monkeypatch.delenv(v, raising=False)
+def _clean_env(clean_hl_env):
+    pass
 
 
 def test_defaults_are_the_safe_side_of_every_switch():

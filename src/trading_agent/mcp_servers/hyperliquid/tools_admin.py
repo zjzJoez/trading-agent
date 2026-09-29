@@ -25,6 +25,7 @@ from trading_agent.mcp_servers.hyperliquid.core import (
     WRITE,
     address,
     client,
+    destination_reasons,
     execute,
     mcp,
     now_ms,
@@ -34,6 +35,8 @@ from trading_agent.mcp_servers.hyperliquid.core import (
 from trading_agent.mcp_servers.hyperliquid.tools_funds import _micro_usd
 
 MAX_AGENT_VALID_DAYS = 180
+# 0.0005 USDC per unit: one call can buy at most $50 of request budget.
+MAX_RESERVE_WEIGHT = 100_000
 
 
 def _write_agent_key(path, record: dict) -> None:
@@ -106,6 +109,7 @@ def agent_approve(name: str | None = None, valid_days: int | None = None,
 def builder_fee_approve(builder: str, max_fee_rate_percent: float, dry_run: bool = False) -> dict:
     """Allow a builder (front-end / bot operator) to charge up to `max_fee_rate_percent`
     per order (e.g. 0.01 = 0.01%; max 0.1% on perps, 1% on spot). 0 revokes.
+    The builder must be in HL_WITHDRAW_ALLOWLIST (revoking is always allowed).
     Must be signed by the account owner's key."""
     b = address(builder, "builder")
     rate = float(max_fee_rate_percent)
@@ -114,6 +118,7 @@ def builder_fee_approve(builder: str, max_fee_rate_percent: float, dry_run: bool
     rate_str = f"{rate:.4f}".rstrip("0").rstrip(".") + "%"
     req = A.approve_builder_fee(b, rate_str, client().next_nonce())
     return execute("builder_fee_approve", "admin", req, dry_run=dry_run, needs_owner_key=True,
+                   reasons=destination_reasons(b, "builder") if rate > 0 else [],
                    summary={"builder": b, "max_fee_rate": rate_str})
 
 
@@ -217,12 +222,14 @@ def account_set_evm_big_blocks(enabled: bool, dry_run: bool = False) -> dict:
 def account_reserve_request_weight(weight: int, destination: str | None = None,
                                    dry_run: bool = False) -> dict:
     """Buy extra address-based action budget (0.0005 USDC per request, paid from the
-    perp balance), optionally for another existing user."""
-    if int(weight) < 1:
-        raise ValueError("weight must be >= 1")
+    perp balance; at most 100,000 = 50 USDC per call), optionally for another
+    user (who must be your own or allowlisted address)."""
+    if not 1 <= int(weight) <= MAX_RESERVE_WEIGHT:
+        raise ValueError(f"weight must be between 1 and {MAX_RESERVE_WEIGHT}")
     dest = address(destination, "destination") if destination else None
     req = A.reserve_request_weight(int(weight), client().next_nonce(), destination=dest)
     return execute("account_reserve_request_weight", "admin", req, dry_run=dry_run,
+                   reasons=destination_reasons(dest) if dest else [],
                    summary={"weight": int(weight), "cost_usdc": int(weight) * 0.0005,
                             "destination": dest})
 
@@ -317,11 +324,14 @@ def advanced_convert_to_multisig(authorized_users: list[str], threshold: int,
                                  dry_run: bool = True) -> dict:
     """Convert this account into a multi-sig account controlled by `authorized_users`
     with `threshold` required signatures. Afterwards this key alone can no
-    longer act for the account. Owner key only. Defaults to dry_run=True."""
+    longer act for the account. Every authorized user gains control of the
+    funds, so each must be your own address or in HL_WITHDRAW_ALLOWLIST.
+    Owner key only. Defaults to dry_run=True."""
     users = [address(u, "authorized user") for u in authorized_users]
     if not users or not 1 <= int(threshold) <= len(users):
         raise ValueError("threshold must be between 1 and len(authorized_users)")
+    reasons = [r for u in users for r in destination_reasons(u, "authorized user")]
     req = A.convert_to_multi_sig_user(users, int(threshold), client().next_nonce())
     return execute("advanced_convert_to_multisig", "advanced", req, dry_run=dry_run,
-                   needs_owner_key=True, summary={"authorized_users": users,
-                                                  "threshold": int(threshold)})
+                   needs_owner_key=True, reasons=reasons,
+                   summary={"authorized_users": users, "threshold": int(threshold)})

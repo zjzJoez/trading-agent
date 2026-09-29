@@ -8,9 +8,17 @@ Guards on top of the module/network gates (see guard.py):
   * sizes are floored to the lot size, prices snapped to a valid tick in the
     trader's favour (buys down, sells up) unless round_to_tick=False;
   * opening orders are capped by HL_MAX_ORDER_NOTIONAL_USD (per order and per
-    batch) and need the coin's current leverage <= HL_MAX_LEVERAGE;
+    batch) and HL_MAX_DAILY_NOTIONAL_USD (per UTC day), and need the coin's
+    current leverage <= HL_MAX_LEVERAGE. Exposure is valued conservatively:
+    buys at their limit, sells at max(limit, mid) since a low sell limit
+    still fills at the bid;
   * market orders are IOC limits at mid ± slippage, capped by HL_MAX_SLIPPAGE;
-  * reduce-only orders skip the notional cap and coin allowlist (exits first).
+    limit orders may not sit more than HL_MAX_SLIPPAGE through the mid;
+  * market TP/SL triggers carry a worst-fill limit of trigger ± slippage:
+    10% for exits (Hyperliquid's own default — a stop-loss must fill),
+    HL_DEFAULT_SLIPPAGE for entries (capped by HL_MAX_SLIPPAGE);
+  * reduce-only PERP orders skip the notional caps and coin allowlist (exits
+    first). reduce_only means nothing on spot/outcomes and is cleared there.
 Every order carries a client order id (generated when not given) so that an
 order whose send timed out can still be found with account_get_order_status.
 """
@@ -29,6 +37,7 @@ from trading_agent.mcp_servers.hyperliquid.core import (
     WRITE,
     address,
     client,
+    destination_reasons,
     execute,
     leverage_reasons,
     mcp,
@@ -49,8 +58,9 @@ from trading_agent.mcp_servers.hyperliquid.universe import (
     to_decimal,
 )
 
-# Hyperliquid fills market TP/SL within 10% of the trigger; TWAP slices within 3%.
-TRIGGER_MARKET_SLIPPAGE = Decimal("0.10")
+# Hyperliquid's frontend sends market TP/SL with a worst-fill limit 10% past
+# the trigger; TWAP slices are capped at 3% by the exchange.
+TRIGGER_EXIT_SLIPPAGE = 0.10
 TWAP_SLICE_SLIPPAGE = Decimal("0.03")
 OUTCOME_MIN_PX = Decimal("0.00001")
 OUTCOME_MAX_PX = Decimal("0.99999")
@@ -65,11 +75,18 @@ class Prepared:
     size: Decimal
     limit_px: Decimal
     order_type: dict
-    reduce_only: bool
+    reduce_only: bool          # effective flag: only ever True on perps
     cloid: str
-    notional: Decimal | None
-    slippage: float | None = None
+    notional: Decimal | None   # conservative USD exposure if it fills
+    slippage: float | None = None      # slippage this order was priced with...
+    slippage_cap: float | None = None  # ...and the most it may use
+    band_ref: Decimal | None = None    # price the limit must stay within HL_MAX_SLIPPAGE of
+    band_what: str | None = None       # "mid" / "trigger"; None = no band check
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def is_exit(self) -> bool:
+        return guard.is_exit(self.inst, self.reduce_only)
 
     def wire(self) -> dict:
         return A.order_wire(self.inst.asset, self.is_buy, float(self.size), float(self.limit_px),
@@ -106,6 +123,24 @@ def _cloid(cloid: str | None) -> str:
     return c
 
 
+def _flag(value: Any, name: str) -> bool:
+    """Strict boolean: bool("false") is True, so strings must say true/false."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ValueError(f"{name} must be true or false, got {value!r}")
+
+
+def _reduce_only(inst: Instrument, requested: bool, notes: list[str]) -> bool:
+    """reduce_only only exists for perps; on spot/outcomes it is cleared so it
+    can neither be rejected by the exchange nor exempt the order from guards."""
+    if requested and not inst.is_perp:
+        notes.append(f"reduce_only ignored: {inst.kind} has no positions to reduce")
+        return False
+    return requested
+
+
 def _limit_px(inst: Instrument, price: Any, is_buy: bool, round_to_tick: bool,
               notes: list[str]) -> Decimal:
     raw = to_decimal(price, "price")
@@ -132,8 +167,10 @@ def _size(inst: Instrument, size: Any, notes: list[str]) -> Decimal:
     return sz
 
 
-def _market_px(inst: Instrument, is_buy: bool, slippage: float) -> Decimal:
-    ref = mid(inst)
+def _market_px(inst: Instrument, is_buy: bool, slippage: float,
+               ref: Decimal | None = None) -> Decimal:
+    """IOC limit at ref × (1 ± slippage); ref defaults to the live mid."""
+    ref = ref if ref is not None else mid(inst)
     if ref is None or ref <= 0:
         raise ValueError(f"no mid price for {inst.coin}; use a limit order instead")
     slip = Decimal(str(slippage))
@@ -144,11 +181,28 @@ def _market_px(inst: Instrument, is_buy: bool, slippage: float) -> Decimal:
     return round_price(raw, inst, "down" if is_buy else "up")
 
 
-def _slippage(value: float | None) -> float:
-    s = client().settings.default_slippage if value is None else float(value)
-    if s <= 0:
-        raise ValueError("slippage must be positive (0.01 = 1%)")
+def _slip_cap(exit_: bool) -> float:
+    """Entries are bounded by HL_MAX_SLIPPAGE; perp exits may use at least 10%
+    so a stop can still fill in a fast market."""
+    s = client().settings
+    return max(s.max_slippage, TRIGGER_EXIT_SLIPPAGE) if exit_ else s.max_slippage
+
+
+def _slippage(value: float | None, default: float | None = None) -> float:
+    fallback = client().settings.default_slippage if default is None else default
+    s = fallback if value is None else float(value)
+    if not 0 < s < 1:
+        raise ValueError("slippage must be a fraction between 0 and 1 (0.01 = 1%)")
     return s
+
+
+def _exposure(inst: Instrument, is_buy: bool, size: Decimal, price: Decimal,
+              floor: Decimal | None = None) -> Decimal | None:
+    """Conservative USD value if the order fills. A buy fills at or below its
+    limit; a sell fills at or ABOVE it — up to the bid — so a sell is valued at
+    max(price, floor) where floor is the mid (or the trigger)."""
+    ref = price if is_buy or floor is None else max(price, floor)
+    return notional_usd(inst, size, ref)
 
 
 def prepare_limit(inst: Instrument, is_buy: bool, size: Any, price: Any, tif: str,
@@ -156,28 +210,46 @@ def prepare_limit(inst: Instrument, is_buy: bool, size: Any, price: Any, tif: st
     notes: list[str] = []
     sz = _size(inst, size, notes)
     px = _limit_px(inst, price, is_buy, round_to_tick, notes)
-    return Prepared(inst, is_buy, sz, px, {"limit": {"tif": tif}}, reduce_only, _cloid(cloid),
-                    notional_usd(inst, sz, px), notes=notes)
+    ro = _reduce_only(inst, reduce_only, notes)
+    ref = mid(inst)
+    return Prepared(inst, is_buy, sz, px, {"limit": {"tif": tif}}, ro, _cloid(cloid),
+                    _exposure(inst, is_buy, sz, px, ref), band_ref=ref, band_what="mid",
+                    notes=notes)
 
 
 def prepare_market(inst: Instrument, is_buy: bool, size: Any, slippage: float | None,
-                   reduce_only: bool, cloid: str | None) -> Prepared:
+                   reduce_only: bool, cloid: str | None, ref: Decimal | None = None) -> Prepared:
     notes: list[str] = []
     sz = _size(inst, size, notes)
     slip = _slippage(slippage)
-    px = _market_px(inst, is_buy, slip)
-    notes.append(f"market order = IOC limit at {fmt_decimal(px)} (mid ± {slip:.2%})")
-    return Prepared(inst, is_buy, sz, px, {"limit": {"tif": "Ioc"}}, reduce_only, _cloid(cloid),
-                    notional_usd(inst, sz, px), slippage=slip, notes=notes)
+    ro = _reduce_only(inst, reduce_only, notes)
+    ref = ref if ref is not None else mid(inst)
+    px = _market_px(inst, is_buy, slip, ref)
+    notes.append(f"market order = IOC limit at {fmt_decimal(px)} (reference ± {slip:.2%})")
+    return Prepared(inst, is_buy, sz, px, {"limit": {"tif": "Ioc"}}, ro, _cloid(cloid),
+                    _exposure(inst, is_buy, sz, px, ref), slippage=slip,
+                    slippage_cap=_slip_cap(guard.is_exit(inst, ro)), notes=notes)
 
 
 def prepare_trigger(inst: Instrument, is_buy: bool, size: Any, trigger_price: Any,
                     trigger_type: str, limit_price: Any | None, reduce_only: bool,
-                    cloid: str | None, round_to_tick: bool = True) -> Prepared:
+                    cloid: str | None, round_to_tick: bool = True,
+                    slippage: float | None = None, whole_position: bool = False) -> Prepared:
+    """TP/SL trigger on the mark price. Market triggers still carry a limit:
+    the worst fill, trigger ± slippage (10% for perp exits, like Hyperliquid's
+    frontend; HL_DEFAULT_SLIPPAGE for entries). `whole_position` sends size 0,
+    which the exchange reads as "the entire position, resizing with it"."""
     if trigger_type not in ("stop", "take_profit"):
         raise ValueError("trigger_type must be 'stop' or 'take_profit'")
     notes: list[str] = []
-    sz = _size(inst, size, notes)
+    ro = _reduce_only(inst, reduce_only, notes)
+    if whole_position:
+        if not (inst.is_perp and ro):
+            raise ValueError("whole-position TP/SL is only for reduce-only perp orders")
+        sz = Decimal(0)
+        notes.append("size 0 = the whole position; resizes with it")
+    else:
+        sz = _size(inst, size, notes)
     raw_trig = to_decimal(trigger_price, "trigger_price")
     if not round_to_tick and not is_valid_price(raw_trig, inst):
         raise ValueError(f"trigger_price {trigger_price} is not a valid tick for {inst.coin}; "
@@ -185,17 +257,21 @@ def prepare_trigger(inst: Instrument, is_buy: bool, size: Any, trigger_price: An
     trig = round_price(raw_trig, inst, "nearest") if round_to_tick else raw_trig
     if trig != raw_trig:
         notes.append(f"trigger {fmt_decimal(raw_trig)} snapped to tick {fmt_decimal(trig)}")
-    is_market = limit_price is None
-    if is_market:
-        px = trig  # the exchange applies its 10% market TP/SL slippage on trigger
-        worst = trig * (1 + TRIGGER_MARKET_SLIPPAGE) if is_buy else trig
-    else:
-        px = _limit_px(inst, limit_price, is_buy, round_to_tick, notes)
-        worst = px
-    order_type = {"trigger": {"triggerPx": float(trig), "isMarket": is_market,
+    order_type = {"trigger": {"triggerPx": float(trig), "isMarket": limit_price is None,
                               "tpsl": "sl" if trigger_type == "stop" else "tp"}}
-    return Prepared(inst, is_buy, sz, px, order_type, reduce_only, _cloid(cloid),
-                    notional_usd(inst, sz, worst), notes=notes)
+    if limit_price is None:
+        exit_ = guard.is_exit(inst, ro)
+        slip = _slippage(slippage, TRIGGER_EXIT_SLIPPAGE if exit_
+                         else client().settings.default_slippage)
+        px = _market_px(inst, is_buy, slip, trig)
+        notes.append(f"market trigger: worst fill {fmt_decimal(px)} (trigger ± {slip:.2%})")
+        return Prepared(inst, is_buy, sz, px, order_type, ro, _cloid(cloid),
+                        _exposure(inst, is_buy, sz, px, trig), slippage=slip,
+                        slippage_cap=_slip_cap(exit_), notes=notes)
+    px = _limit_px(inst, limit_price, is_buy, round_to_tick, notes)
+    return Prepared(inst, is_buy, sz, px, order_type, ro, _cloid(cloid),
+                    _exposure(inst, is_buy, sz, px, trig), band_ref=trig,
+                    band_what="trigger", notes=notes)
 
 
 def _order_reasons(preps: list[Prepared], target: str | None) -> list[str]:
@@ -203,19 +279,31 @@ def _order_reasons(preps: list[Prepared], target: str | None) -> list[str]:
     reasons: list[str] = []
     for p in preps:
         reasons += guard.order_block_reasons(s, p.inst, reduce_only=p.reduce_only,
-                                             notional_usd=p.notional, slippage=p.slippage)
-    opening = [p for p in preps if not p.reduce_only]
-    if len(opening) > 1 and all(p.notional is not None for p in opening):
-        total = sum((p.notional for p in opening), Decimal(0))
-        if total > Decimal(str(s.max_order_notional_usd)):
-            reasons.append(f"batch opening notional ${total:,.2f} exceeds "
-                           f"HL_MAX_ORDER_NOTIONAL_USD ${s.max_order_notional_usd:,.2f}")
+                                             notional_usd=p.notional)
+        cap = p.slippage_cap if p.slippage_cap is not None else _slip_cap(p.is_exit)
+        if p.slippage is not None and p.slippage > cap:
+            reasons.append(f"{p.inst.coin}: slippage {p.slippage:.4f} exceeds the allowed "
+                           f"{cap} (HL_MAX_SLIPPAGE)")
+        if p.band_what is not None:
+            reasons += guard.price_band_reasons(s, p.inst, is_buy=p.is_buy, limit_px=p.limit_px,
+                                                reference=p.band_ref, what=p.band_what,
+                                                band=_slip_cap(p.is_exit))
+    opening = [p for p in preps if not p.is_exit]
+    total = _opening_total(preps)
+    if len(opening) > 1 and total > Decimal(str(s.max_order_notional_usd)):
+        reasons.append(f"batch opening notional ${total:,.2f} exceeds "
+                       f"HL_MAX_ORDER_NOTIONAL_USD ${s.max_order_notional_usd:,.2f}")
     checked: set[str] = set()
     for p in opening:
         if p.inst.coin not in checked:
             checked.add(p.inst.coin)
             reasons += leverage_reasons(p.inst, target, reduce_only=False)
     return list(dict.fromkeys(reasons))
+
+
+def _opening_total(preps: list[Prepared]) -> Decimal:
+    return sum((p.notional for p in preps if not p.is_exit and p.notional is not None),
+               Decimal(0))
 
 
 def _describe_statuses(out: dict, preps: list[Prepared]) -> dict:
@@ -245,8 +333,12 @@ def _send_orders(tool: str, preps: list[Prepared], vault: str | None, target: st
                    builder=builder, vault_address=vault)
     summary = {"orders": [p.summary() for p in preps], "grouping": grouping,
                "account": target, **({"vault_address": vault} if vault else {})}
-    out = execute(tool, "trade", req, dry_run=dry_run, reasons=_order_reasons(preps, target),
-                  summary=summary)
+    reasons = _order_reasons(preps, target)
+    if builder:
+        # A builder code pays the builder a fee on every fill: a payee like any other.
+        reasons += destination_reasons(builder["b"], "builder")
+    out = execute(tool, "trade", req, dry_run=dry_run, reasons=reasons, summary=summary,
+                  opening_notional_usd=_opening_total(preps))
     return _describe_statuses(out, preps)
 
 
@@ -293,21 +385,25 @@ def order_place_market(coin: str, side: Literal["buy", "sell"], size: float,
 def order_place_trigger(coin: str, side: Literal["buy", "sell"], size: float,
                         trigger_price: float, trigger_type: Literal["stop", "take_profit"],
                         limit_price: float | None = None, reduce_only: bool = True,
-                        cloid: str | None = None, round_to_tick: bool = True,
-                        vault_address: str | None = None, dry_run: bool = False) -> dict:
+                        slippage: float | None = None, cloid: str | None = None,
+                        round_to_tick: bool = True, vault_address: str | None = None,
+                        dry_run: bool = False) -> dict:
     """Stop / take-profit order triggered by the MARK price.
 
     `trigger_type="stop"` fires when price moves through the trigger in the
     direction of `side` (a sell stop fires on a fall, a buy stop on a rise);
-    "take_profit" is the opposite. With no `limit_price` it executes as a
-    market order (the exchange allows 10% slippage); with one, as a limit.
-    `reduce_only` defaults to True (a protective exit); set False for stop
-    entries. For a TP/SL on an existing position prefer position_set_tpsl.
+    "take_profit" is the opposite. With a `limit_price` it becomes a limit
+    order once triggered. Without one it executes as a market order no worse
+    than trigger ± `slippage`: 10% by default for perp exits (as on
+    Hyperliquid's own frontend), HL_DEFAULT_SLIPPAGE for entries.
+    `reduce_only` defaults to True (a protective perp exit); set False for stop
+    entries. It has no effect on spot/outcomes. For a TP/SL on an existing
+    position prefer position_set_tpsl.
     """
     inst = resolve(coin)
     vault, target = trade_target(vault_address)
     p = prepare_trigger(inst, _is_buy(side), size, trigger_price, trigger_type, limit_price,
-                        reduce_only, cloid, round_to_tick)
+                        reduce_only, cloid, round_to_tick, slippage=slippage)
     return _send_orders("order_place_trigger", [p], vault, target, dry_run=dry_run)
 
 
@@ -376,8 +472,9 @@ def order_place_batch(orders: list[dict],
     "price" (limit, or trigger limit), "tif", "reduce_only", "trigger_price",
     "trigger_type": "stop"|"take_profit", "cloid", "slippage", "round_to_tick"}.
     The notional cap applies to each order and to the batch's opening total.
-    `builder_address` + `builder_fee_tenths_bp` attach a builder code (the
-    builder must be approved first with builder_fee_approve).
+    `builder_address` + `builder_fee_tenths_bp` attach a builder code: the
+    builder is paid a fee on every fill, so it must be approved first
+    (builder_fee_approve) and be your own address or in HL_WITHDRAW_ALLOWLIST.
     """
     if not orders:
         raise ValueError("orders is empty")
@@ -393,18 +490,22 @@ def order_place_batch(orders: list[dict],
         inst = resolve(o["coin"])
         is_buy = _is_buy(o["side"])
         kind = o.get("type", "limit")
-        ro = bool(o.get("reduce_only", False))
-        rt = bool(o.get("round_to_tick", True))
+        ro = _flag(o.get("reduce_only", False), f"order[{i}].reduce_only")
+        rt = _flag(o.get("round_to_tick", True), f"order[{i}].round_to_tick")
         if kind == "limit":
+            if "price" not in o:
+                raise ValueError(f"order[{i}] is a limit order without a price")
             preps.append(prepare_limit(inst, is_buy, o["size"], o["price"], o.get("tif", "Gtc"),
                                        ro, o.get("cloid"), rt))
         elif kind == "market":
             preps.append(prepare_market(inst, is_buy, o["size"], o.get("slippage"), ro,
                                         o.get("cloid")))
         elif kind == "trigger":
+            if "trigger_price" not in o:
+                raise ValueError(f"order[{i}] is a trigger order without a trigger_price")
             preps.append(prepare_trigger(inst, is_buy, o["size"], o["trigger_price"],
                                          o.get("trigger_type", "stop"), o.get("price"), ro,
-                                         o.get("cloid"), rt))
+                                         o.get("cloid"), rt, slippage=o.get("slippage")))
         else:
             raise ValueError(f"order[{i}].type must be limit, market or trigger")
     builder = None
@@ -421,14 +522,32 @@ def order_place_batch(orders: list[dict],
 # Positions
 # --------------------------------------------------------------------------
 
-def _position(inst: Instrument, target: str) -> Decimal:
-    """Signed position size (szi) of a perp for `target`; 0 if flat."""
-    st = client().info({"type": "clearinghouseState", "user": target, "dex": inst.dex}) or {}
-    for ap in st.get("assetPositions") or []:
-        p = ap.get("position") or {}
+def _position_rows(target: str, dex: str) -> list[dict]:
+    st = client().info({"type": "clearinghouseState", "user": target, "dex": dex}) or {}
+    return [ap.get("position") or {} for ap in st.get("assetPositions") or []]
+
+
+def _position(inst: Instrument, target: str) -> tuple[Decimal, Decimal | None]:
+    """(signed size szi, reference price) of a perp for `target`; (0, None) if flat."""
+    for p in _position_rows(target, inst.dex):
         if p.get("coin") == inst.coin:
-            return to_decimal(p.get("szi", "0"), "szi")
-    return Decimal(0)
+            return to_decimal(p.get("szi", "0"), "szi"), _exit_ref(inst, p)
+    return Decimal(0), None
+
+
+def _exit_ref(inst: Instrument, pos: dict) -> Decimal | None:
+    """Price to close against: the live mid, else the mark implied by the
+    position itself (positionValue / |szi|), so an exit never depends on a
+    mid being available."""
+    m = mid(inst)
+    if m is not None and m > 0:
+        return m
+    try:
+        value = to_decimal(pos.get("positionValue"), "positionValue")
+        szi = abs(to_decimal(pos.get("szi"), "szi"))
+        return value / szi if szi > 0 and value > 0 else None
+    except ValueError:
+        return None
 
 
 @mcp.tool(annotations=WRITE)
@@ -437,19 +556,20 @@ def position_close(coin: str, size: float | None = None, slippage: float | None 
     """Close a perp position (all of it, or `size`) with a reduce-only market order.
 
     Reduce-only means it can only shrink the position, so it is never blocked
-    by the notional cap or coin allowlist.
+    by the notional caps or coin allowlist. `slippage` may go up to
+    max(HL_MAX_SLIPPAGE, 10%) for exits.
     """
     inst = resolve(coin)
     if not inst.is_perp:
         raise ValueError(f"{inst.coin} is not a perp; sell spot/outcome balances with "
                          "order_place_market")
     vault, target = trade_target(vault_address)
-    szi = _position(inst, require_target(target))
+    szi, ref = _position(inst, require_target(target))
     if szi == 0:
         return {"tool": "position_close", "status": "nothing_to_close", "sent": False,
                 "coin": inst.coin, "account": target}
     qty = abs(szi) if size is None else min(to_decimal(size, "size"), abs(szi))
-    p = prepare_market(inst, szi < 0, qty, slippage, True, None)
+    p = prepare_market(inst, szi < 0, qty, slippage, True, None, ref=ref)
     return _send_orders("position_close", [p], vault, target, dry_run=dry_run)
 
 
@@ -457,24 +577,37 @@ def position_close(coin: str, size: float | None = None, slippage: float | None 
 def position_close_all(all_dexs: bool = True, slippage: float | None = None,
                        vault_address: str | None = None, dry_run: bool = False) -> dict:
     """Close every open perp position (main dex and, by default, every HIP-3 dex)
-    with reduce-only market orders in a single action."""
+    with reduce-only market orders in a single action. A position that cannot
+    be priced or resolved is reported in `not_closed` instead of stopping the
+    others from closing."""
     vault, target = trade_target(vault_address)
     target = require_target(target)
     dexs = client().universe.dex_names() if all_dexs else [""]
-    preps = []
+    preps: list[Prepared] = []
+    not_closed: list[dict] = []
     for d in dexs:
-        st = client().info({"type": "clearinghouseState", "user": target, "dex": d}) or {}
-        for ap in st.get("assetPositions") or []:
-            pos = ap.get("position") or {}
-            szi = to_decimal(pos.get("szi", "0"), "szi")
-            if szi == 0:
-                continue
-            inst = resolve(pos["coin"])
-            preps.append(prepare_market(inst, szi < 0, abs(szi), slippage, True, None))
+        try:
+            rows = _position_rows(target, d)
+        except Exception as e:
+            not_closed.append({"dex": d, "error": f"cannot read positions: {e}"})
+            continue
+        for pos in rows:
+            try:
+                szi = to_decimal(pos.get("szi", "0"), "szi")
+                if szi == 0:
+                    continue
+                inst = resolve(pos["coin"])
+                preps.append(prepare_market(inst, szi < 0, abs(szi), slippage, True, None,
+                                            ref=_exit_ref(inst, pos)))
+            except Exception as e:
+                not_closed.append({"coin": pos.get("coin"), "dex": d, "error": str(e)})
     if not preps:
-        return {"tool": "position_close_all", "status": "nothing_to_close", "sent": False,
-                "account": target}
-    return _send_orders("position_close_all", preps, vault, target, dry_run=dry_run)
+        return {"tool": "position_close_all", "status": "nothing_to_close" if not not_closed
+                else "error", "sent": False, "account": target, "not_closed": not_closed}
+    out = _send_orders("position_close_all", preps, vault, target, dry_run=dry_run)
+    if not_closed:
+        out["not_closed"] = not_closed
+    return out
 
 
 @mcp.tool(annotations=WRITE)
@@ -485,9 +618,11 @@ def position_set_tpsl(coin: str, take_profit_price: float | None = None,
                       vault_address: str | None = None, dry_run: bool = False) -> dict:
     """Attach take-profit and/or stop-loss orders to an EXISTING perp position.
 
-    Without `size` they cover the whole position and resize with it. Legs are
-    reduce-only triggers on the mark price; market unless a *_limit_price is
-    given. TP must be on the profit side of the current mark, SL on the loss side.
+    Without `size` they cover the whole position and resize with it (sent as
+    size 0, like Hyperliquid's own position TP/SL); with `size` they are fixed.
+    Legs are reduce-only triggers on the mark price: market (worst fill 10%
+    past the trigger) unless a *_limit_price is given. TP must be on the
+    profit side of the current mark, SL on the loss side.
     """
     if take_profit_price is None and stop_loss_price is None:
         raise ValueError("give take_profit_price and/or stop_loss_price")
@@ -495,23 +630,23 @@ def position_set_tpsl(coin: str, take_profit_price: float | None = None,
     if not inst.is_perp:
         raise ValueError("position TP/SL is for perps")
     vault, target = trade_target(vault_address)
-    szi = _position(inst, require_target(target))
+    szi, ref = _position(inst, require_target(target))
     if szi == 0:
         raise ValueError(f"no open {inst.coin} position for {target}")
     is_long = szi > 0
-    qty = abs(szi) if size is None else to_decimal(size, "size")
+    whole = size is None
+    qty = Decimal(0) if whole else to_decimal(size, "size")
     if qty > abs(szi):
         raise ValueError(f"size {size} exceeds the position size {fmt_decimal(abs(szi))}")
-    ref = mid(inst)
     if ref is not None:
         _check_bracket(is_long, ref, take_profit_price, stop_loss_price)
     legs = []
     if take_profit_price is not None:
         legs.append(prepare_trigger(inst, not is_long, qty, take_profit_price, "take_profit",
-                                    take_profit_limit_price, True, None))
+                                    take_profit_limit_price, True, None, whole_position=whole))
     if stop_loss_price is not None:
         legs.append(prepare_trigger(inst, not is_long, qty, stop_loss_price, "stop",
-                                    stop_loss_limit_price, True, None))
+                                    stop_loss_limit_price, True, None, whole_position=whole))
     return _send_orders("position_set_tpsl", legs, vault, target, grouping="positionTpsl",
                         dry_run=dry_run)
 
@@ -560,6 +695,9 @@ def order_modify(oid: int | None = None, cloid: str | None = None, price: float 
     reduce_only = bool(o.get("reduceOnly"))
     new_size = size if size is not None else o.get("sz")
     keep_cloid = o.get("cloid") or None
+    # A whole-position TP/SL reports size 0 and must keep it (it resizes with the position).
+    whole = (bool(o.get("isPositionTpsl")) and size is None
+             and to_decimal(o.get("sz") or "0", "sz") == 0)
     if o.get("isTrigger"):
         otype = str(o.get("orderType") or "")
         p = prepare_trigger(inst, is_buy, new_size,
@@ -567,11 +705,19 @@ def order_modify(oid: int | None = None, cloid: str | None = None, price: float 
                             "take_profit" if "Take Profit" in otype else "stop",
                             None if "Market" in otype else (price if price is not None
                                                             else o.get("limitPx")),
-                            reduce_only, keep_cloid, round_to_tick)
+                            reduce_only, keep_cloid, round_to_tick, whole_position=whole)
     else:
         cur_tif = o.get("tif") if o.get("tif") in ("Gtc", "Alo", "Ioc") else "Gtc"
         p = prepare_limit(inst, is_buy, new_size, price if price is not None else o.get("limitPx"),
                           tif or cur_tif, reduce_only, keep_cloid, round_to_tick)
+    # Only the increase over the order being replaced counts towards the daily budget.
+    old = None
+    try:
+        old = _exposure(inst, is_buy, to_decimal(o.get("sz") or "0", "sz"),
+                        to_decimal(o.get("limitPx") or "0", "limitPx"), mid(inst))
+    except ValueError:
+        pass
+    added = _opening_total([p]) - (old or Decimal(0))
     req = A.batch_modify([(int(o["oid"]), p.wire())], client().next_nonce(),
                          always_place=always_place, vault_address=vault)
     out = execute("order_modify", "trade", req, dry_run=dry_run,
@@ -579,7 +725,8 @@ def order_modify(oid: int | None = None, cloid: str | None = None, price: float 
                   summary={"oid": o["oid"], "from": {"limit_px": o.get("limitPx"),
                                                      "size": o.get("sz"),
                                                      "trigger_px": o.get("triggerPx")},
-                           "to": p.summary()})
+                           "to": p.summary()},
+                  opening_notional_usd=max(added, Decimal(0)))
     return _describe_statuses(out, [p])
 
 
@@ -627,7 +774,8 @@ def order_cancel_batch(cancels: list[dict], vault_address: str | None = None,
 def order_cancel_all(coin: str | None = None, all_dexs: bool = True,
                      vault_address: str | None = None, dry_run: bool = False) -> dict:
     """Cancel every open order (optionally only for `coin`), across all perp dexs,
-    spot and outcomes, including TP/SL triggers."""
+    spot and outcomes, including TP/SL triggers. Orders that cannot be mapped
+    to an asset are listed in `skipped` rather than blocking the rest."""
     vault, target = trade_target(vault_address)
     target = require_target(target)
     want = resolve(coin) if coin else None
@@ -636,19 +784,30 @@ def order_cancel_all(coin: str | None = None, all_dexs: bool = True,
     else:
         dexs = client().universe.dex_names() if all_dexs else [""]
     pairs: list[tuple[int, int]] = []
+    skipped: list[dict] = []
     for d in dexs:
-        # frontendOpenOrders includes untriggered TP/SL orders.
-        for o in client().info({"type": "frontendOpenOrders", "user": target, "dex": d}) or []:
+        try:
+            # frontendOpenOrders includes untriggered TP/SL orders.
+            orders = client().info({"type": "frontendOpenOrders", "user": target, "dex": d}) or []
+        except Exception as e:
+            skipped.append({"dex": d, "error": f"cannot read open orders: {e}"})
+            continue
+        for o in orders:
             if want is not None and o.get("coin") != want.coin:
                 continue
-            inst = resolve(o["coin"])
-            pairs.append((inst.asset, int(o["oid"])))
+            try:
+                pairs.append((resolve(o["coin"]).asset, int(o["oid"])))
+            except (ValueError, KeyError) as e:
+                skipped.append({"coin": o.get("coin"), "oid": o.get("oid"), "error": str(e)})
     if not pairs:
-        return {"tool": "order_cancel_all", "status": "nothing_to_cancel", "sent": False,
-                "account": target}
+        return {"tool": "order_cancel_all", "sent": False, "account": target,
+                "status": "error" if skipped else "nothing_to_cancel", "skipped": skipped}
     req = A.cancel(pairs, client().next_nonce(), vault_address=vault)
-    return execute("order_cancel_all", "trade", req, dry_run=dry_run,
-                   summary={"n_orders": len(pairs), "coin": want.coin if want else None})
+    out = execute("order_cancel_all", "trade", req, dry_run=dry_run,
+                  summary={"n_orders": len(pairs), "coin": want.coin if want else None})
+    if skipped:
+        out["skipped"] = skipped
+    return out
 
 
 @mcp.tool(annotations=WRITE)
@@ -700,17 +859,46 @@ def leverage_update(coin: str, leverage: int, margin_mode: Literal["cross", "iso
 @mcp.tool(annotations=WRITE)
 def margin_adjust_isolated(coin: str, amount_usd: float, vault_address: str | None = None,
                            dry_run: bool = False) -> dict:
-    """Add (positive) or remove (negative) USD margin on an isolated perp position."""
+    """Add (positive) or remove (negative) USD margin on an isolated perp position.
+    Removing margin raises leverage; it is refused if the result would exceed
+    HL_MAX_LEVERAGE."""
     inst = resolve(coin)
     if not inst.is_perp:
         raise ValueError("isolated margin applies to perps only")
-    if float(amount_usd) == 0:
+    amount = to_decimal(amount_usd, "amount_usd")
+    if amount == 0:
         raise ValueError("amount_usd must be non-zero")
-    vault, _target = trade_target(vault_address)
+    vault, target = trade_target(vault_address)
+    reasons: list[str] = []
+    if amount < 0:
+        reasons = _margin_removal_reasons(inst, target, amount)
     req = A.update_isolated_margin(inst.asset, float_to_usd_int(float(amount_usd)),
                                    client().next_nonce(), vault_address=vault)
-    return execute("margin_adjust_isolated", "trade", req, dry_run=dry_run,
+    return execute("margin_adjust_isolated", "trade", req, dry_run=dry_run, reasons=reasons,
                    summary={"coin": inst.coin, "amount_usd": amount_usd})
+
+
+def _margin_removal_reasons(inst: Instrument, target: str | None, amount: Decimal) -> list[str]:
+    """Leverage after removing |amount| of margin = position value / new margin."""
+    cap = client().settings.max_leverage
+    if not target:
+        return ["cannot verify the resulting leverage: no account address configured"]
+    try:
+        for p in _position_rows(target, inst.dex):
+            if p.get("coin") != inst.coin:
+                continue
+            value = to_decimal(p.get("positionValue"), "positionValue")
+            margin = to_decimal(p.get("marginUsed"), "marginUsed") + amount
+            if margin <= 0:
+                return [f"removing ${-amount} would leave no margin on {inst.coin}"]
+            lev = value / margin
+            if lev > cap:
+                return [f"removing ${-amount} would put {inst.coin} at {lev:.2f}x, above "
+                        f"HL_MAX_LEVERAGE {cap}x"]
+            return []
+    except Exception as e:
+        return [f"cannot verify the resulting leverage ({e}); refusing fail-closed"]
+    return [f"no open {inst.coin} position to remove margin from"]
 
 
 @mcp.tool(annotations=WRITE)
@@ -744,7 +932,8 @@ def twap_place(coin: str, side: Literal["buy", "sell"], size: float, minutes: in
                randomize: bool = False, reduce_only: bool = False,
                vault_address: str | None = None, dry_run: bool = False) -> dict:
     """Exchange-native TWAP: `size` executed in slices every ~30s over `minutes`
-    (5-1440). Each slice allows at most 3% slippage."""
+    (5-1440). The exchange lets each slice slip up to 3%, so an opening TWAP
+    needs HL_MAX_SLIPPAGE >= 0.03."""
     inst = resolve(coin)
     m = int(minutes)
     if not 5 <= m <= 1440:
@@ -752,19 +941,27 @@ def twap_place(coin: str, side: Literal["buy", "sell"], size: float, minutes: in
     is_buy = _is_buy(side)
     notes: list[str] = []
     sz = _size(inst, size, notes)
+    ro = _reduce_only(inst, reduce_only, notes)
+    exit_ = guard.is_exit(inst, ro)
     ref = mid(inst)
-    worst = None if ref is None else ref * (1 + TWAP_SLICE_SLIPPAGE if is_buy else 1)
-    notional = None if worst is None else notional_usd(inst, sz, worst)
+    notional = None
+    if ref is not None:
+        notional = (notional_usd(inst, sz, ref * (1 + TWAP_SLICE_SLIPPAGE)) if is_buy
+                    else notional_usd(inst, sz, ref))
     vault, target = trade_target(vault_address)
-    reasons = guard.order_block_reasons(client().settings, inst, reduce_only=reduce_only,
-                                        notional_usd=notional)
-    reasons += leverage_reasons(inst, target, reduce_only)
-    req = A.twap_order(inst.asset, is_buy, fmt_decimal(sz), reduce_only, m, randomize,
+    s = client().settings
+    reasons = guard.order_block_reasons(s, inst, reduce_only=ro, notional_usd=notional)
+    if not exit_ and Decimal(str(s.max_slippage)) < TWAP_SLICE_SLIPPAGE:
+        reasons.append(f"TWAP slices may slip up to {TWAP_SLICE_SLIPPAGE:.0%}, above "
+                       f"HL_MAX_SLIPPAGE {s.max_slippage}")
+    reasons += leverage_reasons(inst, target, ro)
+    req = A.twap_order(inst.asset, is_buy, fmt_decimal(sz), ro, m, randomize,
                        client().next_nonce(), vault_address=vault)
     return execute("twap_place", "trade", req, dry_run=dry_run, reasons=reasons,
                    summary={"coin": inst.coin, "side": side, "size": fmt_decimal(sz),
                             "minutes": m, "notional_usd": None if notional is None
-                            else round(float(notional), 2), "notes": notes})
+                            else round(float(notional), 2), "notes": notes},
+                   opening_notional_usd=None if exit_ else notional)
 
 
 @mcp.tool(annotations=WRITE)

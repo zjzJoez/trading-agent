@@ -112,13 +112,29 @@ def test_outcome_orders_use_outcome_asset_ids(hl):
 def test_trigger_orders(hl):
     sl = only_order(T.order_place_trigger("BTC", "sell", 0.001, 70000, "stop", dry_run=True))
     assert sl["t"] == {"trigger": {"isMarket": True, "triggerPx": "70000", "tpsl": "sl"}}
-    assert sl["r"] is True and sl["p"] == "70000"
+    # A market stop-loss carries a worst-fill limit 10% past the trigger, like
+    # Hyperliquid's frontend — limit == trigger could leave it unfilled on a gap.
+    assert sl["r"] is True and sl["p"] == "63000"
     tp = only_order(T.order_place_trigger("BTC", "sell", 0.001, 95000, "take_profit",
                                           limit_price=94900, dry_run=True))
     assert tp["t"]["trigger"]["tpsl"] == "tp" and tp["t"]["trigger"]["isMarket"] is False
     assert tp["p"] == "94900"
     with pytest.raises(ValueError, match="trigger_price"):
         T.order_place_trigger("BTC", "sell", 0.001, 70000.55, "stop", round_to_tick=False)
+
+
+def test_trigger_entries_are_held_to_the_slippage_cap(hl):
+    entry = only_order(T.order_place_trigger("BTC", "buy", 0.001, 85000, "stop",
+                                             reduce_only=False, dry_run=True))
+    assert entry["p"] == "85850"  # trigger + HL_DEFAULT_SLIPPAGE (1%)
+    wide = T.order_place_trigger("BTC", "buy", 0.001, 85000, "stop", reduce_only=False,
+                                 slippage=0.2)
+    assert wide["status"] == "blocked" and any("slippage" in r for r in wide["reasons"])
+    exit_wide = T.order_place_trigger("BTC", "sell", 0.001, 70000, "stop", slippage=0.2)
+    assert exit_wide["status"] == "blocked"  # exits get 10%, not unlimited
+    far_limit = T.order_place_trigger("BTC", "buy", 0.001, 85000, "stop", reduce_only=False,
+                                      limit_price=95000)
+    assert any("trigger" in r and "through the book" in r for r in far_limit["reasons"])
 
 
 def test_bracket_links_reduce_only_legs(hl):
@@ -192,7 +208,11 @@ def test_position_tpsl(hl):
     hl.api.positions[""] = [position("BTC", "0.02")]
     out = T.position_set_tpsl("BTC", take_profit_price=90000, stop_loss_price=75000, dry_run=True)
     assert out["action"]["grouping"] == "positionTpsl"
-    assert all(o["s"] == "0.02" and o["b"] is False for o in out["action"]["orders"])
+    # size 0 = the whole position, resizing with it (what the frontend sends)
+    assert all(o["s"] == "0" and o["b"] is False and o["r"] is True
+               for o in out["action"]["orders"])
+    fixed = T.position_set_tpsl("BTC", stop_loss_price=75000, size=0.01, dry_run=True)
+    assert only_order(fixed)["s"] == "0.01"
     with pytest.raises(ValueError):
         T.position_set_tpsl("BTC", take_profit_price=70000)  # below mark for a long
     with pytest.raises(ValueError):

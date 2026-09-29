@@ -160,7 +160,10 @@ def fmt_decimal(d: Decimal) -> str:
 # Universe
 # --------------------------------------------------------------------------
 
-_PERP_SUFFIXES = ("-USDT-SWAP", "-USD-SWAP", "-SWAP", "-PERP", "PERP", "-USDC", "-USDT", "-USD")
+# Only suffixes that unambiguously mean a perpetual. "BTC-USDT" / "BTC-USD" are
+# SPOT names on OKX and Coinbase, so they are not guessed (see _not_found).
+_PERP_SUFFIXES = ("-USDT-SWAP", "-USDC-SWAP", "-USD-SWAP", "-SWAP", "-PERP", "PERP")
+_AMBIGUOUS_QUOTES = ("USD", "USDC", "USDT", "USDT0", "USDH", "USDE")
 
 
 class Universe:
@@ -319,6 +322,13 @@ class Universe:
         return None
 
     def _not_found(self, query: str) -> str:
+        base, sep, quote = query.strip().rpartition("-")
+        if sep and base and quote.upper() in _AMBIGUOUS_QUOTES:
+            options = [o for o in (base.upper(), f"{base.upper()}/{quote.upper()}")
+                       if self._lookup(o)]
+            return (f"{query!r} is ambiguous (a spot pair on some exchanges, a perp on others). "
+                    f"Use one of {options or [base.upper()]}: bare name = perp, "
+                    "BASE/QUOTE = spot.")
         near = [i.coin for i in self.search(query, limit=5)]
         hint = f" Close matches: {near}." if near else ""
         return (

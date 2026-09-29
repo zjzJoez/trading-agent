@@ -2,14 +2,18 @@
 
 Every signed action passes `write_block_reasons` (module switch, read-only,
 key present, key type, mainnet opt-in). Orders additionally pass
-`order_block_reasons` (coin allowlist, per-order notional cap, slippage cap)
-and a live leverage check in the server. Funds leaving the account pass
-`destination_block_reasons` (HL_WITHDRAW_ALLOWLIST). All of these return
-reason strings instead of raising, so a dry run can report every gate that
-would block the live send at once.
+`order_block_reasons` (coin allowlist, per-order notional cap, slippage cap),
+`price_band_reasons` (no limit priced through the market by more than
+HL_MAX_SLIPPAGE), `daily_budget_reasons` (HL_MAX_DAILY_NOTIONAL_USD) and a
+live leverage check in the server. Anything that hands funds or control to
+another address passes `destination_block_reasons` (HL_WITHDRAW_ALLOWLIST).
+All of these return reason strings instead of raising, so a dry run can
+report every gate that would block the live send at once.
 
-Reduce-only orders skip the allowlist and notional cap on purpose: an exit
-must never be blocked by the limits that exist to stop entries.
+Reduce-only PERP orders skip the allowlist and notional caps on purpose: an
+exit must never be blocked by the limits that exist to stop entries. Only
+perps qualify — the exchange enforces reduce-only against a position there,
+while on spot and outcomes the flag is meaningless (the server clears it).
 """
 from __future__ import annotations
 
@@ -64,14 +68,18 @@ def coin_allowed(settings: Settings, inst: Instrument) -> bool:
     return inst.coin.lower() in allowed or inst.name.lower() in allowed
 
 
+def is_exit(inst: Instrument, reduce_only: bool) -> bool:
+    """A reduce-only perp order: the exchange guarantees it only shrinks a position."""
+    return reduce_only and inst.is_perp
+
+
 def order_block_reasons(settings: Settings, inst: Instrument, *, reduce_only: bool,
-                        notional_usd: Decimal | None, slippage: float | None = None) -> list[str]:
+                        notional_usd: Decimal | None) -> list[str]:
     reasons: list[str] = []
-    if inst.delisted and not reduce_only:
+    exit_ = is_exit(inst, reduce_only)
+    if inst.delisted and not exit_:
         reasons.append(f"{inst.coin} is delisted; only reduce-only orders are allowed")
-    if slippage is not None and slippage > settings.max_slippage:
-        reasons.append(f"slippage {slippage:.4f} exceeds HL_MAX_SLIPPAGE {settings.max_slippage}")
-    if reduce_only:
+    if exit_:
         return reasons
     if not coin_allowed(settings, inst):
         reasons.append(f"{inst.coin} is not in HL_ALLOWED_COINS")
@@ -88,6 +96,76 @@ def order_block_reasons(settings: Settings, inst: Instrument, *, reduce_only: bo
     return reasons
 
 
+def price_band_reasons(settings: Settings, inst: Instrument, *, is_buy: bool, limit_px: Decimal,
+                       reference: Decimal | None, what: str = "mid",
+                       band: float | None = None) -> list[str]:
+    """Refuse a limit priced through the market by more than the slippage cap
+    (HL_MAX_SLIPPAGE unless `band` is given — exits get a wider one).
+
+    A buy limit far above mid (or a sell far below) fills against whatever is
+    on the book — on a thin book, possibly someone's resting order placed to
+    catch exactly that. Market orders are already capped by slippage; this
+    gives marketable limits the same bound."""
+    if reference is None or reference <= 0:
+        return [f"no {what} price for {inst.coin} to bound the limit price against; "
+                "refusing fail-closed"]
+    b = Decimal(str(settings.max_slippage if band is None else band))
+    if is_buy and limit_px > reference * (1 + b):
+        return [f"buy limit {limit_px} is more than {b:.2%} above the {what} {reference} "
+                "(HL_MAX_SLIPPAGE); it would fill through the book"]
+    if not is_buy and limit_px < reference * (1 - b):
+        return [f"sell limit {limit_px} is more than {b:.2%} below the {what} {reference} "
+                "(HL_MAX_SLIPPAGE); it would fill through the book"]
+    return []
+
+
+BUDGET_FIELD = "opening_notional_usd"
+
+
+def daily_opening_notional(settings: Settings) -> Decimal:
+    """USD notional of opening orders sent today (UTC) on this network,
+    including sends whose outcome is unknown ("error": they may have landed).
+
+    Read from the audit log, so every server process shares one budget and a
+    restart does not reset it. Records are appended in time order, so the
+    scan stops at the first record from an earlier day."""
+    path = settings.audit_path
+    if not path.exists():
+        return Decimal(0)
+    today = datetime.now(UTC).date().isoformat()
+    total = Decimal(0)
+    with path.open() as f:
+        lines = f.readlines()
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day < today:
+            break
+        if (day == today and rec.get("decision") in ("sent", "error")
+                and rec.get("network") == settings.network and rec.get(BUDGET_FIELD)):
+            total += Decimal(str(rec[BUDGET_FIELD]))
+    return total
+
+
+def daily_budget_reasons(settings: Settings, opening_usd: Decimal) -> list[str]:
+    if opening_usd <= 0:
+        return []
+    try:
+        used = daily_opening_notional(settings)
+    except OSError as e:
+        return [f"cannot read the audit log to check HL_MAX_DAILY_NOTIONAL_USD ({e}); "
+                "refusing fail-closed"]
+    cap = Decimal(str(settings.max_daily_notional_usd))
+    if used + opening_usd > cap:
+        return [f"today's opening notional would reach ${used + opening_usd:,.2f} "
+                f"(${used:,.2f} already sent since 00:00 UTC), above "
+                f"HL_MAX_DAILY_NOTIONAL_USD ${cap:,.2f}"]
+    return []
+
+
 def leverage_block_reasons(settings: Settings, leverage: int | None, coin: str) -> list[str]:
     if leverage is not None and leverage > settings.max_leverage:
         return [
@@ -98,13 +176,11 @@ def leverage_block_reasons(settings: Settings, leverage: int | None, coin: str) 
 
 
 def destination_block_reasons(settings: Settings, destination: str,
-                              own_addresses: set[str]) -> list[str]:
+                              own_addresses: set[str], what: str = "destination") -> list[str]:
     d = destination.lower()
     if d in own_addresses or d in settings.withdraw_allowlist:
         return []
-    return [
-        f"destination {destination} is not your account and not in HL_WITHDRAW_ALLOWLIST"
-    ]
+    return [f"{what} {destination} is not your account and not in HL_WITHDRAW_ALLOWLIST"]
 
 
 def audit(settings: Settings, record: dict[str, Any]) -> None:

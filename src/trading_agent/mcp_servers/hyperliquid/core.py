@@ -203,6 +203,18 @@ def notional_usd(inst: Instrument, size: Decimal, price: Decimal) -> Decimal | N
     return None if rate is None else size * price * rate
 
 
+def own_addresses() -> set[str]:
+    """Addresses that are unambiguously the user's: the account and the signer."""
+    c = client()
+    return {a for a in (c.account_address(), c.signer_address) if a}
+
+
+def destination_reasons(destination: str, what: str = "destination") -> list[str]:
+    """Anything that hands funds or control to `destination` needs it to be the
+    user's own address or listed in HL_WITHDRAW_ALLOWLIST."""
+    return guard.destination_block_reasons(client().settings, destination, own_addresses(), what)
+
+
 def leverage_reasons(inst: Instrument, target: str | None, reduce_only: bool) -> list[str]:
     """Live check that the coin's current leverage is within HL_MAX_LEVERAGE.
 
@@ -237,8 +249,12 @@ def _display_action(req: ActionRequest) -> dict:
 
 def execute(tool: str, module: str, req: ActionRequest, *, dry_run: bool = False,
             reasons: list[str] | None = None, needs_owner_key: bool = False,
-            summary: dict | None = None) -> dict:
+            summary: dict | None = None,
+            opening_notional_usd: Decimal | None = None) -> dict:
     """Guard, then dry-run / refuse / sign-and-send one action, and audit it.
+
+    `opening_notional_usd` is the exposure this action can add; it is checked
+    against HL_MAX_DAILY_NOTIONAL_USD and, once sent, counted towards it.
 
     Returns a dict whose `status` is one of:
       dry_run  – nothing signed or sent; `blocked_reasons` lists what would
@@ -255,12 +271,19 @@ def execute(tool: str, module: str, req: ActionRequest, *, dry_run: bool = False
         signer_is_agent=c.signer_is_agent() if (needs_owner_key and has_signer) else False,
         needs_owner_key=needs_owner_key,
     ) + list(reasons or [])
+    if opening_notional_usd:
+        all_reasons += guard.daily_budget_reasons(s, opening_notional_usd)
     head: dict[str, Any] = {"tool": tool, "network": s.network, "action_type": req.action_type,
                             "nonce": req.nonce}
     if summary:
         head["summary"] = summary
     record = {"tool": tool, "module": module, "signer": c.signer_address, "nonce": req.nonce,
               "vault": req.vault_address, "action": req.action, "summary": summary}
+    if opening_notional_usd:
+        # Counted against the daily budget on "sent" and "error" records:
+        # conservatively, even when the exchange rejects part of the batch or
+        # the outcome of the send is unknown.
+        record[guard.BUDGET_FIELD] = float(round(opening_notional_usd, 2))
 
     if dry_run or s.dry_run:
         guard.audit(s, {**record, "decision": "dry_run", "reasons": all_reasons})

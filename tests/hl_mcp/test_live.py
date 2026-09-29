@@ -33,6 +33,7 @@ from trading_agent.mcp_servers.hyperliquid.settings import WRITE_MODULES, Settin
 pytestmark = pytest.mark.integration
 
 DEST = "0x" + "22" * 20
+COSIGNER = "0x" + "33" * 20
 MASTER = "0x" + "44" * 20
 CLOID = "0x" + "cd" * 16
 
@@ -62,7 +63,7 @@ def _client(wallet, **kw) -> HLClient:
     key, _me, tmp = wallet
     return HLClient(Settings(
         network="testnet", private_key=key, write_modules=frozenset(WRITE_MODULES),
-        withdraw_allowlist=frozenset({DEST}), max_leverage=100,
+        withdraw_allowlist=frozenset({DEST, COSIGNER}), max_leverage=100,
         audit_path=tmp / "audit.jsonl", agent_key_dir=tmp / "agents", **kw))
 
 
@@ -76,7 +77,26 @@ def _raw(req_fn):
     return normalize_exchange_response(c.send(req_fn(c.next_nonce())))
 
 
+def _pretend(fn, **answers):
+    """The oracle wallet is empty. Answer some /info lookups as if it were not,
+    so the tool's guards pass and its signed action reaches the exchange."""
+    def run():
+        c = core.client()
+        real = c.info
+        c.info = lambda p: answers[p["type"]](p) if p.get("type") in answers else real(p)
+        return fn()
+    return run
+
+
+def _long_btc(p):
+    size = 0.001
+    return {"assetPositions": [{"type": "oneWay", "position": {
+        "coin": "BTC", "szi": str(size), "positionValue": str(_btc(1) * size),
+        "marginUsed": "1", "leverage": {"type": "cross", "value": 5}}}] if not p.get("dex") else []}
+
+
 _WIRE = A.order_wire(0, True, 0.001, 50000.0, {"limit": {"tif": "Alo"}}, False, CLOID)
+_MY_SUB = {"subAccounts": lambda p: [{"subAccountUser": DEST}]}
 
 OWNER_CASES = {
     "order limit": lambda: T.order_place_limit("BTC", "buy", 0.0002, _btc(0.8)),
@@ -84,6 +104,9 @@ OWNER_CASES = {
     "order trigger": lambda: T.order_place_trigger("BTC", "sell", 0.0002, _btc(0.7), "stop",
                                                    reduce_only=False),
     "order priority grouping": lambda: _raw(lambda n: A.orders([_WIRE], n, grouping={"p": 1000})),
+    "whole-position TP/SL (size 0)": _pretend(
+        lambda: T.position_set_tpsl("BTC", take_profit_price=_btc(1.3), stop_loss_price=_btc(0.7)),
+        clearinghouseState=_long_btc),
     "cancel": lambda: T.order_cancel("BTC", oid=1),
     "cancelByCloid": lambda: T.order_cancel("BTC", cloid=CLOID),
     "batchModify": lambda: _raw(lambda n: A.batch_modify([(123, _WIRE)], n)),
@@ -99,8 +122,10 @@ OWNER_CASES = {
     "noop": lambda: T.nonce_invalidate(core.client().next_nonce()),
     "usdClassTransfer": lambda: F.transfer_usdc_perp_spot(1, to="spot"),
     "sendAsset (self)": lambda: F.transfer_between_dexs(1, "", "spot"),
-    "subAccountTransfer": lambda: F.transfer_sub_account_usdc(DEST, 1, "deposit"),
-    "subAccountSpotTransfer": lambda: F.transfer_sub_account_spot(DEST, "USDC", 1, "deposit"),
+    "subAccountTransfer": _pretend(lambda: F.transfer_sub_account_usdc(DEST, 1, "deposit"),
+                                   **_MY_SUB),
+    "subAccountSpotTransfer": _pretend(
+        lambda: F.transfer_sub_account_spot(DEST, "USDC", 1, "deposit"), **_MY_SUB),
     "vaultTransfer": lambda: F.vault_transfer(DEST, 5, "deposit"),
     "cDeposit": lambda: F.staking_deposit(1),
     "cWithdraw": lambda: F.staking_withdraw(1),
@@ -137,7 +162,7 @@ OWNER_CASES = {
     "raw L1 (gossipPriorityBid)": lambda: AD.advanced_send_l1_action(
         {"type": "gossipPriorityBid", "slotId": 0, "ip": "1.2.3.4", "maxGas": 1}, dry_run=False),
     "convertToMultiSigUser": lambda: AD.advanced_convert_to_multisig(
-        [DEST, "0x" + "33" * 20], 1, dry_run=False),
+        [DEST, COSIGNER], 1, dry_run=False),
 }
 # With an API-wallet key (account != signer) these go out as agent variants.
 AGENT_CASES = {

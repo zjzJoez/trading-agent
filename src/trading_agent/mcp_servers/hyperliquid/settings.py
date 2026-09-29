@@ -12,11 +12,13 @@ Defaults are the safe side of every switch:
     (`transfer`), sending them to another address (`withdraw`), account
     administration (`admin`) and raw signed actions (`advanced`) are opt-in.
   * `withdraw` additionally needs the destination in HL_WITHDRAW_ALLOWLIST.
-  * Opening orders are capped by HL_MAX_ORDER_NOTIONAL_USD and HL_MAX_LEVERAGE.
+  * Opening orders are capped by HL_MAX_ORDER_NOTIONAL_USD (per order / batch),
+    HL_MAX_DAILY_NOTIONAL_USD (per UTC day) and HL_MAX_LEVERAGE.
 Invalid values raise SettingsError at startup instead of silently falling back.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -52,6 +54,7 @@ class Settings:
     dry_run: bool = False
     write_modules: frozenset[str] = frozenset(DEFAULT_WRITE_MODULES)
     max_order_notional_usd: float = 1000.0
+    max_daily_notional_usd: float = 10000.0
     max_leverage: int = 10
     default_slippage: float = 0.01
     max_slippage: float = 0.05
@@ -98,6 +101,10 @@ def _float(name: str, default: float, *, minimum: float = 0.0) -> float:
         f = float(v)
     except ValueError as e:
         raise SettingsError(f"{name}={v!r} is not a number") from e
+    # nan compares False with everything and would silently disable a cap;
+    # inf would remove it.
+    if not math.isfinite(f):
+        raise SettingsError(f"{name}={v!r} must be a finite number")
     if f < minimum:
         raise SettingsError(f"{name}={v!r} must be >= {minimum}")
     return f
@@ -120,7 +127,10 @@ def normalize_address(value: str, what: str = "address") -> str:
     """Lowercased 0x-address; the docs recommend lowercase before signing."""
     v = value.strip()
     if not _ADDRESS_RE.match(v):
-        raise SettingsError(f"{what} {value!r} is not a 42-character 0x address")
+        # Do not echo the value: a private key pasted into an address field
+        # would otherwise end up in stderr and the MCP client's logs.
+        raise SettingsError(
+            f"{what} is not a 42-character 0x address (got {len(v)} characters)")
     return v.lower()
 
 
@@ -186,6 +196,7 @@ def load_settings() -> Settings:
         dry_run=_bool("HL_DRY_RUN", False),
         write_modules=modules,
         max_order_notional_usd=_float("HL_MAX_ORDER_NOTIONAL_USD", 1000.0),
+        max_daily_notional_usd=_float("HL_MAX_DAILY_NOTIONAL_USD", 10000.0),
         max_leverage=_int("HL_MAX_LEVERAGE", 10),
         default_slippage=default_slippage,
         max_slippage=max_slippage,
